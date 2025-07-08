@@ -1,0 +1,3 @@
+[submodule "ref/qwen3.c"]
+	path = ref/qwen3.c
+	url = https://github.com/adriancable/qwen3.c
