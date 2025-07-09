@@ -30,3 +30,4 @@ temp/
 
 uv.lock
 .python-version
+weights/
