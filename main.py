@@ -1,64 +1,63 @@
 import os
+import json
+import os
 import sqlite3
+
 import gradio as gr
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
-from inference import run_forward_pass
+from config import QUANTIZATION_SCALE
+from inference.backward_pass import run_per_token_backward_pass
+from inference.forward_pass import run_forward_pass_and_capture_activations
+from ui.gradio_ui import create_visualization_ui
 from utils import log_message, update_plot
 
-# --- Global State ---
 model = None
 tokenizer = None
 db_conn = None
 total_tokens_processed = 0
-
-# --- Core Application Logic ---
+param_name_to_id = {}
+id_to_param_name = {}
 
 def setup_database(db_path="tiny_onn_metrics.db", memory=False):
-    """Initializes a SQLite database, either in-memory or file-based."""
     global db_conn
-    if memory:
-        db_conn = sqlite3.connect(":memory:", check_same_thread=False)
-        log_message("In-memory SQLite database initialized.")
-    else:
-        if os.path.exists(db_path):
-            os.remove(db_path)
-        db_conn = sqlite3.connect(db_path, check_same_thread=False)
-        log_message(f"File-based SQLite database initialized at {db_path}.")
-
-    cursor = db_conn.cursor()
+    path = ":memory:" if memory else db_path
+    if not memory and os.path.exists(path):
+        os.remove(path) # Ensure a clean database for schema change
+    
+    conn = sqlite3.connect(path, check_same_thread=False)
+    cursor = conn.cursor()
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS block_metrics (
         token_idx INTEGER,
         param_name TEXT,
         block_idx INTEGER,
-        activation REAL,
-        grad_norm REAL,
-        absmax REAL,
+        activation INTEGER,
+        grad_norm INTEGER,
+        absmax INTEGER,
         PRIMARY KEY (token_idx, param_name, block_idx)
     )
     """)
-    db_conn.commit()
-    return db_conn
+    conn.commit()
+    
+    if not memory:
+        db_conn = conn
+    return conn
 
 def load_model_and_tokenizer(model_name="Qwen/Qwen3-1.7B"):
-    """Loads the specified model and tokenizer with 4-bit quantization."""
-    global model, tokenizer
+    global model, tokenizer, param_name_to_id, id_to_param_name
     cache_path = os.path.join(os.getcwd(), "weights")
     os.makedirs(cache_path, exist_ok=True)
-
     log_message(f"Loading tokenizer: {model_name}")
     tokenizer = AutoTokenizer.from_pretrained(model_name, cache_dir=cache_path)
     log_message("Tokenizer loaded.")
-
     bnb_config = BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_quant_type="nf4",
         bnb_4bit_compute_dtype=torch.bfloat16,
         bnb_4bit_use_double_quant=True,
     )
-
     log_message(f"Loading model: {model_name}")
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
@@ -67,131 +66,117 @@ def load_model_and_tokenizer(model_name="Qwen/Qwen3-1.7B"):
         device_map="auto"
     )
     log_message("Model loaded.")
+    log_message("Model compilation skipped on Windows due to Triton dependency.")
 
-    from inference.block_level_capture import patch_model_for_block_level_capture
-    patch_model_for_block_level_capture(model)
-    log_message("Model patched for block-level data capture.")
+    # Load param_name_map
+    map_path = os.path.join("metadata", "param_name_map.json")
+    if os.path.exists(map_path):
+        with open(map_path, 'r', encoding='utf-8') as f:
+            id_to_param_name = json.load(f)
+        param_name_to_id = {name: int(id_str) for id_str, name in id_to_param_name.items()}
+        log_message("Parameter name map loaded.")
+    else:
+        log_message("Parameter name map not found. Please run scripts/generate_param_map.py first.")
+
     return model, tokenizer
 
-def run_analysis_pipeline(
-    current_model, current_tokenizer, user_message, history, current_db_conn
-):
-    """
-    Runs the core data generation and storage pipeline.
-    This function is separated from Gradio logic for testability.
-    """
-    global total_tokens_processed
-    
-    if history is None:
-        history = []
-
-    # 1. Forward pass to generate response and capture block-level data
-    generated_ids, per_token_block_data, _ = run_forward_pass(
-        current_model, current_tokenizer, user_message, history
-    )
-    final_response = current_tokenizer.decode(generated_ids, skip_special_tokens=True)
-    history.append([user_message, final_response])
-
-    # 2. Store captured data in the database
+def store_per_token_data(per_token_data, start_idx, current_db_conn):
     cursor = current_db_conn.cursor()
-    num_generated_tokens = len(per_token_block_data)
+    for i, token_data in enumerate(per_token_data):
+        current_token_idx = start_idx + i
+        for param_name, metrics in token_data.items():
+            param_id = param_name_to_id.get(param_name)
+            if param_id is None:
+                log_message(f"Warning: param_name '{param_name}' not found in map. Skipping.")
+                continue
 
-    for i in range(num_generated_tokens):
-        token_block_data = per_token_block_data[i]
-        current_token_idx = total_tokens_processed + i
-        
-        for param_name, metrics in token_block_data.items():
             activations = metrics.get("activation", [])
-            gradients = metrics.get("gradient", [])
-            weights = metrics.get("weight", [])
-            
-            max_blocks = max(len(activations), len(gradients), len(weights))
-
-            for block_idx in range(max_blocks):
-                activation_val = activations[block_idx] if block_idx < len(activations) else 0.0
-                grad_norm_val = gradients[block_idx] if block_idx < len(gradients) else 0.0
-                absmax_val = weights[block_idx] if block_idx < len(weights) else 0.0
-
+            gradients = metrics.get("gradient", [0.0] * len(activations))
+            weights = metrics.get("weight", [0.0] * len(activations))
+            for block_idx, (act, grad, w) in enumerate(zip(activations, gradients, weights, strict=False)):
+                # Quantize values to integers before storing
+                quantized_act = int(act * QUANTIZATION_SCALE)
+                quantized_grad = int(grad * QUANTIZATION_SCALE)
+                quantized_w = int(w * QUANTIZATION_SCALE)
                 cursor.execute("""
                 INSERT OR REPLACE INTO block_metrics (token_idx, param_name, block_idx, activation, grad_norm, absmax)
                 VALUES (?, ?, ?, ?, ?, ?)
-                """, (current_token_idx, param_name, block_idx, activation_val, grad_norm_val, absmax_val))
-
+                """, (current_token_idx, param_id, block_idx, quantized_act, quantized_grad, quantized_w))
     current_db_conn.commit()
-    total_tokens_processed += num_generated_tokens
-    log_message(f"Stored metrics for {num_generated_tokens} tokens. Total processed: {total_tokens_processed}")
+
+def run_analysis_pipeline(current_model, current_tokenizer, user_message, history, current_db_conn, tokens_processed_offset):
+    global total_tokens_processed
+    log_message("--- [START] Per-Token Forward Pass & Activation Capture ---")
+    history.append({"role": "user", "content": user_message})
+    final_response, per_token_activation_data, full_sequence_ids, prompt_len = run_forward_pass_and_capture_activations(
+        current_model, current_tokenizer, user_message, history
+    )
+    history.append({"role": "assistant", "content": final_response})
+    log_message("--- [END] Forward Pass ---")
+
+    if per_token_activation_data:
+        log_message("--- [START] Per-Token Backward Pass & Gradient Capture ---")
+        per_token_activation_data = run_per_token_backward_pass(
+            current_model, full_sequence_ids, per_token_activation_data, prompt_len
+        )
+        log_message("--- [END] Backward Pass ---")
+
+    num_generated_tokens = len(per_token_activation_data)
+    store_per_token_data(per_token_activation_data, tokens_processed_offset, current_db_conn)
+    
+    total_tokens_processed = tokens_processed_offset + num_generated_tokens
     
     return history, final_response
 
-# --- Gradio Interface Logic ---
-
-def process_input_for_gradio(user_message, history, current_token_idx, view_mode):
-    """Gradio callback to process user input and update the interface."""
+def process_input_for_gradio(user_message, history, view_mode, vmin, vmax, w_act, w_grad):
     global model, tokenizer, db_conn, total_tokens_processed
     
-    updated_history, _ = run_analysis_pipeline(
-        model, tokenizer, user_message, history, db_conn
-    )
-
-    final_plot = update_plot(
-        total_tokens_processed - 1, view_mode, db_conn, total_tokens_processed
+    history, _ = run_analysis_pipeline(
+        model, tokenizer, user_message, history, db_conn, total_tokens_processed
     )
     
-    slider_update = gr.update(
-        maximum=max(1, total_tokens_processed - 1), value=total_tokens_processed - 1
-    )
+    last_token_idx = total_tokens_processed - 1
+    override_kwargs = {'vmin': vmin, 'vmax': vmax, 'w_act': w_act, 'w_grad': w_grad}
+    final_plot = update_plot(last_token_idx, view_mode, db_conn, total_tokens_processed, **override_kwargs)
+    slider_update = gr.update(maximum=max(0, last_token_idx), value=last_token_idx)
     
-    yield "", updated_history, final_plot, slider_update
+    return "", history, final_plot, slider_update
 
-def update_plot_from_history(token_idx, view_mode):
-    """Gradio callback to update the plot based on the slider."""
+def update_plot_from_history(token_idx, view_mode, vmin, vmax, w_act, w_grad):
     global db_conn, total_tokens_processed
-    return update_plot(token_idx, view_mode, db_conn, total_tokens_processed)
+    override_kwargs = {'vmin': vmin, 'vmax': vmax, 'w_act': w_act, 'w_grad': w_grad}
+    return update_plot(int(token_idx), view_mode, db_conn, total_tokens_processed, **override_kwargs)
 
 def build_gradio_ui():
-    """Builds and returns the Gradio interface."""
-    with gr.Blocks() as demo:
-        gr.Markdown("# Tiny-ONN Pilot Study: Real-time Analysis")
+    with gr.Blocks(css=".gradio-container {max-width: 800px; margin: auto;}") as demo:
+        gr.Markdown("# Tiny-ONN: Digital fMRI (Live Analysis)")
+        
+        def get_total_tokens_for_live(db_conn_ignored):
+            # In live mode, the max token index is tracked by a global variable
+            global total_tokens_processed
+            return total_tokens_processed
+
         with gr.Row():
             with gr.Column(scale=1):
-                chatbot = gr.Chatbot(height=400, label="Chat History")
+                chatbot = gr.Chatbot(height=400, label="Chat History", type="messages", bubble_full_width=False)
                 msg = gr.Textbox(label="Your Message")
-                gr.ClearButton([msg, chatbot])
-                submit_btn = gr.Button("Send")
-            with gr.Column(scale=1):
-                plot_output = gr.Plot(label="Visualization")
-                view_selector = gr.Radio(
-                    ["Activation", "Gradient Norm", "AbsMax", "PI Diff Scatter"],
-                    label="Select View",
-                    value="Activation"
-                )
-                time_slider = gr.Slider(
-                    minimum=0, maximum=1, step=1, value=0,
-                    label="Timeline (Token Index)", interactive=True
-                )
+                submit_btn = gr.Button("Run fMRI")
+
+            # Use the shared UI component for the visualization part
+            plot_output, time_slider, view_selector, vmin_slider, vmax_slider, w_act_slider, w_grad_slider = create_visualization_ui(
+                update_plot_from_history, 
+                get_total_tokens_for_live,
+                db_conn
+            )
+
+        # Link the submit button to the main processing function
+        submit_inputs = [msg, chatbot, view_selector, vmin_slider, vmax_slider, w_act_slider, w_grad_slider]
+        submit_outputs = [msg, chatbot, plot_output, time_slider]
+        submit_btn.click(process_input_for_gradio, submit_inputs, submit_outputs)
         
-        # Event Listeners
-        submit_action = msg.submit(
-            process_input_for_gradio, 
-            [msg, chatbot, time_slider, view_selector], 
-            [msg, chatbot, plot_output, time_slider]
-        )
-        submit_btn.click(
-            process_input_for_gradio, 
-            [msg, chatbot, time_slider, view_selector], 
-            [msg, chatbot, plot_output, time_slider],
-            cancels=[submit_action]
-        )
-        time_slider.change(
-            update_plot_from_history, [time_slider, view_selector], [plot_output]
-        )
-        view_selector.change(
-            update_plot_from_history, [time_slider, view_selector], [plot_output]
-        )
     return demo
 
 def main():
-    """Main function to set up and launch the Gradio app."""
     setup_database()
     load_model_and_tokenizer()
     demo = build_gradio_ui()

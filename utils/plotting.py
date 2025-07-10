@@ -1,153 +1,212 @@
-import random
+import json
+import os
+import re
+import sqlite3
 
+import matplotlib.colors as mcolors
 import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
 
-from utils.data_quantization import dequantize_linear_symmetric, dequantize_log_norm
-from utils.logging_utils import log_debug
+from config import PLOT_CONFIG, QUANTIZATION_SCALE, VIEW_MODE_MAP
 
+from .logging_utils import log_debug
 
-def update_plot(token_idx, view_mode, db_conn, total_tokens_processed):
-    if total_tokens_processed == 0:
-        return plt.figure()
+# Global map for param_name to ID and vice-versa
+id_to_param_name_map = {}
 
-    token_idx = max(0, min(token_idx, total_tokens_processed - 1))
+def get_plot_config(view_mode, **kwargs):
+    """
+    Retrieves the plot configuration for a given view mode and allows overrides.
+    """
+    config_key = VIEW_MODE_MAP.get(view_mode, "pi_diff")
+    config = PLOT_CONFIG[config_key].copy()
+    config.update(kwargs)
+    return config
+
+def fetch_and_prepare_data(db_conn, token_idx):
+    """
+    Fetches data for a specific token index, then calculates layer-wise z-scores.
+    """
+    global id_to_param_name_map
+    if not id_to_param_name_map:
+        map_path = os.path.join("metadata", "param_name_map.json")
+        if os.path.exists(map_path):
+            with open(map_path, 'r', encoding='utf-8') as f:
+                id_to_param_name_map = json.load(f)
+        else:
+            log_debug("Parameter name map not found. Cannot map param_ids to names.")
+            return None
+
+    query = f"SELECT param_name, block_idx, activation, grad_norm, absmax FROM block_metrics WHERE token_idx = {token_idx}"
+    df = pd.read_sql_query(query, db_conn)
+
+    if df.empty:
+        log_debug(f"No data found for token_idx {token_idx}")
+        return None
+
+    # Convert param_name (which is now ID) back to string name
+    df['param_name'] = df['param_name'].astype(str).map(id_to_param_name_map)
+    df.dropna(subset=['param_name'], inplace=True) # Drop rows where mapping failed
+
+    # Dequantize values
+    df['activation'] = df['activation'] / QUANTIZATION_SCALE
+    df['grad_norm'] = df['grad_norm'] / QUANTIZATION_SCALE
+    df['absmax'] = df['absmax'] / QUANTIZATION_SCALE
+
+    # --- 1. Extract Layer Info (Robust Version) ---
+    def get_layer_info(param_name):
+        match = re.search(r'model\.layers\.(\d+)', param_name)
+        if match:
+            return int(match.group(1))
+        elif 'embed_tokens' in param_name:
+            return -1  # Special index for embeddings
+        elif 'lm_head' in param_name:
+            return 999 # Special index for the head
+        elif 'model.norm' in param_name:
+            return 998 # Special index for final norm
+        return -2 # Other modules
+
+    def get_layer_type(param_name):
+        parts = param_name.split('.')
+        # Heuristic to get a meaningful type label
+        if 'layers' in parts:
+            try:
+                idx = parts.index('layers')
+                return ".".join(parts[idx+2:]) # e.g., self_attn.q_proj
+            except (ValueError, IndexError):
+                return param_name
+        return param_name
+
+    df['layer_index'] = df['param_name'].apply(get_layer_info)
+    df['layer_type'] = df['param_name'].apply(get_layer_type)
+
+    # Dynamically assign final layer indices for plotting order
+    if not df[df['layer_index'] < 900].empty:
+        max_real_layer = df[df['layer_index'] < 900]['layer_index'].max()
+        if 998 in df['layer_index'].unique(): # model.norm
+             df.loc[df['layer_index'] == 998, 'layer_index'] = max_real_layer + 1
+        if 999 in df['layer_index'].unique(): # lm_head
+            df.loc[df['layer_index'] == 999, 'layer_index'] = max_real_layer + 2
+
+    df = df[df['layer_index'] != -2].copy() # Use .copy() to avoid SettingWithCopyWarning
+    df.dropna(subset=['layer_index', 'layer_type'], inplace=True)
+    df['layer_index'] = df['layer_index'].astype(int)
+    df = df.sort_values(by=['layer_index', 'layer_type', 'block_idx'])
+
+    # --- 2. Calculate Layer-wise Z-Scores ---
+    grouped = df.groupby('layer_index')
     
-    cursor = db_conn.cursor()
-    # Query from block_metrics table
-    cursor.execute("SELECT param_name, block_idx, activation, grad_norm, absmax FROM block_metrics WHERE token_idx=?", (token_idx,))
-    data = cursor.fetchall()
-    log_debug(f"Fetched {len(data)} rows from block_metrics for token_idx {token_idx}")
-
-    if not data:
-        fig, ax = plt.subplots()
-        ax.text(0.5, 0.5, "No data for current token", ha='center', va='center')
-        return fig
-
-    param_names, block_indices, activations, grad_norms, absmaxes = zip(*data, strict=False)
-
-    # --- Sample data for logging ---
-    log_sample_size = 30
-    if len(param_names) > log_sample_size:
-        log_sampled_indices = random.sample(range(len(param_names)), log_sample_size)
-    else:
-        log_sampled_indices = range(len(param_names))
-
-    log_debug("\n--- Sampled Block Metrics from DB ---")
-    for idx in log_sampled_indices:
-        param_name = param_names[idx]
-        block_idx = block_indices[idx]
-        activation = activations[idx]
-        grad_norm = grad_norms[idx]
-        absmax = absmaxes[idx]
-        
-        log_debug(f"Param: {param_name}, Block: {block_idx}")
-        log_debug(f"  Act: {activation:.4f}, Grad: {grad_norm:.4f}, AbsMax: {absmax:.4f}")
-    log_debug("--- End Sampled Metrics ---")
-
-    fig, ax = plt.subplots(figsize=(12, 8))
-
-    # --- Structured Scatter-Heatmap ---
-    coords_x, coords_y, plot_values = [], [], []
-    
-    # --- Dynamically build the block type map from the data ---
-    unique_block_types = set()
-    for name in param_names:
-        try:
-            parts = name.split('.')
-            if len(parts) >= 5 and parts[1] == 'layers':
-                block_type_key = f"{parts[3]}.{parts[4]}"
-                unique_block_types.add(block_type_key)
-        except (IndexError, ValueError):
-            continue # Skip names that don't fit the expected format
-            
-    # Create a sorted map for consistent ordering
-    block_type_map = {name: i for i, name in enumerate(sorted(list(unique_block_types)))}
-
-    if not block_type_map:
-        ax.text(0.5, 0.5, "Could not identify any plottable module types.", ha='center', va='center')
-        return fig
-
-    if view_mode == "Activation":
-        values_to_plot = activations
-        title = f"Token {token_idx}: Activation Scatter-Heatmap (Blocks: {len(data)})"
-        cmap = 'viridis'
-    elif view_mode == "Gradient Norm":
-        values_to_plot = grad_norms
-        title = f"Token {token_idx}: Gradient Norm Scatter-Heatmap (Blocks: {len(data)})"
-        cmap = 'plasma'
-    elif view_mode == "AbsMax":
-        values_to_plot = absmaxes
-        title = f"Token {token_idx}: AbsMax Scatter-Heatmap (Blocks: {len(data)})"
-        cmap = 'cividis'
-    else: # PI Diff Scatter (re-using the old logic for now, but will need block-level PI Diff)
-        # For now, we'll just show a placeholder or adapt if PI Diff is calculated per block
-        # As per note-2, PI Diff is calculated per param, not per block yet.
-        # So, we'll default to Activation view if PI Diff Scatter is selected for block_metrics
-        log_debug("PI Diff Scatter not yet implemented for block-level data. Defaulting to Activation view.")
-        values_to_plot = activations
-        title = f"Token {token_idx}: Activation Scatter-Heatmap (Blocks: {len(data)})"
-        cmap = 'viridis'
-
-
-    for i, name in enumerate(param_names):
-        try:
-            parts = name.split('.')
-            # Extract layer index (e.g., 'model.layers.0.mlp.down_proj' -> 0)
-            # This assumes a common naming convention like model.layers.X.module_type
-            layer_idx_str = parts[2] if len(parts) > 2 and parts[1] == 'layers' else None
-            
-            if layer_idx_str and layer_idx_str.isdigit():
-                layer_idx = int(layer_idx_str)
+    def normalize_group(group):
+        for metric in ['activation', 'grad_norm']:
+            mean = group[metric].mean()
+            std = group[metric].std()
+            if std > 1e-9:
+                group[f'{metric}_z_score'] = (group[metric] - mean) / std
             else:
-                # Fallback for non-layered modules or different naming conventions
-                layer_idx = -1 # Assign a special index or skip
-                # log_debug(f"Could not determine layer_idx for {name}. Skipping or assigning -1.")
-                # continue # Uncomment to skip modules without clear layer index
+                group[f'{metric}_z_score'] = 0.0
+        return group
 
-            # Extract block type key (e.g., 'mlp.down_proj')
-            # Assuming param_name format like 'model.layers.X.module_type.sub_module.weight'
-            # We need 'module_type.sub_module'
-            if len(parts) >= 5:
-                block_type_key = f"{parts[3]}.{parts[4]}"
-            else:
-                block_type_key = "" # Fallback if format is unexpected
-            
-            if block_type_key in block_type_map:
-                x_base = block_type_map[block_type_key]
-                # Add jitter to x-coordinate for better visualization of overlapping points
-                x_jitter = (random.random() - 0.5) * 0.8 # Jitter between -0.4 and 0.4
-                
-                coords_x.append(x_base + x_jitter)
-                coords_y.append(layer_idx + (block_indices[i] * 0.01)) # Small offset for block_idx within layer
-                plot_values.append(values_to_plot[i])
-            else:
-                # log_debug(f"Unknown block type key: {block_type_key} for param {name}. Skipping.")
-                pass # Skip if block type is not mapped
-        except (IndexError, ValueError) as e:
-            log_debug(f"Error parsing param_name {name}: {e}. Skipping.")
-            continue
+    df = grouped.apply(normalize_group, include_groups=False).reset_index()
     
-    if not coords_x:
-        ax.text(0.5, 0.5, "No plottable data for this view or parsing failed", ha='center', va='center')
+    # --- 3. Prepare for Plotting ---
+    layer_type_map = {t: i for i, t in enumerate(df['layer_type'].unique())}
+    df['layer_type_idx'] = df['layer_type'].map(layer_type_map)
+    
+    log_debug(f"Processed {len(df)} records for token_idx {token_idx}")
+    return df
+
+def create_heatmap(df, value_col, title, cmap, vmin, vmax):
+    """
+    Creates a scatter plot heatmap from the dataframe.
+    """
+    fig, ax = plt.subplots(figsize=(14, 10))
+
+    if df.empty:
+        ax.text(0.5, 0.5, "No data available for this token.", 
+                horizontalalignment='center', verticalalignment='center', 
+                transform=ax.transAxes, fontsize=14, color='red')
+        ax.set_title(title)
+        plt.tight_layout()
         return fig
-
-    scatter = ax.scatter(coords_x, coords_y, c=plot_values, cmap=cmap, s=15, alpha=0.7)
     
-    ax.set_title(title)
+    unique_layer_types = sorted(df['layer_type'].unique(), key=lambda x: df[df['layer_type'] == x]['layer_type_idx'].iloc[0])
+    
+    x_coords = df['layer_type_idx'] + (df['block_idx'] / (df['block_idx'].max() + 1) * 0.8 - 0.4)
+    
+    scatter = ax.scatter(
+        x_coords,
+        df['layer_index'],
+        c=df[value_col],
+        cmap=cmap,
+        s=10,
+        alpha=0.7,
+        norm=mcolors.Normalize(vmin=vmin, vmax=vmax)
+    )
+    
+    ax.set_xticks(range(len(unique_layer_types)))
+    ax.set_xticklabels(unique_layer_types, rotation=45, ha='right')
+    ax.set_xlabel("Layer Type")
     ax.set_ylabel("Layer Index")
+    ax.set_title(title)
+    ax.grid(True, which='both', linestyle='--', linewidth=0.5)
+    ax.set_yticks(np.arange(0, df['layer_index'].max() + 1, 1))
+    ax.invert_yaxis()
     
-    # Dynamically set y-ticks based on actual layer indices present in data
-    unique_layers = sorted(list(set([int(y) for y in coords_y])))
-    if unique_layers:
-        ax.set_yticks(unique_layers)
+    cbar = fig.colorbar(scatter, ax=ax)
+    cbar.set_label("Value")
     
-    ax.set_xticks(list(block_type_map.values()))
-    ax.set_xticklabels(list(block_type_map.keys()), rotation=45, ha='right')
-    ax.invert_yaxis() # Layers typically go from 0 at top to N at bottom
-    ax.grid(True, linestyle='--', alpha=0.5)
-    plt.colorbar(scatter, ax=ax, label="Value")
-
     plt.tight_layout()
-    plt.close(fig) # Explicitly close the figure to free memory
     return fig
+
+def update_plot(token_idx, view_mode, db_conn, total_tokens_processed, **kwargs):
+    """
+    Main function to update the plot based on the selected token and view mode.
+    """
+    df = fetch_and_prepare_data(db_conn, token_idx)
+    config = get_plot_config(view_mode, **kwargs)
+    title = f"Token {token_idx}: {view_mode}"
+
+    if df is None or df.empty:
+        log_debug(f"No data for token {token_idx}, returning empty plot.")
+        fig, ax = plt.subplots(figsize=(14, 10))
+        ax.text(0.5, 0.5, f"No data available for token_idx: {token_idx}",
+                horizontalalignment='center', verticalalignment='center',
+                transform=ax.transAxes, fontsize=14, color='red')
+        ax.set_title(title)
+        plt.tight_layout()
+        return fig
+
+    title = f"Token {token_idx}: {view_mode} (Blocks: {len(df)})"
+    
+    value_col_map = {
+        "Activation": "activation",
+        "Gradient Norm": "grad_norm",
+        "AbsMax": "absmax",
+        "Activation Z-Score": "activation_z_score",
+        "Gradient Z-Score": "grad_norm_z_score",
+        "S_p": "S_p"
+    }
+    
+    value_col = value_col_map.get(view_mode, 'activation')
+
+    # Dynamically set vmin/vmax for raw activation/gradient views
+    if view_mode in ["Activation", "Gradient Norm", "AbsMax"]:
+        # Use the max of the actual data for vmax, and 0 for vmin
+        # For AbsMax view, use the absmax column directly
+        if value_col in df.columns and not df[value_col].empty:
+            config['vmin'] = 0.0
+            config['vmax'] = df[value_col].max() * 1.1 # Add a small buffer
+        else:
+            config['vmin'] = 0.0
+            config['vmax'] = 1.0 # Default if no data or column missing
+    
+    if view_mode == "S_p":
+        df['S_p'] = df['activation_z_score'] - df['grad_norm_z_score']
+        title = f"Token {token_idx}: S_p (Fixed Weights)"
+
+    if value_col not in df.columns:
+        log_debug(f"Column '{value_col}' not found in DataFrame. Defaulting to 'activation'.")
+        value_col = 'activation'
+        
+    return create_heatmap(df, value_col, title, config['cmap'], config['vmin'], config['vmax'])

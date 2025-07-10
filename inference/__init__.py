@@ -1,2 +1,2 @@
-from .backward_pass import run_backward_pass as run_backward_pass
-from .forward_pass import run_forward_pass as run_forward_pass
+from .backward_pass import run_per_token_backward_pass
+from .forward_pass import run_forward_pass_and_capture_activations

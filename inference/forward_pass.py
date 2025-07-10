@@ -1,63 +1,107 @@
+from functools import partial
+from typing import Dict, List
+
 import torch
+from bitsandbytes.nn import Linear4bit
 from tqdm import tqdm
-from transformers import AutoTokenizer
+from transformers import PreTrainedTokenizer
 
-from inference.block_level_capture import get_and_clear_block_level_data
+from utils.logging_utils import log_debug
 
 
-def run_forward_pass(model, tokenizer: AutoTokenizer, user_message: str, history: list):
+def _patched_forward(module, activation_data, original_forward, *args, **kwargs):
+    """Patched forward method to capture block-level activation metrics for a single token pass."""
+    x = args[0]
+    param_name = module.param_name
+    
+    num_features = x.shape[-1]
+    block_size = 64
+    num_blocks = (num_features + block_size - 1) // block_size
+
+    block_activations = [
+        torch.norm(x[..., i*block_size:min((i+1)*block_size, num_features)].float(), p=2).item()
+        for i in range(num_blocks)
+    ]
+    
+    activation_data[param_name] = {"activation": block_activations}
+    if hasattr(module.weight, 'quant_state') and module.weight.quant_state is not None:
+        absmax = module.weight.quant_state.absmax
+        weight_values = absmax.tolist()
+        if len(weight_values) == num_blocks:
+            activation_data[param_name]["weight"] = weight_values
+        else:
+            activation_data[param_name]["weight"] = [weight_values[0]] * num_blocks if weight_values else [0.0] * num_blocks
+
+    return original_forward(*args, **kwargs)
+
+def run_forward_pass_and_capture_activations(model, tokenizer: PreTrainedTokenizer, user_message: str, history: list):
     """
-    Runs the forward pass for a given input and captures block-level data.
-    Returns generated tokens and per-token block-level data.
+    Runs a token-by-token forward pass to generate a response, showing a progress bar
+    and capturing block-level activation data at each step.
     """
-    messages = []
-    for user, assistant in history:
-        messages.append({"role": "user", "content": user})
-        if assistant is not None:
-            messages.append({"role": "assistant", "content": assistant})
-    messages.append({"role": "user", "content": user_message})
+    messages = [{"role": "user", "content": user_message}]
+    # This logic is flawed for the new message format.
+    # The history is already in the correct format.
+    # Let's just combine them.
+    if history:
+        messages = history + messages
 
-    text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True) # type: ignore
-    model_inputs = tokenizer([text], return_tensors="pt").to(model.device) # type: ignore
+    text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    model_inputs = tokenizer([text], return_tensors="pt").to(model.device)
     
     input_ids = model_inputs.input_ids
     
-    generated_ids: list[int] = []
+    # --- Dynamic Patching ---
+    hooks = []
+    for name, module in model.named_modules():
+        if isinstance(module, Linear4bit):
+            module.param_name = name
+            hooks.append((module, module.forward)) # Store original forward
+
+    # --- Token-by-token Generation with TQDM ---
+    generated_ids = []
     per_token_block_data = []
     past_key_values = None
     model.eval()
 
     with torch.no_grad():
-        # First, process the prompt to get the initial KV cache
-        prompt_outputs = model(input_ids=input_ids, use_cache=True)
-        past_key_values = prompt_outputs.past_key_values
-        next_token_logits = prompt_outputs.logits[:, -1, :]
-        next_token_id = torch.argmax(next_token_logits, dim=-1).unsqueeze(-1)
-        
-        # Start the generation loop
-        for _ in tqdm(range(256), desc="[Unified] Generating & Logging"):
-            # Clear and get block-level data for the previous token before processing the current one
-            # This ensures we capture data for the token that *just* finished its forward pass
-            if len(generated_ids) > 0: # Only collect after the first token is generated
-                per_token_block_data.append(get_and_clear_block_level_data())
+        outputs = model(input_ids=input_ids, use_cache=True)
+        past_key_values = outputs.past_key_values
+        next_token_id = torch.argmax(outputs.logits[:, -1, :], dim=-1).unsqueeze(-1)
+
+        for _ in tqdm(range(256), desc="Generating Tokens"):
+            activation_data_for_step: Dict[str, Dict[str, List[float]]] = {}
             
-            # Use KV cache for efficient single-token forward pass
+            patched_forwards = []
+            for module, original_forward in hooks:
+                patched_forward = partial(_patched_forward, module, activation_data_for_step, original_forward)
+                module.forward = patched_forward
+                patched_forwards.append((module, original_forward))
+
             outputs = model(input_ids=next_token_id, past_key_values=past_key_values, use_cache=True)
             
-            # Update for next iteration
-            past_key_values = outputs.past_key_values
-            next_token_logits = outputs.logits[:, -1, :]
-            next_token_id = torch.argmax(next_token_logits, dim=-1).unsqueeze(-1)
+            for module, original_forward in patched_forwards:
+                module.forward = original_forward
 
-            # Append generated token
-            generated_ids.append(int(next_token_id.item()))
+            per_token_block_data.append(activation_data_for_step)
             
-            if next_token_id.item() == tokenizer.eos_token_id: # type: ignore
+            past_key_values = outputs.past_key_values
+            next_token_id = torch.argmax(outputs.logits[:, -1, :], dim=-1).unsqueeze(-1)
+            
+            token_id = next_token_id.item()
+            generated_ids.append(token_id)
+            
+            if token_id == tokenizer.eos_token_id:
                 break
-            torch.cuda.empty_cache() # Clear CUDA cache after each token generation
     
-    # Capture data for the very last generated token
-    if len(generated_ids) > 0:
-        per_token_block_data.append(get_and_clear_block_level_data())
+    # --- Unpatching (final cleanup) ---
+    for module, original_forward in hooks:
+        module.forward = original_forward
+        if hasattr(module, 'param_name'):
+            del module.param_name
 
-    return generated_ids, per_token_block_data, input_ids
+    final_response = tokenizer.decode(generated_ids, skip_special_tokens=True)
+    full_sequence_ids_with_generation = torch.cat([input_ids[0], torch.tensor(generated_ids, device=model.device)])
+    prompt_len = input_ids.shape[1]
+
+    return final_response, per_token_block_data, full_sequence_ids_with_generation, prompt_len
