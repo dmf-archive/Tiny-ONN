@@ -1,3 +1,4 @@
+import argparse
 import sqlite3
 
 import gradio as gr
@@ -49,5 +50,10 @@ def build_replay_ui(db_path="tiny_onn_metrics.db"):
     return demo
 
 if __name__ == "__main__":
-    replay_demo = build_replay_ui()
+    parser = argparse.ArgumentParser(description="Replay and analyze Tiny-ONN metrics.")
+    parser.add_argument("--db_path", type=str, default="tiny_onn_metrics.db",
+                        help="Path to the SQLite database file (e.g., tiny_onn_pruned_metrics.db)")
+    args = parser.parse_args()
+
+    replay_demo = build_replay_ui(db_path=args.db_path)
     replay_demo.launch()

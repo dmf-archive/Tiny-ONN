@@ -31,3 +31,5 @@ temp/
 uv.lock
 .python-version
 weights/
+
+*.db

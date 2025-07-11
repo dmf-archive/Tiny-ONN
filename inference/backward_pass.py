@@ -1,13 +1,19 @@
 from functools import partial
+import re # Import re module
 
 import torch
 from bitsandbytes.nn import Linear4bit
 from tqdm import tqdm
+from models.pruned_layers import PrunedQwen3DecoderLayer
 
 from utils.logging_utils import log_message
 
 
-def _capture_backward_hook(module, grad_input, grad_output, data_dict_for_token):
+def _capture_backward_hook(capture_state, module, grad_input, grad_output):
+    data_dict_for_token = capture_state.get('capture_dict')
+    if data_dict_for_token is None:
+        return
+
     param_name = module.param_name
     if grad_output[0] is not None and param_name in data_dict_for_token:
         grad = grad_output[0]
@@ -32,46 +38,58 @@ def run_per_token_backward_pass(model, full_sequence_ids, per_token_activation_d
     hook_modules = []
     for name, module in model.named_modules():
         if isinstance(module, Linear4bit):
-            module.param_name = name
-            hook_modules.append(module)
+            is_pruned_module = False
+            match = re.search(r'model\.layers\.(\d+)\.(self_attn|mlp)', name)
+            if match:
+                layer_idx = int(match.group(1))
+                parent_name = ".".join(name.split('.')[:-2])
+                if parent_name:
+                    parent_module = model.get_submodule(parent_name)
+                    if isinstance(parent_module, PrunedQwen3DecoderLayer):
+                        module_type = match.group(2)
+                        if module_type == "self_attn" and parent_module.prune_self_attn:
+                            is_pruned_module = True
+                        elif module_type == "mlp" and parent_module.prune_mlp:
+                            is_pruned_module = True
+            if not is_pruned_module:
+                module.param_name = name
+                hook_modules.append(module)
 
     num_generated_tokens = len(per_token_activation_data)
     log_message(f"Starting per-token backward pass for {num_generated_tokens} generated tokens.")
 
-    for i in tqdm(range(num_generated_tokens), desc="Per-Token Backward Pass"):
-        model.zero_grad()
-        
-        handles = []
-        current_token_data_dict = per_token_activation_data[i]
+    capture_state = {'capture_dict': None}
+    handles = []
+    try:
         for module in hook_modules:
             handle = module.register_full_backward_hook(
-                partial(_capture_backward_hook, data_dict_for_token=current_token_data_dict)
+                partial(_capture_backward_hook, capture_state)
             )
             handles.append(handle)
 
-        try:
-            # The sequence for this step includes the full prompt + generated tokens up to current_token_idx
+        for i in tqdm(range(num_generated_tokens), desc="Per-Token Backward Pass (Optimized)"):
+            model.zero_grad()
+            
+            current_token_data_dict = per_token_activation_data[i]
+            capture_state['capture_dict'] = current_token_data_dict
+
             current_sequence_len = prompt_len + i + 1
             input_ids_for_step = full_sequence_ids[:current_sequence_len].unsqueeze(0)
             
-            # Labels are set for the last token in the sequence to calculate loss
-            labels = input_ids_for_step.clone()
-            labels[:, :-1] = -100 # Ignore all tokens except the last one for loss calculation
-
-            # Only perform backward pass if there's a token to predict (i.e., after the prompt)
             if input_ids_for_step.shape[1] <= prompt_len:
-                 for handle in handles: handle.remove()
                  continue
+
+            labels = input_ids_for_step.clone()
+            labels[:, :-1] = -100
 
             outputs = model(input_ids=input_ids_for_step, labels=labels)
             loss = outputs.loss
             
             if loss is not None and loss.requires_grad:
                 loss.backward()
-        
-        finally:
-            for handle in handles:
-                handle.remove()
+    finally:
+        for handle in handles:
+            handle.remove()
 
     log_message("Per-token backward pass completed.")
     model.eval()
