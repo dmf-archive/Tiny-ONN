@@ -48,5 +48,5 @@ url = "https://download.pytorch.org/whl/cu128"
 explicit = true
 
 [tool.ruff.lint]
-select = ["I", "B", "NPY"]
+select = ["W", "F", "I", "UP", "B", "NPY", "SIM", "ISC", "TID", "RUF"]
 exclude = ["./ref/"]
