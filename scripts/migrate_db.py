@@ -2,11 +2,13 @@ import json
 import os
 import sqlite3
 import sys
+
 import pandas as pd
 
 # Add the project root to the Python path to allow importing config
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from config import QUANTIZATION_SCALE
+
 
 def generate_param_name_map(modules_file="1.7B_model_modules.txt", output_dir="metadata"):
     param_names = []

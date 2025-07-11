@@ -1,14 +1,13 @@
+import re  # Import re module
 from functools import partial
-from functools import partial
-from typing import Dict, List
-import re # Import re module
+from typing import Any, Dict, List, Optional
 
 import torch
 from bitsandbytes.nn import Linear4bit
 from tqdm import tqdm
-from models.pruned_layers import PrunedQwen3DecoderLayer
 from transformers import PreTrainedTokenizer
 
+from models.pruned_layers import PrunedQwen3DecoderLayer
 from utils.logging_utils import log_debug
 
 
@@ -16,6 +15,7 @@ def _patched_forward(module, capture_state, original_forward, *args, **kwargs):
     """
     Patched forward method to capture block-level activation metrics.
     It uses a 'capture_state' dictionary to get the correct data dictionary for the current token.
+    This version is optimized to compute block norms in a vectorized way.
     """
     activation_data = capture_state.get('capture_dict')
     if activation_data is None:
@@ -28,12 +28,17 @@ def _patched_forward(module, capture_state, original_forward, *args, **kwargs):
     num_features = x.shape[-1]
     block_size = 64
     num_blocks = (num_features + block_size - 1) // block_size
-
-    block_activations = [
-        torch.norm(x[..., i*block_size:min((i+1)*block_size, num_features)].float(), p=2).item()
-        for i in range(num_blocks)
-    ]
     
+    # Vectorized computation of block norms
+    padded_len = num_blocks * block_size
+    padding_needed = padded_len - num_features
+    padded_x = torch.nn.functional.pad(x, (0, padding_needed))
+    reshaped_x = padded_x.view(*x.shape[:-1], num_blocks, block_size)
+    block_norms = torch.norm(reshaped_x.float(), p=2, dim=-1)
+    
+    # Ensure we handle any batch dimensions correctly by flattening to a list
+    block_activations = block_norms.flatten().tolist()
+
     activation_data[param_name] = {"activation": block_activations}
     if hasattr(module.weight, 'quant_state') and module.weight.quant_state is not None:
         absmax = module.weight.quant_state.absmax
@@ -89,7 +94,7 @@ def run_forward_pass_and_capture_activations(model, tokenizer: PreTrainedTokeniz
     model.eval()
 
     # This object will be passed to the hook and modified in-place
-    capture_state = {'capture_dict': None}
+    capture_state: Dict[str, Optional[Dict[str, Any]]] = {'capture_dict': None}
 
     # Register hooks only ONCE
     original_forwards = []
@@ -109,7 +114,7 @@ def run_forward_pass_and_capture_activations(model, tokenizer: PreTrainedTokeniz
             # Generate tokens one by one
             for _ in tqdm(range(512), desc="Generating Tokens (Optimized Forward)"):
                 # For each step, create a new dictionary to store activation data
-                activation_data_for_step = {}
+                activation_data_for_step: Dict[str, Any] = {}
                 capture_state['capture_dict'] = activation_data_for_step
 
                 outputs = model(input_ids=next_token_id, past_key_values=past_key_values, use_cache=True)

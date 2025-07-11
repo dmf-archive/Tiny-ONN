@@ -1,11 +1,11 @@
+import re  # Import re module
 from functools import partial
-import re # Import re module
 
 import torch
 from bitsandbytes.nn import Linear4bit
 from tqdm import tqdm
-from models.pruned_layers import PrunedQwen3DecoderLayer
 
+from models.pruned_layers import PrunedQwen3DecoderLayer
 from utils.logging_utils import log_message
 
 
@@ -20,14 +20,18 @@ def _capture_backward_hook(capture_state, module, grad_input, grad_output):
         num_features = grad.shape[-1]
         block_size = getattr(module, 'blocksize', 64)
         num_blocks = (num_features + block_size - 1) // block_size
+
+        # Vectorized computation of block gradient norms
+        padded_len = num_blocks * block_size
+        padding_needed = padded_len - num_features
+        padded_grad = torch.nn.functional.pad(grad, (0, padding_needed))
+        reshaped_grad = padded_grad.view(*grad.shape[:-1], num_blocks, block_size)
+        block_norms = torch.norm(reshaped_grad.float(), p=2, dim=-1)
         
-        block_grads = [
-            torch.norm(grad[..., i*block_size:min((i+1)*block_size, num_features)].float(), p=2).item()
-            for i in range(num_blocks)
-        ]
-        
+        block_grads = block_norms.flatten().tolist()
+
         if "gradient" not in data_dict_for_token[param_name]:
-             data_dict_for_token[param_name]["gradient"] = [0.0] * num_blocks
+            data_dict_for_token[param_name]["gradient"] = [0.0] * num_blocks
         
         for i, grad_val in enumerate(block_grads):
             data_dict_for_token[param_name]["gradient"][i] = grad_val
@@ -56,7 +60,7 @@ def run_per_token_backward_pass(model, full_sequence_ids, per_token_activation_d
                 hook_modules.append(module)
 
     num_generated_tokens = len(per_token_activation_data)
-    log_message(f"Starting per-token backward pass for {num_generated_tokens} generated tokens.")
+    log_message(f"Starting per-token backward pass for {num_generated_tokens} generated tokens (Optimized).")
 
     capture_state = {'capture_dict': None}
     handles = []
@@ -67,26 +71,37 @@ def run_per_token_backward_pass(model, full_sequence_ids, per_token_activation_d
             )
             handles.append(handle)
 
+        # 1. Single forward pass to get all logits
+        input_ids = full_sequence_ids.unsqueeze(0)
+        outputs = model(input_ids=input_ids)
+        logits = outputs.logits
+
+        # 2. Per-token backward pass from the pre-computed logits
         for i in tqdm(range(num_generated_tokens), desc="Per-Token Backward Pass (Optimized)"):
             model.zero_grad()
             
             current_token_data_dict = per_token_activation_data[i]
             capture_state['capture_dict'] = current_token_data_dict
 
-            current_sequence_len = prompt_len + i + 1
-            input_ids_for_step = full_sequence_ids[:current_sequence_len].unsqueeze(0)
+            # The token index in the sequence for which we calculate the loss
+            token_idx_in_sequence = prompt_len + i
             
-            if input_ids_for_step.shape[1] <= prompt_len:
-                 continue
-
-            labels = input_ids_for_step.clone()
-            labels[:, :-1] = -100
-
-            outputs = model(input_ids=input_ids_for_step, labels=labels)
-            loss = outputs.loss
+            # Logits for predicting the token at `token_idx_in_sequence`
+            # are at position `token_idx_in_sequence - 1`
+            pred_logits = logits[:, token_idx_in_sequence - 1, :]
             
-            if loss is not None and loss.requires_grad:
-                loss.backward()
+            # The actual token (label) is at `token_idx_in_sequence`
+            true_label = full_sequence_ids[token_idx_in_sequence].unsqueeze(0)
+
+            # Calculate loss for this single token
+            loss = torch.nn.functional.cross_entropy(pred_logits, true_label)
+            
+            if loss.requires_grad:
+                # Retain graph is needed as we perform backward on a part of the graph 
+                # in each iteration, and the graph is needed for the next iteration.
+                is_last_iteration = (i == num_generated_tokens - 1)
+                loss.backward(retain_graph=not is_last_iteration)
+
     finally:
         for handle in handles:
             handle.remove()

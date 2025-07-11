@@ -2,6 +2,7 @@ import json
 import os
 import re
 import sqlite3
+from typing import Dict
 
 import matplotlib.colors as mcolors
 import matplotlib.pyplot as plt
@@ -13,7 +14,7 @@ from config import PLOT_CONFIG, QUANTIZATION_SCALE, VIEW_MODE_MAP
 from .logging_utils import log_debug
 
 # Global map for param_name to ID and vice-versa
-id_to_param_name_map = {}
+id_to_param_name_map: Dict[str, str] = {}
 
 def get_plot_config(view_mode, **kwargs):
     """
