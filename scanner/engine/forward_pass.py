@@ -15,6 +15,9 @@ def _patched_forward(module, capture_state, original_forward, *args, **kwargs):
     if (activation_data := capture_state.get("capture_dict")) is None:
         return original_forward(x, **kwargs)
 
+    if not hasattr(module, "param_name"):
+        return original_forward(x, **kwargs)
+
     param_name = module.param_name
     num_features = x.shape[-1]
     block_size = 64
@@ -82,7 +85,8 @@ def run_forward_pass_and_capture_activations(
             module.param_name = name
             hook_modules.append(module)
 
-    generated_ids, per_token_block_data = [], []
+    generated_ids: list[int] = []
+    per_token_block_data: list[dict[str, Any]] = []
     model.eval()
     capture_state: dict[str, dict[str, Any] | None] = {"capture_dict": None}
     original_forwards = {m: m.forward for m in hook_modules}
@@ -100,14 +104,15 @@ def run_forward_pass_and_capture_activations(
                 outputs.logits[:, -1, :], temperature, top_p
             )
 
-            for _ in tqdm(range(512), desc="Generating Tokens (fMRI Forward)"):
-                capture_state["capture_dict"] = {}
+            for _ in tqdm(range(128), desc="Generating Tokens (fMRI Forward)"):
+                current_capture_dict: dict[str, Any] = {}
+                capture_state["capture_dict"] = current_capture_dict
                 outputs = model(
                     input_ids=next_token_id,
                     past_key_values=past_key_values,
                     use_cache=True,
                 )
-                per_token_block_data.append(capture_state["capture_dict"])
+                per_token_block_data.append(current_capture_dict)
                 past_key_values = outputs.past_key_values
                 next_token_id = _sample_next_token(
                     outputs.logits[:, -1, :], temperature, top_p
@@ -123,6 +128,6 @@ def run_forward_pass_and_capture_activations(
 
     final_response = tokenizer.decode(generated_ids, skip_special_tokens=True)
     full_sequence_ids = torch.cat(
-        [input_ids[0], torch.tensor(generated_ids, device=model.device.type)]
+        [input_ids[0], torch.tensor(generated_ids, device=input_ids.device)]
     )
     return final_response, per_token_block_data, full_sequence_ids, input_ids.shape[1]

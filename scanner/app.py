@@ -5,13 +5,14 @@ import sqlite3
 import sys
 from datetime import datetime
 from threading import Thread
-from typing import Any, Optional
+from typing import Any
 
 import gradio as gr
 import torch
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
+    BitsAndBytesConfig,
     TextIteratorStreamer,
 )
 
@@ -26,7 +27,7 @@ def log_message(message: str, level: str = "INFO"):
     print(f"{level}: {message}")
 
 
-def initialize_app(model_path: str, db_path: Optional[str] = None) -> dict[str, Any]:
+def initialize_app(model_path: str, db_path: str | None = None) -> dict[str, Any]:
     state: dict[str, Any] = {
         "model": None,
         "tokenizer": None,
@@ -58,15 +59,17 @@ def initialize_app(model_path: str, db_path: Optional[str] = None) -> dict[str, 
 
         log_message(f"Loading tokenizer and model from: {model_path}")
         state["tokenizer"] = AutoTokenizer.from_pretrained(
-            model_path, cache_dir=cache_path, trust_remote_code=True, local_files_only=True
+            model_path, cache_dir=cache_path, trust_remote_code=True
         )
+        if state["tokenizer"].pad_token is None:
+            state["tokenizer"].pad_token = state["tokenizer"].eos_token
+            state["tokenizer"].pad_token_id = state["tokenizer"].eos_token_id
         state["model"] = AutoModelForCausalLM.from_pretrained(
             model_path,
             torch_dtype=torch.bfloat16,
             device_map="auto",
             trust_remote_code=True,
             cache_dir=cache_path,
-            local_files_only=True,
         )
         log_message("Model loaded successfully.")
 
@@ -149,7 +152,6 @@ def main(args):
         user_message,
         history: list,
         view_mode: str,
-        view_mode: str,
         vmin: float,
         vmax: float,
         use_fmri: bool,
@@ -170,12 +172,19 @@ def main(args):
 
             num_tokens = len(per_token_data)
             if num_tokens > 0:
-                store_per_token_data(per_token_data, state["total_tokens_processed"], state)
+                store_per_token_data(
+                    per_token_data, state["total_tokens_processed"], state
+                )
                 state["total_tokens_processed"] += num_tokens
 
             last_token_idx = state["total_tokens_processed"] - 1
             final_plot = update_plot(
-                last_token_idx, view_mode, state["db_conn"], vmin=vmin, vmax=vmax
+                last_token_idx,
+                view_mode,
+                state["db_conn"],
+                state["total_tokens_processed"],
+                vmin=vmin,
+                vmax=vmax,
             )
             slider_update = gr.update(
                 maximum=max(0, last_token_idx), value=last_token_idx
@@ -209,8 +218,16 @@ def main(args):
                 yield "", history, None, gr.update()
 
     def update_plot_wrapper(token_idx, view_mode, vmin, vmax):
+        if token_idx is None:
+            return None
         return update_plot(
-            int(token_idx), view_mode, state["db_conn"], vmin=vmin, vmax=vmax
+            int(token_idx),
+            view_mode,
+            state["db_conn"],
+            state["total_tokens_processed"],
+            state["id_to_param_name_map"],
+            vmin=vmin,
+            vmax=vmax,
         )
 
     demo = create_main_ui(
