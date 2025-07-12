@@ -38,7 +38,7 @@ def get_plot_config(view_mode, **kwargs):
 def fetch_and_prepare_data(db_conn, token_idx):
     global id_to_param_name_map
     if not id_to_param_name_map:
-        map_path = os.path.join("common/data/metadata", "param_name_map.json")
+        map_path = os.path.join("data/metadata", "param_name_map.json")
         if os.path.exists(map_path):
             with open(map_path, encoding="utf-8") as f:
                 id_to_param_name_map = json.load(f)

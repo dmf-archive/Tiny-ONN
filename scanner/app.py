@@ -93,7 +93,7 @@ def initialize_app(model_path: str, db_path: str | None = None) -> dict[str, Any
         state["db_conn"].commit()
         log_message(f"Database setup at: {db_path}")
 
-    map_path = os.path.join("common/data/metadata", "param_name_map.json")
+    map_path = os.path.join("data/metadata", "param_name_map.json")
     if os.path.exists(map_path):
         with open(map_path, encoding="utf-8") as f:
             state["id_to_param_name_map"] = json.load(f)
