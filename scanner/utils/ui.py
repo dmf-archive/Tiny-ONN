@@ -231,15 +231,30 @@ def create_main_ui(
                     type="messages",
                     bubble_full_width=False,
                 )
-                with gr.Row():
-                    use_fmri_checkbox = gr.Checkbox(
-                        label="Enable fMRI Scan",
-                        value=True,
-                        info="Uncheck for pure inference mode",
-                        visible=not is_replay_mode,
-                    )
-                    submit_btn = gr.Button("Send", visible=not is_replay_mode)
-                msg = gr.Textbox(label="Your Message", visible=not is_replay_mode)
+                with gr.Row(equal_height=True):
+                    with gr.Column(scale=1, min_width=150):
+                        use_fmri_checkbox = gr.Checkbox(
+                            label="Enable fMRI Scan",
+                            value=True,
+                            info="Uncheck for pure inference",
+                            visible=not is_replay_mode,
+                        )
+                    with gr.Column(scale=1, min_width=150):
+                        no_think_checkbox = gr.Checkbox(
+                            label="No Think Mode",
+                            value=True,
+                            info="Force model to avoid reasoning",
+                            visible=not is_replay_mode,
+                        )
+                    with gr.Column(scale=2):
+                         submit_btn = gr.Button("Send", visible=not is_replay_mode, variant="primary")
+
+                msg = gr.Textbox(
+                    label="Your Message",
+                    visible=not is_replay_mode,
+                    placeholder="Type your message here...",
+                    lines=2,
+                )
 
             with gr.Column(scale=1):
                 plot_output = gr.Plot(label="Neural Activity Heatmap")
@@ -256,6 +271,11 @@ def create_main_ui(
                     label="Select View",
                     value="Synergistic Prediction Score (SPS)",
                 )
+                normalization_selector = gr.Radio(
+                    ["layer", "global"],
+                    label="Normalization Scope",
+                    value="layer",
+                )
                 time_slider = gr.Slider(
                     minimum=0,
                     maximum=max(0, total_tokens - 1),
@@ -268,7 +288,13 @@ def create_main_ui(
                     vmin_slider = gr.Number(label="Min Value (vmin)", value=-5.0)
                     vmax_slider = gr.Number(label="Max Value (vmax)", value=5.0)
 
-        plot_update_inputs = [time_slider, view_selector, vmin_slider, vmax_slider]
+        plot_update_inputs = [
+            time_slider,
+            view_selector,
+            vmin_slider,
+            vmax_slider,
+            normalization_selector,
+        ]
         for control in plot_update_inputs:
             control.change(update_plot_fn, plot_update_inputs, [plot_output])
 
@@ -280,6 +306,7 @@ def create_main_ui(
                 vmin_slider,
                 vmax_slider,
                 use_fmri_checkbox,
+                no_think_checkbox,
             ]
             submit_outputs = [msg, chatbot, plot_output, time_slider]
             submit_btn.click(process_input_fn, submit_inputs, submit_outputs)
