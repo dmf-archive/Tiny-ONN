@@ -1,25 +1,37 @@
-from typing import Any
+from typing import Any, cast
 
 import torch
-from transformers import GenerationConfig, PreTrainedTokenizer
+from transformers import (
+    BatchEncoding,
+    GenerationConfig,
+    PreTrainedModel,
+    PreTrainedTokenizer,
+)
 
 
 def run_forward_pass_and_capture_activations(
-    model: torch.nn.Module,
+    model: PreTrainedModel,
     tokenizer: PreTrainedTokenizer,
     messages: list[dict[str, str]],
     temperature: float = 0.7,
     top_p: float = 0.95,
     max_new_tokens: int = 256,
 ) -> tuple[str, list[dict[str, Any]], torch.Tensor, int]:
-    
-    inputs = tokenizer.apply_chat_template(
+
+    inputs_raw = tokenizer.apply_chat_template(
         messages,
         tokenize=True,
         add_generation_prompt=True,
         return_tensors="pt",
         return_dict=True,
-    ).to(model.device)
+    )
+
+    # Mypy cannot infer that `return_dict=True` guarantees a BatchEncoding,
+    # so we add a runtime check and cast to satisfy the type checker.
+    if not isinstance(inputs_raw, BatchEncoding):
+        raise TypeError(f"Expected BatchEncoding, but got {type(inputs_raw)}")
+
+    inputs = cast(BatchEncoding, inputs_raw).to(model.device)
 
     prompt_len = inputs["input_ids"].shape[1]
 

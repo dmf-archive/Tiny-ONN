@@ -4,7 +4,6 @@ import os
 import sys
 from datetime import datetime
 from pathlib import Path
-from threading import Thread
 from typing import Any
 
 import gradio as gr
@@ -14,7 +13,6 @@ from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
     BitsAndBytesConfig,
-    TextIteratorStreamer,
 )
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -187,14 +185,13 @@ def main(args):
     ):
         current_history = history or []
 
-        if no_think_mode:
-            if not any(d.get("role") == "system" for d in current_history):
-                current_history.insert(0, {"role": "system", "content": "/no_think"})
+        if no_think_mode and not any(d.get("role") == "system" for d in current_history):
+            current_history.insert(0, {"role": "system", "content": "/no_think"})
 
         current_history.append({"role": "user", "content": user_message})
 
         full_response = ""
-        per_token_data = []
+        per_token_data: list[dict] = []
         final_plot = None
         slider_update = gr.update()
 
@@ -230,7 +227,7 @@ def main(args):
         # --- Unified Response Handling ---
         import re
         think_match = re.search(r"<think>(.*?)</think>", full_response, re.DOTALL)
-        
+
         if think_match:
             think_content = think_match.group(1).strip()
             visible_response = full_response.replace(think_match.group(0), "").strip()

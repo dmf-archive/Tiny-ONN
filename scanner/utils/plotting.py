@@ -1,5 +1,4 @@
 import re
-from typing import Union
 
 import matplotlib.colors as mcolors
 import matplotlib.pyplot as plt
@@ -19,7 +18,7 @@ def _get_plot_config(view_mode):
     key = "activation" if "Activation" in view_mode else "gradient_norm"
     return PLOT_CONFIG[key].copy()
 
-def _prepare_base_data(data: np.ndarray, token_idx: Union[int, slice], id_to_param_name_map: dict[str, str]):
+def _prepare_base_data(data: np.ndarray, token_idx: int | slice, id_to_param_name_map: dict[str, str]):
     if data is None or not id_to_param_name_map:
         return None
 
@@ -71,7 +70,7 @@ def _prepare_base_data(data: np.ndarray, token_idx: Union[int, slice], id_to_par
     df.dropna(subset=['layer_index', 'layer_type'], inplace=True)
     df['layer_index'] = df['layer_index'].astype(int)
     df = df.sort_values(by=["layer_index", "layer_type", "block_idx"])
-    
+
     layer_type_map = {t: i for i, t in enumerate(df['layer_type'].unique())}
     df['layer_type_idx'] = df['layer_type'].map(layer_type_map)
     return df
@@ -86,7 +85,7 @@ def _calculate_z_scores(df: pd.DataFrame, scope: str = "layer"):
                 group[f"{metric}_z_score"] = (group[metric] - mean) / std if std > 1e-9 else 0.0
             return group
         return df.groupby("layer_index").apply(normalize_group, include_groups=False).reset_index()
-    
+
     # Global scope
     for metric in metrics:
         mean = df[metric].mean()
@@ -123,7 +122,7 @@ def create_heatmap(df, value_col, title, cmap, vmin, vmax):
 def update_plot(token_idx, view_mode, data, total_tokens_processed, id_to_param_name_map, normalization_scope="layer", vmin=-5.0, vmax=5.0, **kwargs):
     df = _prepare_base_data(data, token_idx, id_to_param_name_map)
     config = _get_plot_config(view_mode)
-    
+
     if df is None or df.empty:
         fig, ax = plt.subplots(figsize=(14, 10))
         ax.text(0.5, 0.5, f"No data available for token_idx: {token_idx}", ha="center", va="center", transform=ax.transAxes)
@@ -148,21 +147,21 @@ def update_plot(token_idx, view_mode, data, total_tokens_processed, id_to_param_
                 all_df = _prepare_base_data(data, slice(None), id_to_param_name_map)
                 all_df = _calculate_z_scores(all_df, scope=normalization_scope)
                 all_df["SPS"] = all_df["activation_z_score"] - all_df["grad_norm_z_score"]
-                
+
                 integrated_sps = all_df.groupby(["param_name", "block_idx"])["SPS"].sum().reset_index()
                 integrated_sps.rename(columns={'SPS': 'integrated_SPS'}, inplace=True)
-                
+
                 df = df.merge(integrated_sps, on=['param_name', 'block_idx'], how='left')
                 df['integrated_SPS'] = df['integrated_SPS'].fillna(0)
-                
+
                 # Normalize for visualization
                 mean_isps = df['integrated_SPS'].mean()
                 std_isps = df['integrated_SPS'].std()
                 df['integrated_SPS'] = (df['integrated_SPS'] - mean_isps) / std_isps if std_isps > 1e-9 else 0.0
-                
+
                 value_col = 'integrated_SPS'
                 title = f"Integrated SPS (Tokens: {total_tokens_processed}, Norm: {normalization_scope.capitalize()})"
-    
+
     # --- Raw value views ---
     else:
         value_col = "activation" if "Activation" in view_mode else "gradient_norm"

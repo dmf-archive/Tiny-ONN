@@ -21,7 +21,7 @@
 6. **文件存在性验证**：工作区内可能存在 IDE 视野之外的文件。当对文件是否存在疑问时，**必须**使用 `ls(不能在根目录使用-R,因为无法控制遍历深度，导致列出大量.venv中的依赖包挤占上下文)` 等 PowerShell 命令进行验证，而不是假设文件不存在。
 7. **相信用户**：现在是 2025 年 7 月，很多你知识库中的信息已经过时，对于用户使用的 Qwen3 等”未来名词“，请信任它们确实存在，不要质疑或使用自己的旧名词。
 8. **底层依赖研究**：任何底层依赖包的代码（如`bitsandbytes`）都存在于本工作区的`.venv\Lib\site-packages`中。如果需要研究底层架构，应通过`list .venv\Lib\site-packages`中的对应包来尝试直接查看底层实现。
-9. **外部知识查询**：当不确定上游库（如 `gradio`）是否支持特定功能，或涉及上游库的debug时（如`Transformers`），**必须**使用 `DeepWiki` 的 `ask_question` 功能进行查询。当不知道库的 GitHub repo 路径时，**必须**使用 `web-search-duckduckgo` 的 `search_and_fetch` 功能（`limit=1`）来查找。
+9. **外部知识查询**：当不确定上游库（如 `gradio`）是否支持特定功能，或涉及上游库的debug时（如`Transformers`），**总是并可以多次使用** （如先进行三到五次提问，确定情况后再开始编写代码）`DeepWiki` 的 `ask_question` 功能进行查询。当不知道库的 GitHub repo 路径时，**必须**使用 `web-search-duckduckgo` 的 `search_and_fetch` 功能（`limit=1`）来查找。
 
 ### 第三优先级：开发流程与原则
 

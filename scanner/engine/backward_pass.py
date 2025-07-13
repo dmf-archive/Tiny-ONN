@@ -13,11 +13,11 @@ def _capture_backward_hook(module, grad_input, grad_output, data_dict_wrapper):
         grad = grad_output[0].float()
         num_features = grad.shape[-1]
         block_size = getattr(module, "blocksize", 64)
-        
+
         padding_size = (block_size - (num_features % block_size)) % block_size
         if padding_size > 0:
             grad = torch.nn.functional.pad(grad, (0, padding_size))
-        
+
         reshaped_grad = grad.view(-1, block_size)
         block_grads = torch.linalg.vector_norm(reshaped_grad, ord=2, dim=-1).tolist()
 
@@ -62,9 +62,9 @@ def run_per_token_backward_pass(
     try:
         for i in tqdm(range(num_generated_tokens), desc="Per-Token Backward Pass"):
             model.zero_grad()
-            
+
             data_dict_wrapper[0] = per_token_activation_data[i]
-            
+
             current_token_id = full_sequence_ids[prompt_len + i].unsqueeze(0).unsqueeze(0)
             labels = current_token_id.clone()
 
@@ -75,7 +75,7 @@ def run_per_token_backward_pass(
                 use_cache=True,
             )
             loss = outputs.loss
-            
+
             if loss is not None and loss.requires_grad:
                 loss.backward()
 

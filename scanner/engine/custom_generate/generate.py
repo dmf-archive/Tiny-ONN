@@ -1,8 +1,10 @@
+from functools import partial
+from typing import Any
+
 import torch
 import torch.nn.functional as F
 from bitsandbytes.nn import Linear4bit
-from functools import partial
-from typing import Any, List
+
 
 def _capture_block_activations_hook(
     name: str, data_dict_for_token: dict, module: torch.nn.Module, inp: tuple, out: Any
@@ -28,22 +30,22 @@ def generate(
     input_ids: torch.Tensor,
     generation_config=None,
     **kwargs,
-) -> tuple[torch.Tensor, List[dict]]:
-    
+) -> tuple[torch.Tensor, list[dict]]:
+
     tokenizer = kwargs.pop("tokenizer")
-    per_token_data: List[dict] = []
-    
+    per_token_data: list[dict] = []
+
     generation_config = generation_config or model.generation_config
     temperature = generation_config.temperature
     top_p = generation_config.top_p
     max_new_tokens = generation_config.max_new_tokens
-    
+
     generated_ids = []
-    
+
     hook_modules = []
     for name, module in model.named_modules():
         if isinstance(module, Linear4bit):
-            setattr(module, "param_name", name)
+            module.param_name = name
             hook_modules.append(module)
 
     current_ids = input_ids
@@ -64,7 +66,7 @@ def generate(
 
         handles = []
         current_token_data_dict: dict[str, Any] = {}
-        
+
         try:
             for module in hook_modules:
                 handles.append(
@@ -79,7 +81,7 @@ def generate(
 
             with torch.no_grad():
                 outputs = model(**model_inputs, return_dict=True, use_cache=True)
-            
+
             per_token_data.append(current_token_data_dict)
 
         finally:
@@ -88,7 +90,7 @@ def generate(
 
         next_token_logits = outputs.logits[:, -1, :]
         past_key_values = outputs.past_key_values
-        
+
         # Update variables for the next iteration
         attention_mask = torch.cat([attention_mask, attention_mask.new_ones((attention_mask.shape[0], 1))], dim=-1)
         position_ids = torch.tensor([[cache_position[-1] + 1]], device=model.device, dtype=torch.long)
@@ -106,13 +108,13 @@ def generate(
 
         probs = F.softmax(next_token_logits / temperature, dim=-1)
         next_token = torch.multinomial(probs, num_samples=1)
-        
+
         generated_ids.append(next_token.item())
         current_ids = next_token
 
         if next_token.item() == tokenizer.eos_token_id:
             break
-            
+
     for module in hook_modules:
         if hasattr(module, "param_name"):
             delattr(module, "param_name")

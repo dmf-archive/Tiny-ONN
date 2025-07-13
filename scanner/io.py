@@ -65,7 +65,7 @@ def append_records_to_mscan(filepath: Path, new_records: np.ndarray, sequence_in
         return
 
     metadata, old_data = load_mscan_file(filepath)
-    
+
     # Append the new sequence information to the sequences list
     sequences = metadata.get("sequences", [])
     sequences.append(sequence_info)
