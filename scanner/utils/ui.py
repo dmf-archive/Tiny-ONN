@@ -246,6 +246,13 @@ def create_main_ui(
                             info="Force model to avoid reasoning",
                             visible=not is_replay_mode,
                         )
+                    with gr.Column(scale=1, min_width=150):
+                        fast_scan_checkbox = gr.Checkbox(
+                            label="Fast Scan",
+                            value=False,
+                            info="Enable full sequence scan",
+                            visible=not is_replay_mode,
+                        )
                     with gr.Column(scale=2):
                          submit_btn = gr.Button("Send", visible=not is_replay_mode, variant="primary")
 
@@ -307,6 +314,7 @@ def create_main_ui(
                 vmax_slider,
                 use_fmri_checkbox,
                 no_think_checkbox,
+                fast_scan_checkbox,
             ]
             submit_outputs = [msg, chatbot, plot_output, time_slider]
             submit_btn.click(process_input_fn, submit_inputs, submit_outputs)

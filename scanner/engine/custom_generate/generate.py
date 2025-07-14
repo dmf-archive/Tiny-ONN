@@ -1,16 +1,18 @@
 from functools import partial
-from typing import Any
+from typing import Any, List, Dict
 
 import torch
 import torch.nn.functional as F
 from bitsandbytes.nn import Linear4bit
 
+_scan_mode = "per_token"
+_per_token_activation_data_storage: List[Dict[str, Any]] = []
+
 
 def _capture_block_activations_hook(
-    name: str, data_dict_for_token: dict, module: torch.nn.Module, inp: tuple, out: Any
+    name: str, module: torch.nn.Module, inp: tuple, out: Any
 ):
-    if name not in data_dict_for_token:
-        data_dict_for_token[name] = {}
+    global _per_token_activation_data_storage, _scan_mode
 
     x = inp[0]
     num_features = x.shape[-1]
@@ -20,9 +22,25 @@ def _capture_block_activations_hook(
     token_slice = x[:, -1, :]
     padded_x = F.pad(token_slice, (0, num_blocks * block_size - num_features))
     reshaped_x = padded_x.view(x.shape[0], num_blocks, block_size)
-    block_norms = torch.norm(reshaped_x.float(), p=2, dim=-1).squeeze(0).tolist()
+    block_norms = torch.norm(reshaped_x.float(), p=2, dim=-1).squeeze(0)
 
-    data_dict_for_token[name]["activation"] = block_norms
+    if _scan_mode == "per_token":
+        current_token_data_dict = {}
+        if name not in current_token_data_dict:
+            current_token_data_dict[name] = {}
+        current_token_data_dict[name]["activation"] = block_norms.tolist()
+        _per_token_activation_data_storage.append(current_token_data_dict)
+
+    elif _scan_mode == "full_sequence":
+        if not _per_token_activation_data_storage:
+            _per_token_activation_data_storage.append({})
+        
+        storage = _per_token_activation_data_storage[0]
+        if name not in storage:
+            storage[name] = {"activation_sum": block_norms, "count": 1}
+        else:
+            storage[name]["activation_sum"] += block_norms
+            storage[name]["count"] += 1
 
 
 def generate(
@@ -31,9 +49,10 @@ def generate(
     generation_config=None,
     **kwargs,
 ) -> tuple[torch.Tensor, list[dict]]:
-
+    global _per_token_activation_data_storage, _scan_mode
+    _per_token_activation_data_storage = []
+    _scan_mode = kwargs.pop("scan_mode", "per_token")
     tokenizer = kwargs.pop("tokenizer")
-    per_token_data: list[dict] = []
 
     generation_config = generation_config or model.generation_config
     temperature = generation_config.temperature
@@ -65,8 +84,6 @@ def generate(
         )
 
         handles = []
-        current_token_data_dict: dict[str, Any] = {}
-
         try:
             for module in hook_modules:
                 handles.append(
@@ -74,15 +91,12 @@ def generate(
                         partial(
                             _capture_block_activations_hook,
                             module.param_name,
-                            current_token_data_dict,
                         )
                     )
                 )
 
             with torch.no_grad():
                 outputs = model(**model_inputs, return_dict=True, use_cache=True)
-
-            per_token_data.append(current_token_data_dict)
 
         finally:
             for handle in handles:
@@ -118,6 +132,18 @@ def generate(
     for module in hook_modules:
         if hasattr(module, "param_name"):
             delattr(module, "param_name")
+
+    if _scan_mode == "full_sequence" and _per_token_activation_data_storage:
+        aggregated_data = {}
+        storage = _per_token_activation_data_storage[0]
+        for name, metrics in storage.items():
+            if "activation_sum" in metrics and metrics["count"] > 0:
+                aggregated_data[name] = {
+                    "activation": (metrics["activation_sum"] / metrics["count"]).tolist()
+                }
+        per_token_data = [aggregated_data]
+    else:
+        per_token_data = _per_token_activation_data_storage
 
     final_ids = torch.cat([input_ids.squeeze(0), torch.tensor(generated_ids, device=model.device, dtype=torch.long)])
     return final_ids, per_token_data

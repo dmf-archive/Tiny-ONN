@@ -121,35 +121,55 @@ def initialize_app(model_path: str, mscan_path: str | None = None) -> dict[str, 
     return state
 
 
-def store_per_token_data(per_token_data: list[dict], start_idx: int, state: dict, source_text: str = ""):
+def store_per_token_data(
+    per_token_data: list[dict],
+    start_idx: int,
+    state: dict,
+    source_text: str = "",
+    scan_mode: str = "per_token",
+):
     if not state["param_name_to_id_map"]:
         log_message("Param map not available.", level="ERROR")
         return
 
     record_list = []
-    for i, token_data in enumerate(per_token_data):
-        current_token_idx = start_idx + i
-        for param_name, metrics in token_data.items():
-            param_id = state["param_name_to_id_map"].get(param_name)
-            if param_id is None:
-                continue
+    num_records_for_sequence = 0
 
-            activations = metrics.get("activation", [])
-            num_blocks = len(activations)
-            gradients = metrics.get("gradient", [0.0] * num_blocks)
-
-            for block_idx, (act, grad) in enumerate(
-                zip(activations, gradients, strict=False)
-            ):
-                record_list.append(
-                    (
-                        current_token_idx,
-                        param_id,
-                        block_idx,
-                        int(act),
-                        int(grad),
+    if scan_mode == "per_token":
+        num_records_for_sequence = len(per_token_data)
+        for i, token_data in enumerate(per_token_data):
+            current_idx = start_idx + i
+            for param_name, metrics in token_data.items():
+                param_id = state["param_name_to_id_map"].get(param_name)
+                if param_id is None:
+                    continue
+                activations = metrics.get("activation", [])
+                num_blocks = len(activations)
+                gradients = metrics.get("gradient", [0.0] * num_blocks)
+                for block_idx, (act, grad) in enumerate(
+                    zip(activations, gradients, strict=False)
+                ):
+                    record_list.append(
+                        (current_idx, param_id, block_idx, int(act), int(grad))
                     )
-                )
+    elif scan_mode == "full_sequence":
+        if per_token_data:
+            num_records_for_sequence = 1
+            sample_data = per_token_data[0]
+            current_idx = start_idx
+            for param_name, metrics in sample_data.items():
+                param_id = state["param_name_to_id_map"].get(param_name)
+                if param_id is None:
+                    continue
+                activations = metrics.get("activation", [])
+                num_blocks = len(activations)
+                gradients = metrics.get("gradient", [0.0] * num_blocks)
+                for block_idx, (act, grad) in enumerate(
+                    zip(activations, gradients, strict=False)
+                ):
+                    record_list.append(
+                        (current_idx, param_id, block_idx, int(act), int(grad))
+                    )
 
     if not record_list:
         return
@@ -158,7 +178,7 @@ def store_per_token_data(per_token_data: list[dict], start_idx: int, state: dict
 
     sequence_info = {
         "sequence_id": len(state["metadata"].get("sequences", [])),
-        "num_tokens": len(per_token_data),
+        "num_tokens": num_records_for_sequence,
         "source": source_text,
     }
 
@@ -182,6 +202,7 @@ def main(args):
         vmax: float,
         use_fmri: bool,
         no_think_mode: bool,
+        fast_scan: bool,
     ):
         current_history = history or []
 
@@ -196,6 +217,7 @@ def main(args):
         slider_update = gr.update()
 
         if use_fmri:
+            scan_mode = "full_sequence" if fast_scan else "per_token"
             full_response, per_token_data, _, _ = run_fmri_scan(
                 model=state["model"],
                 tokenizer=state["tokenizer"],
@@ -203,6 +225,7 @@ def main(args):
                 temperature=0.7,
                 top_p=0.95,
                 max_new_tokens=256,
+                scan_mode=scan_mode,
             )
         else:
             inputs = state["tokenizer"].apply_chat_template(
@@ -239,12 +262,15 @@ def main(args):
             current_history.append({"role": "assistant", "content": full_response})
 
         if use_fmri and per_token_data:
-            # The source text for this sequence is the user message and the assistant response
+            scan_mode = "full_sequence" if fast_scan else "per_token"
             source_text = f"User: {user_message}\nAssistant: {full_response}"
             store_per_token_data(
-                per_token_data, state["total_tokens_processed"], state, source_text
+                per_token_data,
+                state["total_tokens_processed"],
+                state,
+                source_text,
+                scan_mode=scan_mode,
             )
-            # total_tokens_processed is now correctly updated inside store_per_token_data
             last_token_idx = state["total_tokens_processed"] - 1
             final_plot = update_plot(
                 last_token_idx,

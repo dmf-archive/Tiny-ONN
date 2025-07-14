@@ -16,6 +16,7 @@ def run_forward_pass_and_capture_activations(
     temperature: float = 0.7,
     top_p: float = 0.95,
     max_new_tokens: int = 256,
+    scan_mode: str = "per_token",
 ) -> tuple[str, list[dict[str, Any]], torch.Tensor, int]:
 
     inputs_raw = tokenizer.apply_chat_template(
@@ -26,8 +27,6 @@ def run_forward_pass_and_capture_activations(
         return_dict=True,
     )
 
-    # Mypy cannot infer that `return_dict=True` guarantees a BatchEncoding,
-    # so we add a runtime check and cast to satisfy the type checker.
     if not isinstance(inputs_raw, BatchEncoding):
         raise TypeError(f"Expected BatchEncoding, but got {type(inputs_raw)}")
 
@@ -50,6 +49,7 @@ def run_forward_pass_and_capture_activations(
         custom_generate="scanner/engine",
         trust_remote_code=True,
         tokenizer=tokenizer,
+        scan_mode=scan_mode,
     )
 
     final_response = tokenizer.decode(
