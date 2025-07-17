@@ -1,0 +1,3 @@
+[submodule "ref/DynMoE"]
+	path = ref/DynMoE
+	url = https://github.com/LINs-lab/DynMoE
