@@ -12,13 +12,20 @@ dependencies = [
   "datasets>=3.6.0",
   "gradio>=5.35.0",
   "matplotlib",
+  "pytest>=8.4.1",
+  "pyyaml>=6.0.2",
   "scikit-learn>=1.7.0",
+  "seaborn>=0.13.2",
   "tensorboard>=2.14.0",
   "torch>=2.7.1",
   "tqdm>=4.67.1",
   "transformers>=4.53.1",
   "umap-learn>=0.5.9.post2",
 ]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["tiny_onn*"]
 
 [project.urls]
 "Homepage" = "https://github.com/dmf-archive/Tiny-ONN"
@@ -47,6 +54,8 @@ name = "pytorch-cu128"
 url = "https://download.pytorch.org/whl/cu128"
 explicit = true
 
+[tool.ruff]
+exclude = ["ref", "exp", ".venv"]
+
 [tool.ruff.lint]
 select = ["W", "F", "I", "UP", "B", "NPY", "SIM", "ISC", "TID"]
-exclude = ["./ref/"]

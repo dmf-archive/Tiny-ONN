@@ -1,7 +1,10 @@
+from collections import defaultdict
+
 import torch
 import torch.nn as nn
-from collections import defaultdict
+
 from tiny_onn.hmoe_poc.model import PocHMoEModel
+
 
 class GradientInterceptor:
     def __init__(self):
@@ -13,15 +16,15 @@ class GradientInterceptor:
             module._saved_input = input_tuple[0].detach()
 
     def backward_hook(self, module, grad_input, grad_output):
-        if not hasattr(module, '_saved_input'):
+        if not hasattr(module, "_saved_input"):
             return
 
         input_tensor = module._saved_input
         grad_output_tensor = grad_output[0]
-        
-        per_token_grad = torch.einsum('bi,bo->boi', input_tensor, grad_output_tensor)
+
+        per_token_grad = torch.einsum("bi,bo->boi", input_tensor, grad_output_tensor)
         surprise = torch.linalg.vector_norm(per_token_grad, dim=(1, 2))
-        
+
         # This mapping is simplified for PoC. In a real scenario,
         # a more robust way to identify the expert globally would be needed.
         group_id = self.expert_to_group_map[module]
@@ -29,7 +32,7 @@ class GradientInterceptor:
         global_expert_name = f"Group_{group_id}-Expert_{expert_id_in_group}"
 
         self.surprises[global_expert_name].append(surprise.cpu().numpy())
-        
+
         del module._saved_input
 
     def attach(self, model):
@@ -49,6 +52,7 @@ class GradientInterceptor:
             handle.remove()
         self.handles.clear()
 
+
 def run_hmoe_poc():
     vocab_size = 100
     d_model = 32
@@ -59,7 +63,9 @@ def run_hmoe_poc():
     batch_size = 6
     seq_len = 8
 
-    model = PocHMoEModel(vocab_size, d_model, n_groups, n_experts_per_group, top_k_l1, top_k_l2)
+    model = PocHMoEModel(
+        vocab_size, d_model, n_groups, n_experts_per_group, top_k_l1, top_k_l2
+    )
     interceptor = GradientInterceptor()
     interceptor.attach(model)
 
@@ -70,7 +76,7 @@ def run_hmoe_poc():
     loss_fn = nn.CrossEntropyLoss()
 
     print("--- Running Hierarchical MoE Proof-of-Concept ---")
-    
+
     optimizer.zero_grad()
     output_logits = model(input_data)
     loss = loss_fn(output_logits.view(-1, vocab_size), target_data.view(-1))
@@ -86,10 +92,11 @@ def run_hmoe_poc():
             for i, surprise_batch in enumerate(surprises_list):
                 print(f"  - Surprise values (batch size: {len(surprise_batch)}):")
                 for token_idx, value in enumerate(surprise_batch):
-                     print(f"    Token {token_idx}: {value:.4f}")
+                    print(f"    Token {token_idx}: {value:.4f}")
 
     interceptor.clear()
     print("\n--- HMoE PoC Finished ---")
+
 
 if __name__ == "__main__":
     run_hmoe_poc()

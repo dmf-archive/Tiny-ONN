@@ -1,78 +1,82 @@
-# Tiny-ONN: A New Paradigm for Neural Network Design
+# Tiny-ONN: A Decoupled Meta-Learning Framework
 
 [![Theory: IPWT](https://img.shields.io/badge/Theory-IPWT-blue)](https://github.com/dmf-archive/IPWT)
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
-[![Status: Phase 1 - Topological Imaging](https://img.shields.io/badge/Status-Phase%201%3A%20Topological%20Imaging-orange)](./docs/note.md)
+[![Status: Training](https://img.shields.io/badge/Status-Training%20Hyper--SMoE-green)](./docs/devlog/model_card.md)
 
-> "We are not merging models. We are decomposing one."
+> "We are not just training a model. We are training a model to learn how to learn more efficiently."
 
 ---
 
 ## What is Tiny-ONN?
 
-**Tiny-ONN (Tiny Ouroboros Neural Network)** is not just another neural network architecture. It is a research project and an engineering endeavor to establish a new paradigm for designing AI systems, moving from "black-box" training to **"white-box" topological reconfiguration**.
+**Tiny-ONN (Tiny Ouroboros Neural Network)** is a research project to build a new generation of AI systems based on the principle of **decoupled meta-learning**. We aim to move beyond monolithic, black-box architectures towards models that can dynamically route computation and specialize their knowledge, enabling greater efficiency and a stronger defense against catastrophic forgetting.
 
-Our core hypothesis is that a large, pre-trained dense model is not an inscrutable monolith, but a complex, entangled **functional topology**. Within this high-dimensional space, specialized "conceptual cells" and "functional circuits" have already emerged.
+Our core hypothesis is that a truly intelligent system requires two distinct learning processes:
+1.  A **Fast System (The Experts)** that directly learns to solve tasks and minimize prediction errors.
+2.  A **Slow System (The Router)** that meta-learns how to route problems to the correct experts, optimizing for the lowest possible **learning cost (Surprise)**.
 
-The goal of the Tiny-ONN project is to:
+This "fast/slow thinking" paradigm, inspired by cognitive science and our foundational **[IPWT (Integrated Predictive Workspace Theory)](https://github.com/dmf-archive/IPWT)**, allows the model to physically isolate knowledge domains within its architecture, leading to more robust and efficient learning.
 
-1. **Image (Phase 1):** Develop tools to "see" and map this hidden functional topology.
-2. **Reconfigure (Phase 2):** Surgically extract the most critical functional components and rewire them into a new, sparse, efficient, and interpretable Mixture-of-Experts (MoE) architecture.
-3. **Evolve (Phase 3):** Implement advanced training strategies (like SMK) to allow this new architecture to learn and adapt with unprecedented efficiency.
+## Architecture: Hierarchical Mixture-of-Experts (HMoE)
 
-This project is built upon the theoretical foundation of **[IPWT (Integrated Predictive Workspace Theory)](https://github.com/dmf-archive/IPWT)**.
+To realize this vision, Tiny-ONN employs a **Hierarchical Mixture-of-Experts (HMoE)** architecture that replaces the standard Feed-Forward/MLP layers in the Transformer block.
 
-## Current Status: Phase 1 - Topological Imaging
+-   **Dynamic & Hierarchical Routing**: We use a two-level gating mechanism inspired by `DynMoE`'s `GAMoEGateT`. For each input token, a Level 1 router first selects a group of experts, and then a Level 2 router selects specific experts within that group. The number of activated experts is dynamic, allowing the model to allocate more computational resources to more complex tokens.
+-   **Hyper-Sparse Specialization**: Our current implementation experiments with a large number of extremely lightweight experts, shifting complexity from individual expert capacity to the routing network's intelligence.
 
-We are currently in **Phase 1**. Our primary focus is on building and refining the "scientific instrument" required to perform this topological analysis. We call this instrument our **Digital fMRI Scanner**.
+## Training Paradigm: Decoupled Meta-Learning
 
-The core of this scanner is the **Integrated Synergistic Prediction Score (`∫SPS`)**, a metric derived from our IPWT framework. `∫SPS` allows us to quantify the functional contribution of every parameter block within a model during a specific task, requiring only a single forward and backward pass. It acts as a "functional density meter," revealing which parts of the model are most critical for a given computation.
+The key innovation of Tiny-ONN is its training loop, which separates the optimization of the fast and slow systems.
 
-### A Glimpse into the Machine's Mind
+1.  **Phase 1: Expert Learning (Fast System)**
+    -   The router's weights are frozen.
+    -   The model performs a standard forward pass to generate predictions.
+    -   A primary loss (`L_main`, e.g., cross-entropy) is calculated and backpropagated.
+    -   Only the weights of the activated experts are updated to minimize the prediction error.
+    -   During this backpropagation, we use `backward_hooks` to intercept and cache the **gradient norm (Surprise)** generated by each token on its activated expert.
 
-Below are two preliminary visualizations from a scan of the `Qwen/Qwen3-1.7B` model. These "neuroimages" show the `∫SPS` distribution across all layers, revealing the model's functional hotspots during a task. (`3+5=?`)
+2.  **Phase 2: Gating Meta-Learning (Slow System)**
+    -   The experts' weights are frozen.
+    -   We use the cached data from Phase 1. The "ground truth" for the router is the expert path that produced the **minimum surprise**.
+    -   A secondary loss (`L_router`) is calculated to train the router to predict this minimum-surprise path for any given input.
+    -   Only the router's weights are updated.
 
-| Layer-wise Norm   | Global Norm     |
-| :---: | :-----: |
-| ![Layer Norm](./docs/img/sps_layer_norm.png)    | ![Global Norm](./docs/img/sps_global_norm.png)|
-| Highlights the relative importance of modules *within* each layer, showing localized functional specialization. | Reveals the absolute "hotspots" across the entire model, identifying globally critical computational cores. |
+This dual-optimizer, dual-backward pass approach ensures the learning signals are pure and allows the router to focus exclusively on its meta-task: becoming an efficient "manager" that minimizes the entire system's learning effort.
 
-The raw data for this scan is available for replay and further analysis: [`Qwen--Qwen3-1.7B_20250712_083017.mscan`](./data/scans/Qwen--Qwen3-1.7B_20250712_083017.mscan)
+## Current Implementation: Tiny-ONN 0.6B Hyper-SMoE
 
-These images, while preliminary, serve as our first proof-of-concept. They demonstrate that functional structures within the model are not random noise; they are **localizable, quantifiable, and structured**. This is the first light we've seen in the black box, and it validates our entire approach.
+We are currently focused on training and evaluating our first flagship model, designed to be trainable on a single consumer-grade GPU (e.g., RTX 2070 8GB).
 
-## The Road Ahead
+| Hyperparameter          | Value          | Notes                                        |
+| :---------------------- | :------------- | :------------------------------------------- |
+| **Base Model**          | `Qwen/Qwen3-0.6B` | Attention and Embedding layers are inherited & frozen. |
+| **Total Parameters**    | **~0.51 B**    | Backbone + 896 Experts.                      |
+| `num_experts_per_layer` | **32**         | Total MoE params are equivalent to the original MLP. |
+| `moe_intermediate_size` | **64**         | Creates extremely lightweight experts (~0.2M params each). |
+| **Training Strategy**   | **Online Distillation** | A 4-bit quantized `Qwen3-0.6B` acts as a live teacher. |
 
-Our next steps are focused on leveraging these imaging capabilities to tackle the core topological problem:
-
-1. **High-Throughput Scanning:** Automate the scanning process to analyze the model's response to large, specialized datasets (e.g., code, finance, literature).
-2. **Topological Data Analysis (TDA):** Apply advanced mathematical tools like **Persistent Homology** and the **Mapper algorithm** to the generated `∫SPS` data. This will allow us to move beyond simple "hotspot" identification to rigorously map out the clusters (Experts) and connections (Functional Circuits) within the model.
-3. **Phase 2 Prototyping:** Once we have a clear "functional connectome" of the base model, we will begin the work of Phase 2: designing and building the first prototype of the reconfigured Tiny-ONN architecture.
-
-This is not a short-term project. We are attempting to shift the paradigm from statistical pattern matching to a form of **topological engineering**. We believe this is the only path toward truly understandable, controllable, and scalable artificial general intelligence.
+This setup drastically reduces computational requirements, as we only need to train the MoE and router layers from scratch, guided by a powerful, pre-trained teacher model.
 
 ## Installation & Usage
 
-The project is currently in a heavy research and development phase. The primary entry point for experimentation is the `scanner/app.py` Gradio interface, which allows for live fMRI scanning and replay of `.mscan` files.
+The project is in a heavy research and development phase. The primary entry point is the `train.py` script.
 
 To set up the environment:
 
 ```bash
-# It is recommended to use uv for environment management
+# It is highly recommended to use uv for environment management
 # https://github.com/astral-sh/uv
 uv venv
 source .venv/bin/activate
 uv sync
 ```
 
-To run the scanner application:
+To run the training script:
 
 ```bash
-# Live scanning mode with a specific model
-python scanner/app.py --model Qwen/Qwen3-1.7B
-
-# Replay mode with a pre-existing scan file
-python scanner/app.py --mscan_path data/scans/your_scan_file.mscan
+# Run training using a configuration file
+python train.py --config_file configs/meta_train_v1.yaml
 ```
 
 ---

@@ -1,7 +1,10 @@
+from collections import defaultdict
+
 import torch
 import torch.nn as nn
-from collections import defaultdict
+
 from tiny_onn.grad_hook.model import PocMoEModel
+
 
 class GradientInterceptor:
     def __init__(self):
@@ -13,19 +16,19 @@ class GradientInterceptor:
             module._saved_input = input_tuple[0].detach()
 
     def backward_hook(self, module, grad_input, grad_output):
-        if not hasattr(module, '_saved_input'):
+        if not hasattr(module, "_saved_input"):
             return
 
         input_tensor = module._saved_input
         grad_output_tensor = grad_output[0]
-        
-        per_token_grad = torch.einsum('bi,bo->boi', input_tensor, grad_output_tensor)
-        
+
+        per_token_grad = torch.einsum("bi,bo->boi", input_tensor, grad_output_tensor)
+
         surprise = torch.linalg.vector_norm(per_token_grad, dim=(1, 2))
-        
+
         expert_id = self.handles.index(module.handle)
         self.surprises[expert_id].append(surprise.cpu().numpy())
-        
+
         del module._saved_input
 
     def attach(self, module, expert_id):
@@ -39,6 +42,7 @@ class GradientInterceptor:
         for handle in self.handles:
             handle.remove()
         self.handles.clear()
+
 
 def run_poc():
     vocab_size = 100
@@ -61,15 +65,15 @@ def run_poc():
     loss_fn = nn.CrossEntropyLoss()
 
     print("--- Running Proof-of-Concept ---")
-    
+
     optimizer.zero_grad()
-    
+
     output_logits = model(input_data)
-    
+
     loss = loss_fn(output_logits.view(-1, vocab_size), target_data.view(-1))
-    
+
     loss.backward()
-    
+
     optimizer.step()
 
     print("\n--- Gradient Interception Results ---")
@@ -79,12 +83,15 @@ def run_poc():
         for expert_id, surprises_list in sorted(interceptor.surprises.items()):
             print(f"\nExpert {expert_id}:")
             for i, surprise_batch in enumerate(surprises_list):
-                print(f"  - Surprise values from backward pass {i+1} (batch size: {len(surprise_batch)}):")
+                print(
+                    f"  - Surprise values from backward pass {i + 1} (batch size: {len(surprise_batch)}):"
+                )
                 for token_idx, value in enumerate(surprise_batch):
-                     print(f"    Token {token_idx}: {value:.4f}")
+                    print(f"    Token {token_idx}: {value:.4f}")
 
     interceptor.clear()
     print("\n--- PoC Finished ---")
+
 
 if __name__ == "__main__":
     run_poc()

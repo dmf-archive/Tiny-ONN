@@ -1,0 +1,67 @@
+# Model Configuration
+model:
+  base_model_name: "Qwen/Qwen3-0.6B"
+  # Path to a local checkpoint to resume training. If "auto", it will look for the latest in output_dir.
+  resume_from_checkpoint: null 
+  # Use torch.compile for the model to optimize performance.
+  use_torch_compile: true
+
+# Data Configuration
+data:
+  # Dataset name from Hugging Face Hub
+  dataset_name: "c4"
+  # Subset of the dataset to use, e.g., "en" for English
+  dataset_subset: "en"
+  # Percentage of the dataset to use for validation
+  validation_split_percentage: 5
+  # Maximum sequence length for tokenization
+  max_seq_length: 512
+  # Name or path of the tokenizer
+  tokenizer_name: "Qwen/Qwen3-0.6B"
+
+# Training Hyperparameters
+training:
+  # Directory to save all outputs (checkpoints, logs, plots)
+  output_dir: "outputs/meta_train_v1"
+  # Number of training epochs
+  num_train_epochs: 3
+  # Batch size per device for training
+  per_device_train_batch_size: 8
+  # Batch size per device for evaluation
+  per_device_eval_batch_size: 8
+  # Number of workers for the dataloader
+  dataloader_num_workers: 4
+  # Learning rate for the expert networks
+  expert_learning_rate: 1.0e-4
+  # Learning rate for the gating (router) network
+  gate_learning_rate: 4.0e-4
+  # Weight decay for the AdamW optimizer
+  weight_decay: 0.01
+  # AdamW optimizer beta1
+  adam_beta1: 0.9
+  # AdamW optimizer beta2
+  adam_beta2: 0.999
+  # AdamW optimizer epsilon
+  adam_epsilon: 1.0e-8
+  # Maximum gradient norm for clipping
+  max_grad_norm: 1.0
+  # Warmup steps for the learning rate scheduler
+  lr_scheduler_warmup_steps: 100
+
+# Logging and Checkpointing
+logging:
+  # Log metrics every N steps
+  log_interval: 10
+  # Evaluate on the validation set every N steps
+  eval_interval: 500
+  # Save a checkpoint every N steps
+  checkpoint_interval: 500
+  # Number of recent checkpoints to keep
+  rolling_checkpoint_count: 3
+
+# System Configuration
+system:
+  # "cuda", "cpu", or "auto"
+  device: "auto"
+  # Random seed for reproducibility
+  seed: 42
