@@ -1,7 +1,7 @@
-from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
+from transformers.models.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
 
 
-class TinyOnnConfig(Qwen3Config):
+class TinyOnnConfig(Qwen3MoeConfig):
     model_type = "tiny_onn"
 
     def __init__(
@@ -12,8 +12,10 @@ class TinyOnnConfig(Qwen3Config):
         output_router_logits=False,
         **kwargs,
     ):
-        super().__init__(**kwargs)
-        self.num_experts = num_experts
-        self.moe_intermediate_size = moe_intermediate_size
-        self.num_experts_per_tok = num_experts_per_tok
-        self.output_router_logits = output_router_logits
+        super().__init__(
+            num_experts=num_experts,
+            moe_intermediate_size=moe_intermediate_size,
+            num_experts_per_tok=num_experts_per_tok,
+            output_router_logits=output_router_logits,
+            **kwargs,
+        )

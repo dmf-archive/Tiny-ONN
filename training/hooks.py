@@ -8,15 +8,19 @@ class GradientInterceptor:
     def __init__(self, model: nn.Module):
         self.model = model
         self.handles = []
-        self.surprises: dict[int, torch.Tensor] = defaultdict(list)
-        self.token_info: dict[str, torch.Tensor] = {}
+        self.surprises: dict[nn.Module, list[torch.Tensor]] = defaultdict(list)
+        self.expert_to_id: dict[nn.Module, int] = {}
         self._attach_hooks()
 
     def _forward_hook(
-        self, module: nn.Module, input_tuple: tuple[torch.Tensor], output: torch.Tensor
+        self,
+        module: nn.Module,
+        input_tuple: tuple[tuple[torch.Tensor, torch.Tensor]],
+        output: torch.Tensor,
     ):
         if torch.is_grad_enabled():
-            module._saved_input = input_tuple[0].detach()
+            input_tensor, token_indices = input_tuple[0]
+            module._saved_input = (input_tensor.detach(), token_indices.detach())
 
     def _backward_hook(
         self,
@@ -27,38 +31,40 @@ class GradientInterceptor:
         if not hasattr(module, "_saved_input"):
             return
 
-        input_tensor = module._saved_input
+        input_tensor, token_indices = module._saved_input
         grad_output_tensor = grad_output[0]
 
-        per_token_grad = torch.einsum("bi,bo->boi", input_tensor, grad_output_tensor)
-        surprise = torch.linalg.vector_norm(per_token_grad, dim=(1, 2))
+        per_token_grad = torch.einsum(
+            "bi,bi->b", input_tensor, grad_output_tensor
+        ).unsqueeze(1)
+        surprise = torch.linalg.vector_norm(per_token_grad, dim=1)
 
-        expert_id = self._find_expert_id(module)
-        if expert_id is not None:
-            self.surprises[expert_id].append(surprise)
+        # Store pairs of (token_index, surprise_value)
+        self.surprises[module].append(
+            torch.stack([token_indices.float(), surprise], dim=1)
+        )
 
         del module._saved_input
 
-    def _find_expert_id(self, module_to_find: nn.Module) -> int:
-        for i, expert in enumerate(self.model.model.layers[0].mlp.experts):
-            if expert is module_to_find:
-                return i
-        return None
-
     def _attach_hooks(self):
+        expert_id_counter = 0
         for layer in self.model.model.layers:
-            for _, expert_module in enumerate(layer.mlp.experts):
-                handle = expert_module.register_full_backward_hook(self._backward_hook)
-                self.handles.append(handle)
-                expert_module.register_forward_hook(self._forward_hook)
+            if hasattr(layer, "mlp") and hasattr(layer.mlp, "experts"):
+                for expert_module in layer.mlp.experts:
+                    self.expert_to_id[expert_module] = expert_id_counter
+                    expert_id_counter += 1
+                    handle = expert_module.register_full_backward_hook(
+                        self._backward_hook
+                    )
+                    self.handles.append(handle)
+                    expert_module.register_forward_hook(self._forward_hook)
 
-    def get_surprises(self) -> dict[int, torch.Tensor]:
-        # Consolidate surprise tensors for each expert
-        consolidated_surprises = {
-            expert_id: torch.cat(tensors)
-            for expert_id, tensors in self.surprises.items()
+    def get_surprises(self) -> dict[nn.Module, torch.Tensor]:
+        return {
+            expert: torch.cat(tensors, dim=0)
+            for expert, tensors in self.surprises.items()
+            if tensors
         }
-        return consolidated_surprises
 
     def clear(self):
         self.surprises.clear()
