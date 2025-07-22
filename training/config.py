@@ -23,7 +23,9 @@ def _from_dict(data_class, data):
 
 @dataclass
 class ModelConfig:
+    model_path: str
     base_model_name: str
+    teacher_model_name: str | None = None
     resume_from_checkpoint: str | None = None
     use_torch_compile: bool = True
 
@@ -34,7 +36,6 @@ class DataConfig:
     dataset_subset: str
     validation_split_percentage: int
     max_seq_length: int
-    tokenizer_name: str
 
 
 @dataclass
@@ -51,7 +52,9 @@ class TrainingConfig:
     adam_beta2: float
     adam_epsilon: float
     max_grad_norm: float
-    lr_scheduler_warmup_steps: int
+    lr_scheduler_warmup_steps: int = 0
+    distillation_alpha: float = 0.5
+    distillation_temperature: float = 2.0
 
 
 @dataclass

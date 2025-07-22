@@ -39,12 +39,14 @@ dev = [
   "torch==2.7.1+cu128",
   "torchvision",
   "torchaudio",
+  "types-pyyaml>=6.0.12.20250516",
 ]
 
 [tool.mypy]
 namespace_packages = true
 explicit_package_bases = true
 ignore_missing_imports = true
+exclude = ["ref"]
 
 [tool.uv.sources]
 torch = [{ index = "pytorch-cu128" }]

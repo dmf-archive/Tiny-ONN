@@ -18,48 +18,42 @@
   - `num_experts_per_layer`: 32
   - `moe_intermediate_size`: 64 (每个专家都非常小)
 
-- **路由与训练机制 (SMK)**: 我们抛弃了早期需要完整反向传播来收集梯度的复杂元学习范式。新的 SMK 策略借鉴了 DynMoE 的经验，并进行了关键修正，实现了更高效的训练：
-  1. **选择性更新**: 门控网络进行 Dyn-k 选择，根据输入特征的余弦相似度激活 **动态数量** 的专家参与前向传播。
-  2. **惊奇度元学习**: 门控网络的学习目标为 **最小化内部惊奇（Surprise）**。其损失函数是基于 **被选中的专家** 在每个 token 上产生的梯度 L2 范数（即 Surprise）计算的交叉熵损失。通过这种方式，门控网络通过元学习，学会将输入 Token 路由到能以最低学习成本（最小梯度扰动）处理它的专家，而无需对所有专家进行反向传播。
+- **路由与训练机制 (SMK)**: 我们的训练范式本质上是一个**双层预测系统**：
+    1. **专家（快系统）**: 负责**预测内容**，其优化目标是最小化传统的预测损失（`L_main`）。
+    2. **门控（慢系统）**: 负责**预测成本**，即预测“哪个专家能用最低的惊奇度（Surprise）解决问题”。
+  
+这个机制通过以下两个核心部分实现：
 
-## 3. 训练范式：解耦的元学习 (快思慢想)
+  1. **动态K选择**: 门控网络为每个Token动态决定激活多少个（`K`）专家。这个决策由一个全局的、作为超参数的**认知预算**（`Surprise_Budget`，由PI公式中的`α`调控）来约束。门控会激活其预测中`Surprise`最低的专家，直到它们的预测`Surprise`之和达到预算上限。这强制模型以最能接受的方式使用其专家资源——未来可以考虑直接接入**算力配额或钱包余额**。
+  2. **路由优化**: 门控的学习信号（`L_router`）来自于一个交叉熵损失。它驱动门控的**路由权重**（`router_logits`）去对齐那个在事后被证明（通过`backward_hook`捕获的逐token 梯度L2范数作为变分自由能的启发式代理——计算参数空间的KL散度代价高昂）实际产生**最小`Surprise`**的专家。
 
-训练流程被明确地分为两个解耦的阶段，分别优化专家和门控。
+## 3. 训练范式：统一训练步内的解耦优化
 
-### 3.1 专家学习 (快系统) 与经验提取
+我们的训练范式在一个统一的训练步骤（`train_step`）中，通过两个串联的优化阶段，实现对专家（快系统）和门控（慢系统）的解耦优化。
 
-此阶段的目标是让专家网络最小化预测误差，并同时捕获用于训练门控的“惊奇度”信号。
+### **第一阶段：专家优化与“惊奇度”信号提取**
 
-1. **状态设定**: 门控网络（Router）参数被冻结 (`requires_grad=False`)。
-2. **Hook 注册**: 在每个专家模块上注册 `forward_hook` 和 `backward_hook`。
-3. **前向传播**: 
-   - 输入批次通过模型，门控根据当前策略进行路由。
-   - `forward_hook` 触发，保存每个专家接收到的输入张量 `input_tensor`。
-4. **专家更新**:
-   - 根据最终 `logits` 计算主损失 `L_main` (交叉熵)。
-   - 执行 `L_main.backward()`。
-   - `optimizer_experts.step()` 更新专家权重。
-5. **经验提取 (在 `backward` 过程中)**:
-   - `backward_hook` 被触发，接收到输出梯度 `grad_output`。
-   - 在 Hook 内部，通过 `torch.einsum("bi,bo->boi", input_tensor, grad_output)` 计算出 per-token 的真实梯度。
-   - 计算梯度范数 `torch.linalg.vector_norm()` 得到 **Surprise**。
-   - 将包含以下信息的经验元组缓存下来：
-     - `token_hidden_state`: 输入到当前 MoE 层的隐状态。
-     - `router_logits`: 门控对该 Token 输出的原始 logits。
-     - `per_expert_surprise`: 该 Token 在其**被路由到的**专家上产生的真实梯度范数。
+1. **前向传播**:
+    - 输入批次通过模型，门控根据当前策略路由，模型输出 `logits`。
+    - 在此过程中，通过 `forward_hook` 捕获并暂存每个专家接收到的 `input_tensor` 和对应的 `token_indices`。
+2. **主损失计算与专家更新**:
+    - 根据模型 `logits` 计算主预测损失 `L_main` (交叉熵)。
+    - **执行第一次反向传播**: `L_main.backward(retain_graph=True)`。`retain_graph=True` 是关键，它保留了计算图，为后续门控优化做准备。
+    - **更新专家**: `optimizer_experts.step()`。此时，只有专家网络的权重被更新。
+3. **“惊奇度”信号提取**:
+    - 在 `L_main.backward()` 过程中，`backward_hook` 被触发。
+    - Hook 内部利用暂存的 `input_tensor` 和传入的 `grad_output`，通过 `torch.einsum` 精确计算出每个被激活的专家在每个 Token 上的梯度范数，即“逐token惊奇” (`per_expert_surprise`)。
 
-### 3.2 门控学习 (慢系统)
+### **第二阶段：门控优化**
 
-此阶段的目标是让门控网络学会预测并选择能产生最小“内部惊奇”的路由路径。
-
-1. **状态设定**: 专家网络参数被冻结。
-2. **数据准备**: 从之前步骤缓存的经验中获取一批训练数据。
-3. **真值计算**: 对于每一个样本，通过对缓存的 `per_expert_surprise` 取 `argmin()`，找到能产生最小 Surprise 的**最优专家 (`optimal_expert`)**。
-4. **门控更新**:
-   - 使用缓存的 `router_logits` 作为预测值。
-   - 计算门控损失 `L_router = CrossEntropyLoss(router_logits, optimal_expert)`。
-   - 执行 `L_router.backward()`。
-   - `optimizer_router.step()` 更新门控权重。
+1. **真值（最优专家）确定**:
+    - 收集所有专家的 `per_expert_surprise`。
+    - 对每个 Token，通过 `torch.argmin()` 找到产生最小惊奇度的专家索引，作为该 Token 的“最优路由目标” `optimal_expert_indices`。
+2. **门控损失计算与更新**:
+    - 从前向传播中获取门控网络输出的 `router_logits`。
+    - **计算门控损失**: `L_router = CrossEntropyLoss(router_logits, optimal_expert_indices)`。这个损失驱动门控去预测能产生最小惊奇度的专家。
+    - **执行第二次反向传播**: `L_router.backward()`。
+    - **更新门控**: `optimizer_router.step()`。此时，只有门控网络的权重被更新。
 
 ## 4. 核心技术验证
 

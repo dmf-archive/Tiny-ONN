@@ -8,9 +8,7 @@ import torch
 
 os.environ["HF_HOME"] = str(Path.cwd() / "weights")
 
-from tiny_onn.config import TinyOnnConfig
-from tiny_onn.model import TinyOnnForCausalLM
-from tiny_onn.surgery import perform_surgery
+from tiny_onn.modular import TinyOnnForCausalLM
 from training.config import load_config
 from training.data import get_dataloaders
 from training.engine import TrainerEngine
@@ -34,15 +32,8 @@ def main(config_path: Path):
         else "cpu"
     )
 
-    # Perform model surgery
-    model_config = TinyOnnConfig.from_pretrained(
-        config.model.base_model_name,
-        num_experts=32,
-        moe_intermediate_size=64,
-        num_experts_per_tok=2,
-    )
-    base_model = TinyOnnForCausalLM.from_pretrained(config.model.base_model_name)
-    model = perform_surgery(base_model, model_config).to(device)
+    # Load the surgically modified model
+    model = TinyOnnForCausalLM.from_pretrained(config.model.model_path).to(device)
 
     if config.model.use_torch_compile:
         model = torch.compile(model)
@@ -63,6 +54,7 @@ def main(config_path: Path):
     # Setup dataloaders
     train_loader, eval_loader = get_dataloaders(
         data_config=config.data,
+        model_path=config.model.model_path,
         train_batch_size=config.training.per_device_train_batch_size,
         eval_batch_size=config.training.per_device_eval_batch_size,
         num_workers=config.training.dataloader_num_workers,

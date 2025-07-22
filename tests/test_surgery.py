@@ -1,10 +1,14 @@
 import os
+import sys
+from pathlib import Path
+
+sys.path.append(str(Path(__file__).parent.parent))
 
 import pytest
 import torch
 from transformers import AutoTokenizer
 
-from tiny_onn.surgery import perform_surgery
+from scripts.perform_surgery import perform_surgery
 
 
 @pytest.fixture(scope="module")
@@ -14,11 +18,7 @@ def surgical_model_and_tokenizer():
     cache_dir = os.path.join(os.path.dirname(script_dir), "weights")
     os.makedirs(cache_dir, exist_ok=True)
 
-    model = perform_surgery(base_model_name, cache_dir=cache_dir)
-    tokenizer = AutoTokenizer.from_pretrained(
-        base_model_name, cache_dir=cache_dir, trust_remote_code=True
-    )
-
+    model, tokenizer = perform_surgery(base_model_name, cache_dir=cache_dir)
     return model, tokenizer
 
 

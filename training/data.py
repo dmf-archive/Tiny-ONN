@@ -1,5 +1,6 @@
 from pathlib import Path
 
+import torch
 from datasets import load_dataset
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer
@@ -9,11 +10,12 @@ from .config import DataConfig
 
 def get_dataloaders(
     data_config: DataConfig,
+    model_path: str,
     train_batch_size: int,
     eval_batch_size: int,
     num_workers: int,
 ) -> tuple[DataLoader, DataLoader]:
-    tokenizer = AutoTokenizer.from_pretrained(data_config.tokenizer_name)
+    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
@@ -80,7 +82,9 @@ def get_dataloaders(
         num_proc=num_workers,
     )
 
-    tokenized_datasets.set_format("torch", columns=["input_ids", "attention_mask", "labels"])
+    tokenized_datasets.set_format(
+        "torch", columns=["input_ids", "attention_mask", "labels"]
+    )
 
     train_dataset = tokenized_datasets["train"]
     eval_dataset = tokenized_datasets["validation"]

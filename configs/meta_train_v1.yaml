@@ -1,8 +1,9 @@
 # Model Configuration
 model:
-  base_model_name: "Qwen/Qwen3-0.6B"
+  model_path: "models/tiny-onn-0.6b"
+  base_model_name: "tiny-onn-0.6b"
   # Path to a local checkpoint to resume training. If "auto", it will look for the latest in output_dir.
-  resume_from_checkpoint: null 
+  resume_from_checkpoint: null
   # Use torch.compile for the model to optimize performance.
   use_torch_compile: true
 
@@ -16,8 +17,6 @@ data:
   validation_split_percentage: 5
   # Maximum sequence length for tokenization
   max_seq_length: 512
-  # Name or path of the tokenizer
-  tokenizer_name: "Qwen/Qwen3-0.6B"
 
 # Training Hyperparameters
 training:
@@ -45,7 +44,7 @@ training:
   adam_epsilon: 1.0e-8
   # Maximum gradient norm for clipping
   max_grad_norm: 1.0
-  # Warmup steps for the learning rate scheduler
+  # Number of warmup steps for the learning rate scheduler
   lr_scheduler_warmup_steps: 100
 
 # Logging and Checkpointing

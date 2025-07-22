@@ -14,6 +14,8 @@
 2. **优先复用，而非重造**: 在编写任何代码之前，**必须**首先探查项目 (`tiny_onn/`, `training/` 等) 中是否已存在可复用的组件。绝不重造轮子。
 3. **外科手术式修改**: 在修改 `transformers` 等上游库时，**必须**优先采用**继承和替换最小组件**的“模型手术”模式，而不是覆写庞杂的 `forward` 方法。这要求我在动手前，先通过 `list .venv/Lib/site-packages/...` 研究其源码。
 4. **失败后自省**: 如果任何操作连续两次失败，**必须**暂停并启动自省协议：重新审视我的核心假设是否错误，重新阅读相关文档和代码，而不是在错误的道路上重复尝试。
+5. **Qwen 版本锁定**: **必须**直接参考 `qwen3` 的实现，完全忽略 `qwen2`。
+6. **模块化优先**: `transformers` 模型定义在 `tiny_onn/modular.py` 。`model.py` 是根据 `modular.py` 程序化自动生成的，只应用于观察底层实现，实际书写代码时只需要参考 `modular.py`。
 
 ### 第一优先级：代码与环境核心规范
 
@@ -75,17 +77,20 @@
 
 ### 4.1. 核心目录结构与职责
 
-- **`train.py`**: **唯一的训练入口点**。位于项目根目录。通过 `--config` 参数加载 YAML 配置来启动训练。
+- **`scripts/`**: **流程控制脚本**。
+  - `perform_surgery.py`: **一次性模型手术脚本**。负责加载预训练模型，替换为自定义 MoE 层，并保存为新的、可直接用于训练的模型。
+- **`train.py`**: **唯一的训练入口点**。位于项目根目录。**必须加载已经过手术的模型**，然后通过 `--config` 参数启动训练。
 - **`configs/`**: 存放所有训练配置文件（`.yaml`）。核心配置为 `meta_train_v1.yaml`。
 - **`tiny_onn/`**: **核心模型定义**。
+  - `modular.py`: **核心模块定义**。通过**继承和覆写**的方式，将 `Qwen3Moe` 的 `MLP` 部分替换为我们的 `DynMoE`。**所有新模块开发在此文件进行**。
+  - `model.py`: **模型组装文件**。负责引用 `modular.py` 中定义的模块，组装成完整的 `TinyOnnForCausalLM` 模型。
   - `config.py`: 定义 `TinyOnnConfig`，**必须**继承自 `Qwen3Config`。
-  - `model.py`: 定义 `HierarchicalMoE` 和 `TinyOnnDecoderLayer`。`HierarchicalMoE` 的专家应为 `Qwen3MLP` 的实例。
-  - `surgery.py`: 实现“模型手术”，将预训练的 `Qwen3` 模型层替换为自定义的 `TinyOnnDecoderLayer`。
 - **`training/`**: **模块化的训练组件库**。
-  - `engine.py`: 包含核心的训练与评估循环逻辑。
+  - `engine.py`: 包含核心的训练与评估循环逻辑（实现 SMK 策略）。
   - `data.py`: 负责数据加载，核心函数是 `get_dataloaders`。
-  - `hooks.py`: 用于在训练循环中注入自定义行为，是实现元学习的关键。
+  - `hooks.py`: 用于在训练循环中注入自定义行为（如梯度捕获），是实现元学习的关键。
 - **`tests/`**: **测试代码**。
-  - `test_surgery.py`: 关键验证脚本，用于确保模型手术后与 `transformers` 的 `generate()` 方法兼容。
+  - `test_dynmoe.py`: 针对 `DynMoE` 模块的单元测试。
+  - `test_surgery.py`: **端到端集成测试**。确保调用 `scripts/perform_surgery.py` 后的模型能正确执行 `forward` 和 `loss.backward()`，并验证梯度是否正确回传。
 - **`data/`**: 训练数据存放处。可创建临时的 `.jsonl` 文件（如 `dummy_data.jsonl`）用于端到端测试。
 - **`exp/`**: 存放历史上的**技术验证（PoC）代码**，是当前架构的技术源头，但**不应**在当前开发中直接调用。

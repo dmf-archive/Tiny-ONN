@@ -56,7 +56,7 @@ class LivePlotter:
                 ax.legend()
                 ax.tick_params(axis="x", rotation=45)
 
-        plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+        plt.tight_layout(rect=(0, 0.03, 1, 0.95))
         self._save_plot(fig, f"metrics_dashboard_step_{step}")
 
     def plot_expert_dashboard(self, expert_data: dict, step: int):

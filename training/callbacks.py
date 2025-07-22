@@ -1,12 +1,10 @@
-import os
-from collections import defaultdict
 from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
 import seaborn as sns
-import torch
 from torch.utils.tensorboard import SummaryWriter
+from transformers import PreTrainedModel
 
 
 class TensorBoardLogger:
@@ -39,24 +37,45 @@ class MatplotlibVisualizer:
         metrics_cache: dict[str, list],
         expert_data_cache: dict[str, np.ndarray],
         global_step: int,
+        model: PreTrainedModel,
     ):
         self._plot_core_metrics(metrics_cache, global_step)
         if expert_data_cache:
-            self._plot_expert_dashboard(expert_data_cache, global_step)
+            self._plot_expert_dashboard(expert_data_cache, global_step, model)
 
     def _plot_core_metrics(self, cache: dict[str, list], step: int):
         fig, axs = plt.subplots(3, 2, figsize=(20, 18))
         fig.suptitle(f"Core Metrics for {self.model_name} at Step {step}", fontsize=16)
 
         # Loss
-        axs[0, 0].plot(cache["main_loss"], label="Train Main Loss", color=self.colors["train_main"], alpha=0.7)
-        axs[0, 0].plot(cache["router_loss"], label="Train Router Loss", color=self.colors["train_router"], alpha=0.7)
+        axs[0, 0].plot(
+            cache["main_loss"],
+            label="Train Main Loss",
+            color=self.colors["train_main"],
+            alpha=0.7,
+        )
+        axs[0, 0].plot(
+            cache["router_loss"],
+            label="Train Router Loss",
+            color=self.colors["train_router"],
+            alpha=0.7,
+        )
         axs[0, 0].set_title("Loss")
         axs[0, 0].legend()
 
         # Accuracy
-        axs[0, 1].plot(cache["main_acc"], label="Train Main Acc", color=self.colors["train_main"], alpha=0.7)
-        axs[0, 1].plot(cache["gating_acc"], label="Train Gating Acc", color=self.colors["train_router"], alpha=0.7)
+        axs[0, 1].plot(
+            cache["main_acc"],
+            label="Train Main Acc",
+            color=self.colors["train_main"],
+            alpha=0.7,
+        )
+        axs[0, 1].plot(
+            cache["gating_acc"],
+            label="Train Gating Acc",
+            color=self.colors["train_router"],
+            alpha=0.7,
+        )
         axs[0, 1].set_title("Accuracy")
         axs[0, 1].legend()
 
@@ -71,17 +90,24 @@ class MatplotlibVisualizer:
         # Tau
         axs[2, 0].plot(cache["tau"], label="Tau", color="#7f7f7f", alpha=0.7)
         axs[2, 0].set_title("Tau")
-        
+
         fig.delaxes(axs[2, 1])
-        plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+        plt.tight_layout(rect=(0, 0.03, 1, 0.95))
         plt.savefig(self.img_dir / "core_metrics_latest.png")
         plt.close(fig)
 
-    def _plot_expert_dashboard(self, cache: dict[str, np.ndarray], step: int):
+    def _plot_expert_dashboard(
+        self, cache: dict[str, np.ndarray], step: int, model: PreTrainedModel
+    ):
         fig, axs = plt.subplots(2, 2, figsize=(20, 18))
         fig.suptitle(f"Expert Activation Dashboard at Step {step}", fontsize=16)
 
-        num_experts = self.model.config.num_experts * self.model.config.num_hidden_layers
+        if hasattr(model.config, "num_experts") and hasattr(
+            model.config, "num_hidden_layers"
+        ):
+            num_experts = getattr(model.config, "num_experts", 1)
+        else:
+            num_experts = getattr(model.config, "num_experts", 1)
 
         # Top-K Activation Scatter
         top_k_data = cache["selected_experts"]
@@ -101,7 +127,7 @@ class MatplotlibVisualizer:
 
         # Top-K Activation Heatmap
         top_k_heatmap, _, _ = np.histogram2d(
-            top_k_data[:, 0], top_k_data[:, 1], bins=(10, num_experts)
+            top_k_data[:, 0], top_k_data[:, 1], bins=[10, num_experts]
         )
         sns.heatmap(top_k_heatmap.T, ax=axs[1, 0], cmap="viridis")
         axs[1, 0].set_title("Top-K Activation Heatmap")
@@ -110,13 +136,13 @@ class MatplotlibVisualizer:
 
         # Surprise Min-K Heatmap
         min_k_heatmap, _, _ = np.histogram2d(
-            min_k_data[:, 0], min_k_data[:, 1], bins=(10, num_experts)
+            min_k_data[:, 0], min_k_data[:, 1], bins=[10, num_experts]
         )
         sns.heatmap(min_k_heatmap.T, ax=axs[1, 1], cmap="viridis")
         axs[1, 1].set_title("Surprise Min-K Heatmap")
         axs[1, 1].set_xlabel("Step Bins")
         axs[1, 1].set_ylabel("Expert ID")
 
-        plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+        plt.tight_layout(rect=(0, 0.03, 1, 0.95))
         plt.savefig(self.img_dir / "expert_dashboard_latest.png")
         plt.close(fig)
