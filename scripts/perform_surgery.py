@@ -1,6 +1,7 @@
 import argparse
 from pathlib import Path
 
+import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from tiny_onn.config import TinyOnnConfig
@@ -16,13 +17,50 @@ def perform_surgery(
     tokenizer = AutoTokenizer.from_pretrained(
         base_model_name, cache_dir=cache_dir, trust_remote_code=True
     )
+
     base_config = base_model.config
     tiny_onn_config_dict = base_config.to_dict()
+
+    num_experts = kwargs.get("num_experts_per_layer", 32)
+    tiny_onn_config_dict["moe_intermediate_size"] = (
+        base_config.intermediate_size // num_experts
+    )
+
     tiny_onn_config_dict.update(kwargs)
     config = TinyOnnConfig(**tiny_onn_config_dict)
-    model = TinyOnnForCausalLM(config)
-    model.load_state_dict(base_model.state_dict(), strict=False)
-    return model, tokenizer
+
+    tiny_onn_model = TinyOnnForCausalLM(config)
+
+    base_state_dict = base_model.state_dict()
+    tiny_onn_state_dict = tiny_onn_model.state_dict()
+
+    for key in base_state_dict:
+        if "mlp" not in key:
+            tiny_onn_state_dict[key] = base_state_dict[key]
+
+    for layer_idx in range(config.num_hidden_layers):
+        gate_proj = base_state_dict[f"model.layers.{layer_idx}.mlp.gate_proj.weight"]
+        up_proj = base_state_dict[f"model.layers.{layer_idx}.mlp.up_proj.weight"]
+        down_proj = base_state_dict[f"model.layers.{layer_idx}.mlp.down_proj.weight"]
+
+        gate_chunks = torch.chunk(gate_proj, config.num_experts_per_layer, dim=0)
+        up_chunks = torch.chunk(up_proj, config.num_experts_per_layer, dim=0)
+        down_chunks = torch.chunk(down_proj, config.num_experts_per_layer, dim=1)
+
+        for expert_idx in range(config.num_experts_per_layer):
+            tiny_onn_state_dict[
+                f"model.layers.{layer_idx}.mlp.experts.{expert_idx}.w1.weight"
+            ] = gate_chunks[expert_idx]
+            tiny_onn_state_dict[
+                f"model.layers.{layer_idx}.mlp.experts.{expert_idx}.w3.weight"
+            ] = up_chunks[expert_idx]
+            tiny_onn_state_dict[
+                f"model.layers.{layer_idx}.mlp.experts.{expert_idx}.w2.weight"
+            ] = down_chunks[expert_idx]
+
+    tiny_onn_model.load_state_dict(tiny_onn_state_dict, strict=True)
+
+    return tiny_onn_model, tokenizer
 
 
 def main():
@@ -32,7 +70,7 @@ def main():
     parser.add_argument(
         "--base_model_name",
         type=str,
-        required=True,
+        default="Qwen/Qwen3-0.5B",
         help="The name of the base model to perform surgery on.",
     )
     parser.add_argument(
@@ -42,21 +80,15 @@ def main():
         help="The path to save the surgically modified model.",
     )
     parser.add_argument(
-        "--num_experts",
+        "--num_experts_per_layer",
         type=int,
         default=32,
         help="Number of experts in the MoE layers.",
     )
     parser.add_argument(
-        "--moe_intermediate_size",
-        type=int,
-        default=64,
-        help="Intermediate size of the MoE layers.",
-    )
-    parser.add_argument(
         "--num_experts_per_tok",
         type=int,
-        default=-1,
+        default=4,
         help="Number of experts to use per token.",
     )
     parser.add_argument(
@@ -75,8 +107,7 @@ def main():
     model, tokenizer = perform_surgery(
         base_model_name=args.base_model_name,
         cache_dir=args.cache_dir,
-        num_experts=args.num_experts,
-        moe_intermediate_size=args.moe_intermediate_size,
+        num_experts_per_layer=args.num_experts_per_layer,
         num_experts_per_tok=args.num_experts_per_tok,
     )
 

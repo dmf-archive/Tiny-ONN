@@ -34,29 +34,27 @@
 
 ---
 
-## 3. Qwen3-MoE 架构对比与修改范围评估
+## 3. Qwen3 架构对比与修改范围评估
 
-在对 `DynMoE` 的实现进行分析后，我们进一步将其与我们的目标基础模型 `Qwen3-MoE` 进行对比，以评估模型手术的范围和复杂度。
+在对 `DynMoE` 的实现进行分析后，我们进一步将其与我们的目标基础模型 `Qwen3-0.6B`（一个**稠密**模型）进行对比，以评估模型手术的范围和复杂度。
 
 ### 核心发现
 
-1. **架构兼容性**: `Qwen3-MoE` 的 `modular_qwen3_moe.py` 中 `Qwen3MoeDecoderLayer` 的设计是模块化的，它将 `self.mlp` 作为一个可替换的单元。这与我们的“模型手术”方案高度兼容，我们可以继承该 Layer 并专注于替换 `mlp` 部分。
+1.  **架构兼容性**: `Qwen3` 的 `modeling_qwen3.py` 中的 `Qwen3DecoderLayer` 包含一个标准的 `Qwen3MLP` 作为 `self.mlp` 属性。这种模块化的设计与我们的“模型手术”方案高度兼容。我们可以继承 `Qwen3DecoderLayer` 并专注于替换 `mlp` 部分。
 
-2. **MoE 实现差异**: `Qwen3MoeSparseMoeBlock` 是一个**标准的固定 Top-K MoE 实现**。它通过 `torch.topk` 选择固定数量的专家，其路由逻辑和专家结构均不符合我们的需求。
-    - **路由**: 它是基于 `softmax` 后的最高分选择，而非我们的 Surprise 驱动机制。
-    - **专家**: 它使用标准的、尺寸较大的 `Qwen3MoeMLP` 作为专家，而我们的设计是海量的（`num_experts_per_layer: 32`）、超轻量级（`moe_intermediate_size: 64`）专家。
+2.  **基础模型差异**: 我们手术的基础是一个**稠密模型**，而不是一个 MoE 模型。这意味着我们不是在修改一个现有的 MoE 层，而是在一个原本没有 MoE 的地方，用我们自定义的 `TinyOnnMoE` 替换掉一个标准的 `MLP`。
 
-3. **与 `DynMoE` 的契合点**: `DynMoE` 代码库中的 `topanygating` 函数提供了一个理想的参考实现。该函数能够接受一个外部生成的、per-token 的 K 值张量，这与我们的“Surprise Budget”动态决定 K 值的思想完美契合。
+3.  **与 `DynMoE` 的契合点**: `DynMoE` 代码库中的 `topanygating` 函数提供了一个理想的参考实现。该函数能够接受一个外部生成的、per-token 的 K 值张量，这与我们的“Surprise Budget”动态决定 K 值的思想完美契合。
 
 ### 修改范围评估
 
-结论是，我们需要进行一次**核心组件的完全替换**，而非简单的修改。
+结论是，我们需要进行一次**核心组件的替换**，将稠密层替换为稀疏的 MoE 层。
 
-- **[废弃] `Qwen3MoeSparseMoeBlock`**: 该模块必须被整体废弃。
-- **[新建] `TinyOnnMoE` 模块**: 我们需要创建一个全新的 MoE 模块。
-  - **门控 (Router)**: 新的门控网络需要实现一个 `forward` 方法，该方法的核心逻辑应类似于 `DynMoE` 的 `topanygating`，允许根据我们计算出的 Surprise 动态路由到 K 个专家。
-  - **专家 (Experts)**: 需要定义一个极度轻量化的 MLP 作为专家类，其 `intermediate_size` 应由我们的新配置文件控制。
-- **[新建] `TinyOnnConfig`**: 需要创建一个新的配置类，继承自 `Qwen3MoeConfig`，并添加我们独有的配置项，如 `num_experts_per_layer` 和 `moe_intermediate_size`。
-- **[继承与覆写] `TinyOnnDecoderLayer`**: 继承 `Qwen3MoeDecoderLayer`，并将其 `__init__` 方法中的 `self.mlp` 实例化为我们新建的 `TinyOnnMoE` 模块。
+-   **[替换] `Qwen3MLP`**: 在 `TinyOnnDecoderLayer` 中，原有的 `self.mlp`（一个 `Qwen3MLP` 实例）将被替换为我们的 `TinyOnnMoE` 模块。
+-   **[新建] `TinyOnnMoE` 模块**: 我们需要创建一个全新的 MoE 模块。
+    -   **门控 (Router)**: 新的门控网络需要实现一个 `forward` 方法，其核心逻辑应类似于 `DynMoE` 的 `topanygating`，允许根据我们计算出的 Surprise 动态路由到 K 个专家。
+    -   **专家 (Experts)**: 需要定义一个极度轻量化的 MLP 作为专家类，其 `intermediate_size` 应由我们的新配置文件控制。
+-   **[新建] `TinyOnnConfig`**: 需要创建一个新的配置类，继承自 `Qwen3Config`，并添加我们独有的 MoE 相关配置项，如 `num_experts_per_layer` 和 `moe_intermediate_size`。
+-   **[继承与覆写] `TinyOnnDecoderLayer`**: 继承 `Qwen3DecoderLayer`，在其 `__init__` 方法中用 `TinyOnnMoE` 替换 `self.mlp`，并覆写其 `forward` 方法以支持动态K和返回 `router_logits`。
 
-总而言之，手术方案是清晰的：保留 `Qwen3` 的骨架（如 Attention、LayerNorm），但将其“心脏”（MLP/MoE模块）完全替换为我们自己的、为解耦元学习范式量身定制的动态K稀疏混合专家模块。
+总而言之，手术方案是清晰的：保留 `Qwen3` 的骨架（如 Attention、LayerNorm），但将其“心脏”（MLP模块）完全替换为我们自己的、为解耦元学习范式量身定制的动态K稀疏混合专家模块。

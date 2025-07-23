@@ -6,7 +6,6 @@ sys.path.append(str(Path(__file__).parent.parent))
 
 import pytest
 import torch
-from transformers import AutoTokenizer
 
 from scripts.perform_surgery import perform_surgery
 

@@ -82,7 +82,7 @@
 - **`train.py`**: **唯一的训练入口点**。位于项目根目录。**必须加载已经过手术的模型**，然后通过 `--config` 参数启动训练。
 - **`configs/`**: 存放所有训练配置文件（`.yaml`）。核心配置为 `meta_train_v1.yaml`。
 - **`tiny_onn/`**: **核心模型定义**。
-  - `modular.py`: **核心模块定义**。通过**继承和覆写**的方式，将 `Qwen3Moe` 的 `MLP` 部分替换为我们的 `DynMoE`。**所有新模块开发在此文件进行**。
+  - `modular.py`: **核心模块定义**。通过**继承和覆写**的方式，将 `Qwen3` 的稠密 `MLP` 部分替换为我们的 `DynMoE`。**所有新模块开发在此文件进行**。
   - `model.py`: **模型组装文件**。负责引用 `modular.py` 中定义的模块，组装成完整的 `TinyOnnForCausalLM` 模型。
   - `config.py`: 定义 `TinyOnnConfig`，**必须**继承自 `Qwen3Config`。
 - **`training/`**: **模块化的训练组件库**。
