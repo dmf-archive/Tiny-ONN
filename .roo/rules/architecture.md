@@ -1,61 +1,85 @@
-# Tiny-ONN 最终架构与训练范式
+# Tiny-ONN 最终架构与训练范式 (V2)
 
-## 1. 核心思想
+## 1. 核心思想：解耦元学习
 
-通过**解耦元学习 (Decoupled Meta-Learning)** 范式，训练一个动态稀疏混合专家（SMoE）语言模型。
+通过**解耦元学习 (Decoupled Meta-Learning)** 范式，训练一个动态稀疏混合专家（SMoE）语言模型。其核心机制是：
 
-其核心机制是：专家网络（快系统）专注于最小化预测误差，而门控网络（慢系统）则通过元学习，学会将输入 Token 路由到能以**最低学习成本（最小梯度范数/Surprise）** 处理它的专家。
+- **专家网络（快系统）**: 专注于最小化传统预测误差 (`L_main`)。
+- **门控网络（慢系统）**: 通过元学习，学会预测并将每个 Token 路由到能以**最低学习成本**（即最小的梯度范数，作为“Surprise”的代理）处理它的专家。
 
-这种设计旨在通过动态稀疏路由在架构层面“物理隔离”专家的知识领域，以对抗灾难性遗忘，并通过元学习优化路由策略，最小化内部惊奇（Surprise），从而提高模型的能效比与性能。
+这种设计旨在通过动态稀疏路由在架构层面“物理隔离”专家的知识领域以对抗灾难性遗忘，并通过元学习优化路由策略以提高模型的能效比与性能。
 
-## 2. 核心架构：动态稀疏混合专家 (DynMoE) 与 SMK 路由
+## 2. 核心架构：基于 Qwen3 的动态稀疏 MoE
 
-我们的核心架构借鉴了 **DynMoE** 的动态激活思想，并结合了我们独创的 **SMK (Surprise Min_K)** 路由训练机制，形成了一套独特的“**动态激活量 + 海量超轻量专家**”的超稀疏混合专家（Hyper-SMoE）方案。
+我们将 `Qwen3` 的稠密 `MLP` 层替换为自定义的 `TinyOnnMoE` 模块，其关键特性如下：
 
-与将大型 MLP 直接作为专家的主流 MoE 思路不同，Tiny-ONN 将模型的复杂性从“单个专家的深度”转移到了“海量专家间的协同”。
+- **海量轻量专家**: 将模型的复杂性从“单个专家的深度”转移到了“海量专家间的协同”。
 
-- **结构**: 在每个 Transformer Block 中，我们将原有的稠密 MLP 层替换为一个 MoE 层。该层包含一个门控网络（Router）和海量的、极度轻量化的专家网络。
   - `num_experts_per_layer`: 32
-  - `moe_intermediate_size`: 64 (每个专家都非常小)
+  - `moe_intermediate_size`: 64 (每个专家网络极度轻量)
 
-- **路由与训练机制 (SMK)**: 我们的训练范式本质上是一个**双层预测系统**：
-    1. **专家（快系统）**: 负责**预测内容**，其优化目标是最小化传统的预测损失（`L_main`）。
-    2. **门控（慢系统）**: 负责**预测成本**，即预测“哪个专家能用最低的惊奇度（Surprise）解决问题”。
-  
-这个机制通过以下两个核心部分实现：
+- **动态 K 选择 (Surprise Budgeting)**: 门控网络为每个 Token 动态决定激活多少个 (`K`) 专家。此决策借鉴了 `DynMoE` 的显式可变 Top-K 思想，并与我们的理论结合：
+  1. 门控网络为每个 Token 输出对所有专家的亲和度 `router_logits`。
+  2. 根据 `router_logits` 计算“预期 Surprise”的概率分布。
+  3. 选择激活预期 Surprise 最低的若干专家，直到它们的累积概率达到全局超参数**认知预算** (`surprise_budget`) 的上限。
+  4. 这套机制已在 [`tiny_onn/modular.py`](./tiny_onn/modular.py) 的 `TinyOnnMoE.forward` 方法中初步实现。
 
-  1. **动态K选择**: 门控网络为每个Token动态决定激活多少个（`K`）专家。这个决策由一个全局的、作为超参数的**认知预算**（`Surprise_Budget`，由PI公式中的`α`调控）来约束。门控会激活其预测中`Surprise`最低的专家，直到它们的预测`Surprise`之和达到预算上限。这强制模型以最能接受的方式使用其专家资源——未来可以考虑直接接入**算力配额或钱包余额**。
-  2. **路由优化**: 门控的学习信号（`L_router`）来自于一个交叉熵损失。它驱动门控的**路由权重**（`router_logits`）去对齐那个在事后被证明（通过`backward_hook`捕获的逐token 梯度L2范数作为变分自由能的启发式代理——计算参数空间的KL散度代价高昂）实际产生**最小`Surprise`**的专家。
+## 3. 训练范式：基于 Hooks 的双层优化 (V6 方案)
 
-## 3. 训练范式：统一训练步内的解耦优化
+**此为官方唯一指定的训练范式**，它取代了所有基于 `torch.autograd.grad` 的旧方案。其核心是基于 `PyTorch Hooks` 和**稀疏填充 (Sparse Fill)**机制，在一个训练步内实现对专家和门控的解耦优化。
 
-我们的训练范式在一个统一的训练步骤（`train_step`）中，通过两个串联的优化阶段，实现对专家（快系统）和门控（慢系统）的解耦优化。
+### 核心流程
 
-### **第一阶段：专家优化与“惊奇度”信号提取**
+```mermaid
+sequenceDiagram
+    participant Trainer as TrainerEngine._hyper_step
+    participant Model as TinyOnnForCausalLM
+    participant MoE as TinyOnnMoE (within DecoderLayer)
+    participant Manager as SurpriseHookManager
 
-1. **前向传播**:
-    - 输入批次通过模型，门控根据当前策略路由，模型输出 `logits`。
-    - 在此过程中，通过 `forward_hook` 捕获并暂存每个专家接收到的 `input_tensor` 和对应的 `token_indices`。
-2. **主损失计算与专家更新**:
-    - 根据模型 `logits` 计算主预测损失 `L_main` (交叉熵)。
-    - **执行第一次反向传播**: `L_main.backward(retain_graph=True)`。`retain_graph=True` 是关键，它保留了计算图，为后续门控优化做准备。
-    - **更新专家**: `optimizer_experts.step()`。此时，只有专家网络的权重被更新。
-3. **“惊奇度”信号提取**:
-    - 在 `L_main.backward()` 过程中，`backward_hook` 被触发。
-    - Hook 内部利用暂存的 `input_tensor` 和传入的 `grad_output`，通过 `torch.einsum` 精确计算出每个被激活的专家在每个 Token 上的梯度范数，即“逐token惊奇” (`per_expert_surprise`)。
+    Trainer->>Trainer: 1. per_token_surprise = torch.full((B*S, E), inf)
+    Trainer->>Manager: 2. manager = SurpriseHookManager(per_token_surprise)
+    Trainer->>Manager: 3. manager.register_hooks(model)
 
-### **第二阶段：门控优化**
+    par 专家优化
+        Trainer->>Model: 4. outputs = model(**inputs)
+        Trainer->>Trainer: 5. loss_main = outputs.loss
+        Trainer->>Trainer: 6. loss_main.backward(retain_graph=True)
+        Note right of Trainer: backward_hooks 被触发，<br>并行计算 per-token surprise <br>并填充至共享张量 per_token_surprise
+        Trainer->>Trainer: 7. optimizer_experts.step()
+    and 门控优化
+        Trainer->>Manager: 8. manager.remove_hooks()
+        Trainer->>Trainer: 9. optimal_indices = per_token_surprise.argmin(dim=-1)
+        Trainer->>Trainer: 10. loss_router = CrossEntropy(all_router_logits, optimal_indices)
+        Trainer->>Trainer: 11. loss_router.backward()
+        Trainer->>Trainer: 12. optimizer_router.step()
+    end
+```
 
-1. **真值（最优专家）确定**:
-    - 收集所有专家的 `per_expert_surprise`。
-    - 对每个 Token，通过 `torch.argmin()` 找到产生最小惊奇度的专家索引，作为该 Token 的“最优路由目标” `optimal_expert_indices`。
-2. **门控损失计算与更新**:
-    - 从前向传播中获取门控网络输出的 `router_logits`。
-    - **计算门控损失**: `L_router = CrossEntropyLoss(router_logits, optimal_expert_indices)`。这个损失驱动门控去预测能产生最小惊奇度的专家。
-    - **执行第二次反向传播**: `L_router.backward()`。
-    - **更新门控**: `optimizer_router.step()`。此时，只有门控网络的权重被更新。
+### 实现细节
 
-## 4. 核心技术验证
+1. **`SurpriseHookManager` (`training/hooks.py`)**:
 
-- **Per-Token 梯度捕获**: 已通过 `exp/grad_hook_poc` 验证，使用 `forward_hook` 保存输入、`backward_hook` 结合 `torch.einsum` 计算梯度的方式，是高效且可行的，能够在单次反向传播中精确捕获 per-token 梯度范数，作为“Surprise”信号。
-- **`transformers` 集成**: 已通过 `exp/integration_poc` 验证，将自定义 MoE 模块动态替换 `transformers` 模型的 MLP 层是完全可行的。
+   - **职责**: 封装所有 `hook` 注册、移除以及计算逻辑。
+   - `__init__`: 接收一个在 `TrainerEngine` 中创建的、形状为 `(batch_size * seq_len, num_experts)` 的共享张量 `per_token_surprise`，并用 `inf` 初始化。
+   - `register_hooks`: 遍历模型所有 `TinyOnnMoE` 层，为每个 `expert` 的 `w2` 权重注册 `forward` 和 `full_backward_hook`。
+   - **`forward_hook`**: 捕获并暂存每个 expert 处理的 `input` 张量及其在 `(batch*seq_len)` 维度下的**原始 token 索引**。
+   - **`full_backward_hook`**: 利用暂存的输入、索引和 `grad_output`，计算出 `surprise` 向量，并使用原始 token 索引**直接、正确地**将其填充到共享的 `per_token_surprise` 张量的相应 `[token_indices, expert_idx]` 位置。
+
+2. **`TinyOnnMoE` (`tiny_onn/modular.py`)**:
+
+   - **职责**: 在 `forward` 过程中，必须暂存每个 expert 处理的 `input` 张量，以及对应的**原始 token 索引** `last_expert_token_indices`，供 `forward_hook` 捕获。
+
+3. **`TrainerEngine` (`training/engine.py`)**:
+   - **职责**: 实现上述 Mermaid 图所示的双层优化循环。
+   - 在 `loss_main.backward()` **之前**，初始化 `per_token_surprise` 张量和 `SurpriseHookManager`，并注册 hooks。
+   - 在 `loss_main.backward()` **之后**，移除 hooks。
+   - 使用 `attention_mask` 过滤 `router_logits` 和 `per_token_surprise`，确保只在有效 (非-padding) token 上计算 `router_loss`。
+
+## 4. 观测与验证
+
+训练过程必须记录并可视化在 [`observability_plan.md`](./.roo/rules/observability_plan.md) 中定义的核心指标，特别是：
+
+- **`gating_acc`**: 门控的路由选择与事后计算出的最小 Surprise 专家的匹配度。这是衡量元学习是否成功的关键指标。
+- **`pi_score`**: 模型的整体预测完整性分数。
+- **专家激活热力图**: 观察专家是否在不同任务上形成功能分化。

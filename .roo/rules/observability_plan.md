@@ -43,7 +43,6 @@
   3. **PI Score**: `pi_score` 的曲线。
   4. **Surprise**: `surprise` 的曲线。
   5. **Tau**: `tau` 的曲线。
-- **样式**: 严格遵循您提供的 `marathon_v3` 图表风格，包括颜色、线条样式、网格和图例。
 
 #### 图 2: `expert_dashboard_latest.png`
 

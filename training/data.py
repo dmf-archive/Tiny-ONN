@@ -1,20 +1,20 @@
-from typing import Tuple
 
-from torch.utils.data import DataLoader, Dataset
-from transformers import AutoTokenizer
+from torch.utils.data import DataLoader
+from transformers import PreTrainedTokenizer
 
-from .dataset import TextDataset
+from .dataset import JSONLDataset
 
 
 def get_dataloaders(
-    tokenizer: AutoTokenizer,
+    tokenizer: PreTrainedTokenizer,
     train_path: str,
     val_path: str,
     batch_size: int,
     num_workers: int,
-) -> Tuple[DataLoader, DataLoader]:
-    train_dataset = TextDataset(train_path, tokenizer)
-    val_dataset = TextDataset(val_path, tokenizer)
+    max_length: int,
+) -> tuple[DataLoader, DataLoader]:
+    train_dataset = JSONLDataset(train_path, tokenizer, max_length)
+    val_dataset = JSONLDataset(val_path, tokenizer, max_length)
 
     train_loader = DataLoader(
         train_dataset,

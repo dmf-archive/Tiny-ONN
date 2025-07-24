@@ -1,7 +1,7 @@
 # Model Configuration
 model:
-  model_path: "models/tiny-onn-0.6b"
-  base_model_name: "tiny-onn-0.6b"
+  model_path: "weights/Tiny-ONN-0.6B-Hyper-SMoE"
+  base_model_name: "weights/Tiny-ONN-0.6B-Hyper-SMoE"
   # Path to a local checkpoint to resume training. If "auto", it will look for the latest in output_dir.
   resume_from_checkpoint: null
   # Use torch.compile for the model to optimize performance.
@@ -21,7 +21,7 @@ data:
 # Training Hyperparameters
 training:
   # Directory to save all outputs (checkpoints, logs, plots)
-  output_dir: "outputs/meta_train_v1"
+  output_dir: "output/meta_train_v1"
   # Number of training epochs
   num_train_epochs: 3
   # Batch size per device for training
@@ -46,6 +46,16 @@ training:
   max_grad_norm: 1.0
   # Number of warmup steps for the learning rate scheduler
   lr_scheduler_warmup_steps: 100
+  # PI Score gamma hyperparameter
+  pi_gamma: 0.1
+  # PI Score alpha hyperparameter (Surprise Budget)
+  pi_alpha: 1.0
+  # Enable Automatic Mixed Precision
+  use_amp: true
+  # MoE capacity factor
+  moe_capacity_factor: 1.25
+  # MoE minimum capacity
+  moe_min_capacity: 4
 
 # Logging and Checkpointing
 logging:

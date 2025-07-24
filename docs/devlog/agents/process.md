@@ -1,13 +1,22 @@
 # Agent DevLog
 
-## 2025-07-23
+## 2025-07-26
 
-### Progress
+### Today's Progress
 
-- **Model Surgery Refactoring**: The `scripts/perform_surgery.py` script has been completely rewritten. It now correctly transfers weights from a dense Qwen3 MLP to our custom sparse `TinyOnnMoE` experts by slicing and redistributing the weight tensors.
-- **Unified Modular Definition**: The `tiny_onn/model.py` file has been merged into `tiny_onn/modular.py` and subsequently deleted. All model definitions now reside in a single, authoritative source file, `tiny_onn/modular.py`, adhering to the `transformers` library's modular design philosophy.
-- **Static Analysis & Core Tests**: The entire `tiny_onn` module now passes `ruff` and `mypy` static analysis checks. Key unit tests, including `test_surgery.py` and `test_dynmoe.py`, are now passing, validating the correctness of the model surgery and the core MoE forward pass.
+- **Pivoted Gradient Capture to `torch.autograd.grad`**: Based on the previous day's findings, completely removed the `backward_hook` based `GradientInterceptor`.
+- **Refactored `TrainerEngine`**: The core training loop in `_hyper_step` now uses `torch.autograd.grad` to explicitly calculate per-expert gradients for the `surprise` metric. This is a non-invasive method that avoids the complexities and incompatibilities encountered with hooks.
+- **Simplified Model Outputs**: Modified `tiny_onn/modular.py` to have the MoE layers directly return the token-to-expert assignments, removing the need for complex hook-based state management. Custom dataclasses for model outputs were created to support this.
+- **Removed `training/hooks.py`**: The entire module is now obsolete and has been deleted.
+- **Fixed Configuration Loading**: Corrected the `model_path` in `configs/meta_train_v1.yaml` to point to the local weights directory, resolving the `RepositoryNotFoundError`.
+- **Added `pi_alpha` and `pi_gamma` to Config**: Added the necessary hyperparameters for the PI score calculation to `training/config.py` and `configs/meta_train_v1.yaml`.
+- **Corrected Optimizer and Scheduler Steps**: Fixed a recurring `UserWarning` by ensuring `lr_scheduler.step()` is called after `grad_scaler.step(optimizer)`.
+- **Developed New Tests**:
+    - Created `tests/test_autograd_surprise.py` to provide a basic unit test for the new `autograd.grad` implementation.
+    - Created `tests/test_e2e_meta_learning.py` for a full end-to-end validation of the meta-learning pipeline, including distillation loss, surprise calculation, and router loss.
+- **Validation**: All new and existing tests are now passing, confirming the correctness of the refactored training loop.
+- **Created `exp/autograd_poc.py`**: A proof-of-concept script was created and run to visually confirm that valid gradients are being captured for expert parameters.
 
 ### Next Steps
 
-- **Fix Distillation Test**: The final remaining test, `tests/test_distillation.py`, is failing due to an `AttributeError` in `train.py` when parsing the configuration file. The immediate next step is to resolve this configuration parsing issue in `train.py` to ensure the end-to-end training pipeline test passes.
+- Continue with the training and analysis of the model, now that the core training mechanism is stable and validated.
