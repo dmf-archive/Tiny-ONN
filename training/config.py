@@ -56,8 +56,8 @@ class TrainingConfig:
     distillation_alpha: float = 0.5
     distillation_temperature: float = 2.0
     pi_gamma: float = 1.0
-    pi_alpha: float = 1.0
-    use_amp: bool = True
+    pi_alpha: float = 1.0 # Surprise Budget
+    activation_budget: float = 0.5
     moe_capacity_factor: float = 1.25
     moe_min_capacity: int = 4
 

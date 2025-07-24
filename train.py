@@ -11,7 +11,7 @@ from training.data import get_dataloaders
 from training.engine import TrainerEngine
 
 
-def main(config_path: str):
+def main(config_path: str, max_steps: int | None = None):
     config = load_config(Path(config_path))
 
     model = TinyOnnForCausalLM.from_pretrained(
@@ -59,7 +59,7 @@ def main(config_path: str):
     )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model.to(device)
+    model.to(device, dtype=torch.bfloat16)
 
     engine = TrainerEngine(
         config=config,
@@ -71,7 +71,7 @@ def main(config_path: str):
         device=device,
     )
 
-    engine.train()
+    engine.train(max_steps=max_steps)
 
 
 if __name__ == "__main__":
@@ -79,5 +79,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--config", type=str, required=True, help="Path to the YAML config file."
     )
+    parser.add_argument(
+        "--max_steps", type=int, default=None, help="Maximum number of training steps."
+    )
     args = parser.parse_args()
-    main(args.config)
+    main(args.config, args.max_steps)

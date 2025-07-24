@@ -1,90 +1,58 @@
-import sys
-from pathlib import Path
+from typing import cast
 
-# Add project root to sys.path
-sys.path.append(str(Path(__file__).parent.parent))
-
-from pathlib import Path
-
-import pytest
 import torch
-from torch.optim import AdamW
-from torch.utils.data import DataLoader, TensorDataset
 from transformers import AutoTokenizer
 
-from tiny_onn.modular import TinyOnnForCausalLM
-from training.config import load_config
-from training.engine import TrainerEngine
+from tiny_onn.modular import TinyOnnForCausalLM, TinyOnnMoE
 
 
-@pytest.fixture(scope="module")
-def setup_test_environment():
-    config_path = "configs/meta_train_v1.yaml"
-    config = load_config(Path(config_path))
+def test_autograd_surprise_calculation():
+    model_path = "weights/Tiny-ONN-0.6B-Hyper-SMoE"
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    model = TinyOnnForCausalLM.from_pretrained(
-        config.model.model_path, trust_remote_code=True
-    )
-    tokenizer = AutoTokenizer.from_pretrained(
-        config.model.base_model_name,
-        model_max_length=config.data.max_seq_length,
-        cache_dir="weights",
-    )
+    model = TinyOnnForCausalLM.from_pretrained(model_path, trust_remote_code=True)
+    model.to(device)
+    model.train()
+
+    tokenizer = AutoTokenizer.from_pretrained(model_path)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    dummy_input_ids = torch.randint(0, model.config.vocab_size, (4, 64))
-    dummy_labels = torch.randint(0, model.config.vocab_size, (4, 64))
-    dummy_dataset = TensorDataset(dummy_input_ids, dummy_labels)
-    train_dataloader = DataLoader(dummy_dataset, batch_size=2)
+    batch_size, seq_len = 4, 32
+    input_ids = torch.randint(0, model.config.vocab_size, (batch_size, seq_len), device=device)
+    labels = input_ids.clone()
 
-    expert_params = [
-        p
-        for n, p in model.named_parameters()
-        if "gate" not in n and p.requires_grad
-    ]
-    router_params = [
-        p for n, p in model.named_parameters() if "gate" in n and p.requires_grad
-    ]
-    optimizer_experts = AdamW(expert_params, lr=1e-4)
-    optimizer_router = AdamW(router_params, lr=1e-4)
+    surprise_context: dict[tuple[int, int], tuple[torch.Tensor, torch.Tensor]] = {}
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model.to(device)
-
-    return {
-        "config": config,
-        "model": model,
-        "tokenizer": tokenizer,
-        "train_dataloader": train_dataloader,
-        "optimizer_experts": optimizer_experts,
-        "optimizer_router": optimizer_router,
-        "device": device,
-    }
-
-
-def test_hyper_step_with_autograd(setup_test_environment):
-    env = setup_test_environment
-    engine = TrainerEngine(
-        config=env["config"],
-        model=env["model"],
-        optimizer_experts=env["optimizer_experts"],
-        optimizer_router=env["optimizer_router"],
-        train_dataloader=env["train_dataloader"],
-        eval_dataloader=env["train_dataloader"],
-        device=env["device"],
+    # Set a default surprise_budget for testing, even if not in dyn_k mode
+    outputs = model(
+        input_ids=input_ids,
+        labels=labels,
+        surprise_context=surprise_context,
+        surprise_budget=0.5
     )
+    loss = outputs.loss
+    assert loss is not None
 
-    batch = next(iter(env["train_dataloader"]))
-    batch_dict = {"input_ids": batch[0], "labels": batch[1]}
+    loss.backward()
 
-    metrics = engine._hyper_step(batch_dict)
+    total_routed_tokens_in_forward = 0
+    for layer in model.model.layers:
+        moe_layer = cast(TinyOnnMoE, layer.mlp)
+        if moe_layer.last_expert_token_indices:
+            for indices in moe_layer.last_expert_token_indices.values():
+                total_routed_tokens_in_forward += len(indices)
 
-    assert "main_loss" in metrics
-    assert "router_loss" in metrics
-    assert "surprise" in metrics
-    assert "pi_score" in metrics
+    calculated_surprises = 0
+    for _, (_, surprise) in surprise_context.items():
+        calculated_surprises += surprise.numel()
 
-    assert metrics["main_loss"] >= 0
-    assert metrics["router_loss"] >= 0
-    assert metrics["surprise"] >= 0
+    print("\n--- V12.1 Autograd-based Surprise Calculation ---")
+    print(f"Total number of token-expert routes in forward pass: {total_routed_tokens_in_forward}")
+    print(f"Total number of surprise values calculated via autograd: {calculated_surprises}")
+
+    assert calculated_surprises > 0, "No surprise values were calculated!"
+    assert calculated_surprises == total_routed_tokens_in_forward, \
+        "Mismatch between calculated surprises and routed tokens!"
+
+    print("\n✅ PoC successful. Per-token surprise calculated correctly via custom autograd.")

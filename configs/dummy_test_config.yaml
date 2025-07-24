@@ -1,0 +1,41 @@
+model:
+  base_model_name: "Qwen/Qwen3-0.6B"
+  model_path: "weights/Tiny-ONN-0.6B-Hyper-SMoE"
+  teacher_model_name: null
+  resume_from_checkpoint: null
+  use_torch_compile: false
+
+data:
+  train_path: "data/dummy_chat_data.jsonl"
+  eval_path: "data/dummy_chat_data.jsonl"
+  dataset_name: "dummy"
+  dataset_subset: "dummy"
+  validation_split_percentage: 10
+  max_seq_length: 32
+
+training:
+  output_dir: "tests/test_output/full_pipeline_test"
+  num_train_epochs: 1
+  per_device_train_batch_size: 2
+  per_device_eval_batch_size: 2
+  dataloader_num_workers: 0
+  expert_learning_rate: 0.0001
+  gate_learning_rate: 0.0001
+  weight_decay: 0.01
+  adam_beta1: 0.9
+  adam_beta2: 0.999
+  adam_epsilon: 1.0e-8
+  max_grad_norm: 1.0
+  lr_scheduler_warmup_steps: 10
+  pi_alpha: 0.5
+  pi_gamma: 0.1
+
+logging:
+  rolling_checkpoint_count: 1
+  log_interval: 1
+  eval_interval: 2
+  checkpoint_interval: 2
+
+system:
+  device: "auto"
+  seed: 42

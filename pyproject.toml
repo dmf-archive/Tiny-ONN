@@ -23,9 +23,13 @@ dependencies = [
   "umap-learn>=0.5.9.post2",
 ]
 
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+norecursedirs = ["ref", "exp", ".venv"]
+
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["tiny_onn*"]
+include = ["tiny_onn*", "training*", "scripts*"]
 
 [project.urls]
 "Homepage" = "https://github.com/dmf-archive/Tiny-ONN"

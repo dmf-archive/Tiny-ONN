@@ -27,7 +27,7 @@ def test_tiny_onn_moe_dynamic_k_forward(config):
     config.num_experts_per_tok = -1 # Enable dynamic k
     moe = TinyOnnMoE(config)
     hidden_states = torch.randn(2, 5, config.hidden_size)
-    
+
     # Test with a low budget, should select fewer experts
     low_budget_output = moe(hidden_states, surprise_budget=0.1)
     assert low_budget_output.shape == hidden_states.shape
@@ -39,6 +39,6 @@ def test_tiny_onn_moe_dynamic_k_forward(config):
     assert high_budget_output.shape == hidden_states.shape
     assert moe.last_selected_experts is not None
     num_selected_high = (moe.last_selected_experts != -1).sum(dim=-1)
-    
+
     # On average, a higher budget should lead to more experts being selected
     assert num_selected_high.float().mean() > num_selected_low.float().mean()

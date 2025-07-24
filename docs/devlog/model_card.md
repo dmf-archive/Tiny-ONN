@@ -12,20 +12,20 @@
 
 | 超参数                  | 值             | 备注                                                         |
 | :---------------------- | :------------- | :----------------------------------------------------------- |
-| **总参数量**            | **~0.509 B**   | **骨架与 Qwen3-0.6B 对齐，MoE 层额外增加**                |
+| **总参数量**            | **~0.509 B**   | **与 Qwen3-0.6B (0.508B) 对齐，因门控网络略增**         |
 | `vocab_size`            | 151,936        | 继承自 Qwen3                                                 |
 | `hidden_size`           | 1024           | 继承自 Qwen3                                                 |
 | `num_hidden_layers`     | 28             | 继承自 Qwen3                                                 |
 | `num_attention_heads`   | 16             | 继承自 Qwen3                                                 |
 | `num_key_value_heads`   | 8              | 继承自 Qwen3 (GQA)                                           |
-| `num_experts_per_layer` | **32**         | **核心设计：每层 MoE 总参数与原 MLP 层等价**                 |
-| `moe_intermediate_size` | **64**         | **核心设计：专家被进一步压缩，数量不变**                     |
+| `num_experts_per_layer` | **32**         | 核心设计：每层 MoE 总参数与原 MLP 层等价                     |
+| `moe_intermediate_size` | **96**         | 核心设计：专家网络 FFN 维度 (`gate_proj`, `up_proj`)         |
 
-**参数分布:**
+**参数分布 (Tiny-ONN):**
 
-- **共享骨架 (Shared Backbone)**: **331.80 M** (Embedding + All Attention Layers)
-- **专家网络 (Expert Network)**: **177.08 M** (总计 `28 * 32 = 896` 个专家)
-- **单个专家大小**: **0.197 M**
+- **共享骨架 (Shared Backbone)**: **243.66 M** (Embedding + All Attention Layers)
+- **专家与门控 (Experts + Gating)**: **265.16 M** (总计 `28 * 32 = 896` 个专家及门控)
+- **单个专家大小**: **0.295 M**
 
 ## 3. 训练策略：在线蒸馏与极致优化
 
@@ -46,9 +46,9 @@
 1. **继承预训练知识**: 我们保留了 Qwen3 预训练好的 `embedding` 和 `attention` 层。这意味着模型无需从零学习语言的底层规律，极大地降低了训练难度和数据需求。我们的任务被简化为：**在强大的预训练表征基础上，高效地训练新的 MoE 计算层。**
 
 2. **稀疏激活降本**: 通过将稠密的 MLP 层替换为稀疏的 MoE 层，我们显著降低了前向传播的计算成本。
-   - **原始 Dense MLP**: 在单层中处理一个 token 约需 **6.29M FLOPs** (`2 * 1024 * 3072`)。
-   - **Tiny-ONN MoE (k=2)**: 仅需约 **0.52M FLOPs** (`2 * 2 * (2 * 1024 * 64)`)。
-   - **结论**: 在 FFN 计算环节，我们实现了约 **91.67%** 的计算量削减，这直接转化为更快的训练和推理速度。
+   - **原始 Dense MLP**: 在单层中处理一个 token 约需 **6.29M FLOPs** (`2 * hidden_size * intermediate_size`)。
+   - **Tiny-ONN MoE (k=4)**: 仅需约 **0.79M FLOPs** (`4 * 2 * hidden_size * moe_intermediate_size`)。
+   - **结论**: 在 FFN 计算环节，我们实现了约 **87.44%** 的计算量削减，这直接转化为更快的训练和推理速度。
 
 ### 3.3 硬件可行性
 

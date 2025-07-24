@@ -1,4 +1,4 @@
-# Tiny-ONN 最终架构与训练范式 (V2)
+# Tiny-ONN 最终架构与训练范式 (V31)
 
 ## 1. 核心思想：解耦元学习
 
@@ -18,15 +18,14 @@
   - `num_experts_per_layer`: 32
   - `moe_intermediate_size`: 64 (每个专家网络极度轻量)
 
-- **动态 K 选择 (Surprise Budgeting)**: 门控网络为每个 Token 动态决定激活多少个 (`K`) 专家。此决策借鉴了 `DynMoE` 的显式可变 Top-K 思想，并与我们的理论结合：
-  1. 门控网络为每个 Token 输出对所有专家的亲和度 `router_logits`。
-  2. 根据 `router_logits` 计算“预期 Surprise”的概率分布。
-  3. 选择激活预期 Surprise 最低的若干专家，直到它们的累积概率达到全局超参数**认知预算** (`surprise_budget`) 的上限。
-  4. 这套机制已在 [`tiny_onn/modular.py`](./tiny_onn/modular.py) 的 `TinyOnnMoE.forward` 方法中初步实现。
+- **动态 K 选择与自适应预算**: 门控网络为每个 Token 动态决定激活 (`K`) 多少专家。`K` 的值由一个**可学习的参数 `surprise_budget` (`pi_alpha`)** 动态决定。
+  1. `router_logits` 预测每个 expert 的亲和度（与预期 surprise 负相关）。
+  2. `softmax(-router_logits)` 将其转换为概率分布。
+  3. 选择激活概率最高的若干 experts，直到累积概率达到可学习的 `surprise_budget` 上限。
 
-## 3. 训练范式：基于 Hooks 的双层优化 (V6 方案)
+## 3. 训练范式：基于 `autograd.Function` 的三位一体损失
 
-**此为官方唯一指定的训练范式**，它取代了所有基于 `torch.autograd.grad` 的旧方案。其核心是基于 `PyTorch Hooks` 和**稀疏填充 (Sparse Fill)**机制，在一个训练步内实现对专家和门控的解耦优化。
+**此为官方唯一指定的训练范式**，它取代了所有基于 `hook` 的旧方案。其核心是使用自定义的 `autograd.Function` 来精确捕获梯度，并通过一个三位一体的复合损失函数来实现解耦元学习。
 
 ### 核心流程
 
@@ -34,46 +33,46 @@
 sequenceDiagram
     participant Trainer as TrainerEngine._hyper_step
     participant Model as TinyOnnForCausalLM
-    participant MoE as TinyOnnMoE (within DecoderLayer)
-    participant Manager as SurpriseHookManager
-
-    Trainer->>Trainer: 1. per_token_surprise = torch.full((B*S, E), inf)
-    Trainer->>Manager: 2. manager = SurpriseHookManager(per_token_surprise)
-    Trainer->>Manager: 3. manager.register_hooks(model)
-
-    par 专家优化
-        Trainer->>Model: 4. outputs = model(**inputs)
-        Trainer->>Trainer: 5. loss_main = outputs.loss
-        Trainer->>Trainer: 6. loss_main.backward(retain_graph=True)
-        Note right of Trainer: backward_hooks 被触发，<br>并行计算 per-token surprise <br>并填充至共享张量 per_token_surprise
-        Trainer->>Trainer: 7. optimizer_experts.step()
-    and 门控优化
-        Trainer->>Manager: 8. manager.remove_hooks()
-        Trainer->>Trainer: 9. optimal_indices = per_token_surprise.argmin(dim=-1)
-        Trainer->>Trainer: 10. loss_router = CrossEntropy(all_router_logits, optimal_indices)
-        Trainer->>Trainer: 11. loss_router.backward()
-        Trainer->>Trainer: 12. optimizer_router.step()
-    end
+    participant Autograd as CaptureSurprise.apply
+    
+    Trainer->>Trainer: 1. `surprise_context = {}`
+    Trainer->>Model: 2. `outputs = model(..., surprise_context=surprise_context)`
+    
+    Note right of Model: 前向传播正常进行，<br/>`CaptureSurprise.forward` 被调用
+    
+    Trainer->>Trainer: 3. `main_loss = outputs.loss`
+    Trainer->>Trainer: 4. `main_loss.backward(retain_graph=True)`
+    
+    Note right of Trainer: 第一次 backward。<br/>`CaptureSurprise.backward` 被触发，<br/>`surprise_context` 被填充。
+    
+    Trainer->>Trainer: 5. 构建全局 surprise 张量 (稀疏填充, OOM 优化)
+    Trainer->>Trainer: 6. `optimal_indices = argmin(global_surprise)`
+    Trainer->>Trainer: 7. `smk_loss = CrossEntropy(logits, optimal_indices)`
+    Trainer->>Trainer: 8. `avg_k_loss = mean(k_per_token)`
+    Trainer->>Trainer: 9. `router_loss = smk_loss + lambda * avg_k_loss`
+    
+    Trainer->>Trainer: 10. `router_loss.backward()`
+    
+    Note right of Trainer: 第二次 backward。<br/>梯度流向 gate 和 surprise_budget 参数。
+    
+    Trainer->>Trainer: 11. `optimizer_experts.step()`
+    Trainer->>Trainer: 12. `optimizer_router.step()`
 ```
 
 ### 实现细节
 
-1. **`SurpriseHookManager` (`training/hooks.py`)**:
-
-   - **职责**: 封装所有 `hook` 注册、移除以及计算逻辑。
-   - `__init__`: 接收一个在 `TrainerEngine` 中创建的、形状为 `(batch_size * seq_len, num_experts)` 的共享张量 `per_token_surprise`，并用 `inf` 初始化。
-   - `register_hooks`: 遍历模型所有 `TinyOnnMoE` 层，为每个 `expert` 的 `w2` 权重注册 `forward` 和 `full_backward_hook`。
-   - **`forward_hook`**: 捕获并暂存每个 expert 处理的 `input` 张量及其在 `(batch*seq_len)` 维度下的**原始 token 索引**。
-   - **`full_backward_hook`**: 利用暂存的输入、索引和 `grad_output`，计算出 `surprise` 向量，并使用原始 token 索引**直接、正确地**将其填充到共享的 `per_token_surprise` 张量的相应 `[token_indices, expert_idx]` 位置。
+1. **`CaptureSurprise` (`training/autograd.py`)**:
+    - 一个自定义的 `torch.autograd.Function`，充当“梯度探测器”。
+    - **`forward`**: 充当恒等函数，但在 `ctx` 中保存关键上下文（`layer_idx`, `expert_idx`, `token_indices` 等）。
+    - **`backward`**: 接收到的 `grad_output` 即 `d(loss)/d(expert_input)`。它将计算出的 `surprise` 和上下文一起存入一个外部字典 `surprise_context`，然后将梯度原封不动地传回主计算图。
 
 2. **`TinyOnnMoE` (`tiny_onn/modular.py`)**:
-
-   - **职责**: 在 `forward` 过程中，必须暂存每个 expert 处理的 `input` 张量，以及对应的**原始 token 索引** `last_expert_token_indices`，供 `forward_hook` 捕获。
+    - `surprise_budget` (`pi_alpha`) 被定义为一个可学习的 `nn.Parameter`，并参与 `optimizer_router` 的优化。
+    - 在 `forward` 过程中，将 `expert` 的输入用 `CaptureSurprise.apply(...)` 包装起来，并将 `surprise_context` 字典和层、专家索引传递进去。
 
 3. **`TrainerEngine` (`training/engine.py`)**:
    - **职责**: 实现上述 Mermaid 图所示的双层优化循环。
-   - 在 `loss_main.backward()` **之前**，初始化 `per_token_surprise` 张量和 `SurpriseHookManager`，并注册 hooks。
-   - 在 `loss_main.backward()` **之后**，移除 hooks。
+   - 在 `main_loss.backward()` 之后，使用 `surprise_context` 字典中的稀疏数据，“即时”编译出一个与 `concatenated_logits` 形状相同的稠密 `per_token_surprise` 张量，未激活的 expert 填充 `inf`。
    - 使用 `attention_mask` 过滤 `router_logits` 和 `per_token_surprise`，确保只在有效 (非-padding) token 上计算 `router_loss`。
 
 ## 4. 观测与验证

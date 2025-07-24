@@ -16,7 +16,7 @@ data:
   # Percentage of the dataset to use for validation
   validation_split_percentage: 5
   # Maximum sequence length for tokenization
-  max_seq_length: 512
+  max_seq_length: 256
 
 # Training Hyperparameters
 training:
@@ -25,7 +25,7 @@ training:
   # Number of training epochs
   num_train_epochs: 3
   # Batch size per device for training
-  per_device_train_batch_size: 8
+  per_device_train_batch_size: 1
   # Batch size per device for evaluation
   per_device_eval_batch_size: 8
   # Number of workers for the dataloader
@@ -33,7 +33,7 @@ training:
   # Learning rate for the expert networks
   expert_learning_rate: 1.0e-4
   # Learning rate for the gating (router) network
-  gate_learning_rate: 4.0e-4
+  gate_learning_rate: 1.0e-5
   # Weight decay for the AdamW optimizer
   weight_decay: 0.01
   # AdamW optimizer beta1
@@ -50,8 +50,6 @@ training:
   pi_gamma: 0.1
   # PI Score alpha hyperparameter (Surprise Budget)
   pi_alpha: 1.0
-  # Enable Automatic Mixed Precision
-  use_amp: true
   # MoE capacity factor
   moe_capacity_factor: 1.25
   # MoE minimum capacity
@@ -62,7 +60,7 @@ logging:
   # Log metrics every N steps
   log_interval: 10
   # Evaluate on the validation set every N steps
-  eval_interval: 500
+  eval_interval: 50
   # Save a checkpoint every N steps
   checkpoint_interval: 500
   # Number of recent checkpoints to keep

@@ -1,0 +1,45 @@
+# Model Configuration
+model:
+  model_path: "weights/Tiny-ONN-0.6B-Hyper-SMoE"
+  base_model_name: "weights/Tiny-ONN-0.6B-Hyper-SMoE"
+  resume_from_checkpoint: null
+  use_torch_compile: true
+
+# Data Configuration
+data:
+  dataset_name: "c4"
+  dataset_subset: "en"
+  validation_split_percentage: 5
+  max_seq_length: 256
+
+# Training Hyperparameters
+training:
+  output_dir: "output/meta_train_v1_conservative"
+  num_train_epochs: 3
+  per_device_train_batch_size: 1
+  per_device_eval_batch_size: 8
+  dataloader_num_workers: 4
+  expert_learning_rate: 1.0e-4
+  gate_learning_rate: 1.0e-5
+  weight_decay: 0.01
+  adam_beta1: 0.9
+  adam_beta2: 0.999
+  adam_epsilon: 1.0e-8
+  max_grad_norm: 1.0
+  lr_scheduler_warmup_steps: 100
+  pi_gamma: 0.1
+  pi_alpha: 0.2  # Conservative Surprise Budget
+  moe_capacity_factor: 1.25
+  moe_min_capacity: 4
+
+# Logging and Checkpointing
+logging:
+  log_interval: 10
+  eval_interval: 50
+  checkpoint_interval: 500
+  rolling_checkpoint_count: 3
+
+# System Configuration
+system:
+  device: "auto"
+  seed: 42

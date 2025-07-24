@@ -9,11 +9,12 @@ from tiny_onn.modular import TinyOnnForCausalLM
 
 
 def perform_surgery(
-    base_model_name: str, cache_dir: str, **kwargs
+    base_model_name: str, cache_dir: str, base_model: torch.nn.Module | None = None, **kwargs
 ) -> tuple[TinyOnnForCausalLM, AutoTokenizer]:
-    base_model = AutoModelForCausalLM.from_pretrained(
-        base_model_name, cache_dir=cache_dir, trust_remote_code=True
-    )
+    if base_model is None:
+        base_model = AutoModelForCausalLM.from_pretrained(
+            base_model_name, cache_dir=cache_dir, trust_remote_code=True
+        )
     tokenizer = AutoTokenizer.from_pretrained(
         base_model_name, cache_dir=cache_dir, trust_remote_code=True
     )
