@@ -9,10 +9,9 @@ class TinyOnnConfig(Qwen3Config):
         num_experts_per_layer=32,
         moe_intermediate_size=-1,
         num_experts_per_tok=-1,
-        attn_implementation="eager",
         **kwargs,
     ):
-        super().__init__(attn_implementation=attn_implementation, **kwargs)
+        super().__init__(**kwargs)
         self.num_experts_per_layer = num_experts_per_layer
         self.moe_intermediate_size = (
             moe_intermediate_size

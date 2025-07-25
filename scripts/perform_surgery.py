@@ -63,7 +63,7 @@ def perform_surgery(
                 f"model.layers.{layer_idx}.mlp.experts.{expert_idx}.w2.weight"
             ] = down_chunks[expert_idx]
 
-    tiny_onn_model.load_state_dict(tiny_onn_state_dict, strict=True)
+    tiny_onn_model.load_state_dict(tiny_onn_state_dict, strict=False)
 
     return tiny_onn_model, tokenizer
 
@@ -93,7 +93,7 @@ def main():
     parser.add_argument(
         "--num_experts_per_tok",
         type=int,
-        default=4,
+        default=-1,
         help="Number of experts to use per token.",
     )
     parser.add_argument(

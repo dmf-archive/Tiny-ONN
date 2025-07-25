@@ -22,76 +22,59 @@ def _from_dict(data_class, data):
 
 
 @dataclass
+class DataConfig:
+    mode: str = "local_json"
+    train_path: str | None = None
+    eval_path: str | None = None
+    dataset_name: str | None = None
+    dataset_subset: str | None = None
+    validation_split_percentage: int = 5
+    max_seq_length: int = 512
+
+
+@dataclass
 class ModelConfig:
     model_path: str
-    base_model_name: str
-    teacher_model_name: str | None = None
     resume_from_checkpoint: str | None = None
-    use_torch_compile: bool = True
-
-
-@dataclass
-class DataConfig:
-    dataset_name: str
-    dataset_subset: str
-    validation_split_percentage: int
-    max_seq_length: int
-
-
-@dataclass
-class TrainingConfig:
-    output_dir: str
-    num_train_epochs: int
-    per_device_train_batch_size: int
-    per_device_eval_batch_size: int
-    dataloader_num_workers: int
-    expert_learning_rate: float
-    gate_learning_rate: float
-    weight_decay: float
-    adam_beta1: float
-    adam_beta2: float
-    adam_epsilon: float
-    max_grad_norm: float
-    lr_scheduler_warmup_steps: int = 0
-    distillation_alpha: float = 0.5
-    distillation_temperature: float = 2.0
-    pi_gamma: float = 1.0
-    pi_alpha: float = 1.0 # Surprise Budget
-    activation_budget: float = 0.5
-    moe_capacity_factor: float = 1.25
-    moe_min_capacity: int = 4
-    router_loss_lambda: float = 0.01
-
-
-@dataclass
-class LoggingConfig:
-    log_interval: int
-    eval_interval: int
-    checkpoint_interval: int
-    plot_interval: int
-    rolling_checkpoint_count: int
-
-
-@dataclass
-class SystemConfig:
-    device: str
-    seed: int
 
 
 @dataclass
 class TrainConfig:
-    model: ModelConfig
+    per_device_train_batch_size: int = 1
+    num_train_epochs: int = 1
+    expert_learning_rate: float = 1.0e-5
+    gate_learning_rate: float = 1.0e-4
+    sparsity_learning_rate: float = 1.0e-3
+    weight_decay: float = 0.01
+    adam_beta1: float = 0.9
+    adam_beta2: float = 0.999
+    adam_epsilon: float = 1.0e-8
+    lr_scheduler_warmup_steps: int = 10
+    smk_loss_weight: float = 0.1
+
+
+@dataclass
+class ObserverConfig:
+    output_dir: str
+    log_interval: int = 1
+    checkpoint_interval: int = 100
+    pi_gamma: float = 0.5
+    pi_alpha: float = 1.0
+
+
+@dataclass
+class FullConfig:
     data: DataConfig
-    training: TrainingConfig
-    logging: LoggingConfig
-    system: SystemConfig
+    model: ModelConfig
+    train: TrainConfig
+    observer: ObserverConfig
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "TrainConfig":
+    def from_dict(cls, data: dict[str, Any]) -> "FullConfig":
         return _from_dict(cls, data)
 
 
-def load_config(config_path: Path) -> TrainConfig:
+def load_config(config_path: Path) -> FullConfig:
     with open(config_path) as f:
         config_data = yaml.safe_load(f)
-    return TrainConfig.from_dict(config_data)
+    return FullConfig.from_dict(config_data)

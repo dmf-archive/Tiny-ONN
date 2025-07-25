@@ -47,8 +47,8 @@
 
 2. **稀疏激活降本**: 通过将稠密的 MLP 层替换为稀疏的 MoE 层，我们显著降低了前向传播的计算成本。
    - **原始 Dense MLP**: 在单层中处理一个 token 约需 **6.29M FLOPs** (`2 * hidden_size * intermediate_size`)。
-   - **Tiny-ONN MoE (k=4)**: 仅需约 **0.79M FLOPs** (`4 * 2 * hidden_size * moe_intermediate_size`)。
-   - **结论**: 在 FFN 计算环节，我们实现了约 **87.44%** 的计算量削减，这直接转化为更快的训练和推理速度。
+   - **Tiny-ONN MoE (k=16)**: 约需 **3.15M FLOPs** (`16 * 2 * hidden_size * moe_intermediate_size`)。
+   - **结论**: 在 FFN 计算环节，我们实现了约 **49.92%** 的计算量削减，这直接转化为更快的训练和推理速度。
 
 ### 3.3 硬件可行性
 

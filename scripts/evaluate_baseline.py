@@ -1,13 +1,17 @@
 import argparse
 import sys
+import time
 from pathlib import Path
 
 import torch
+import torch.nn.functional as F
+from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 sys.path.append(str(Path(__file__).parent.parent))
 
 from tiny_onn.modular import TinyOnnForCausalLM
+from training.config import DataConfig
 from training.data import get_dataloaders
 
 
@@ -16,19 +20,21 @@ def evaluate_baseline(
     data_path: str,
     max_seq_length: int,
     batch_size: int,
-    use_tiny_onn: bool,
-    dynamic_k_inference: bool,
+    use_tiny_onn: bool
 ):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
+    print(f"--- BENCHMARKING on {device} ---")
+    print(f"Model: {model_name}, TinyOnn: {use_tiny_onn}")
 
     ModelClass = TinyOnnForCausalLM if use_tiny_onn else AutoModelForCausalLM
 
-    load_kwargs = {"trust_remote_code": True, "cache_dir": "weights"}
-    if use_tiny_onn:
-        load_kwargs["ignore_mismatched_sizes"] = True
+    model = ModelClass.from_pretrained(
+        model_name,
+        trust_remote_code=True,
+        cache_dir="weights",
+        ignore_mismatched_sizes=use_tiny_onn,
+    ).to(device, dtype=torch.bfloat16)
 
-    model = ModelClass.from_pretrained(model_name, **load_kwargs)
     tokenizer = AutoTokenizer.from_pretrained(
         model_name,
         trust_remote_code=True,
@@ -39,54 +45,62 @@ def evaluate_baseline(
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    model.to(device)
-    model.eval()
+    data_config = DataConfig(
+        mode="local_json",
+        train_path=data_path,
+        eval_path=data_path,
+        max_seq_length=max_seq_length,
+    )
 
     _, eval_dataloader = get_dataloaders(
+        data_config=data_config,
         tokenizer=tokenizer,
-        train_path=data_path, # Dummy path, not used
-        val_path=data_path,
         batch_size=batch_size,
         num_workers=0,
-        max_length=max_seq_length,
     )
 
-    # This script now focuses on generation, not perplexity calculation.
-    print(f"\n--- Generating Sample Completion for {model_name} ---")
+    model.train()  # Use train mode to enable gradients
 
-    # Get a single sample from the validation data
-    dataset = eval_dataloader.dataset
-    sample = dataset.data[0]  # Access raw data
+    # Warm-up
+    for _ in range(2):
+        batch = next(iter(eval_dataloader))
+        inputs = {k: v.to(device) for k, v in batch.items()}
+        labels = inputs.pop("labels")
+        outputs = model(**inputs)
+        loss = F.cross_entropy(outputs.logits.view(-1, model.config.vocab_size), labels.view(-1))
+        loss.backward()
 
-    # Extract only the user message
-    user_message = [sample["messages"][0]]
+    torch.cuda.synchronize()
 
-    # Apply template to create the generation prompt
-    prompt_text = tokenizer.apply_chat_template(
-        user_message, tokenize=False, add_generation_prompt=True
-    )
+    start_time = time.time()
+    num_batches = 0
+    progress_bar = tqdm(eval_dataloader, desc="Benchmarking")
 
-    inputs = tokenizer(prompt_text, return_tensors="pt").to(device)
+    for batch in progress_bar:
+        inputs = {k: v.to(device) for k, v in batch.items()}
+        labels = inputs.pop("labels")
 
-    print(f"Prompt: {prompt_text}")
+        # Forward pass
+        outputs = model(**inputs)
+        loss = F.cross_entropy(outputs.logits.view(-1, model.config.vocab_size), labels.view(-1))
 
-    # Generate text
-    generated_ids = model.generate(
-        inputs["input_ids"],
-        max_new_tokens=100,
-        num_return_sequences=1,
-        pad_token_id=tokenizer.eos_token_id,
-        attention_mask=inputs["attention_mask"],
-    )
+        # Backward pass
+        loss.backward()
+        num_batches += 1
 
-    decoded_text = tokenizer.decode(generated_ids[0], skip_special_tokens=True)
+    torch.cuda.synchronize()
+    end_time = time.time()
 
-    print("\nGenerated Text:")
-    print(decoded_text)
+    total_time = end_time - start_time
+    avg_time_per_batch = total_time / num_batches if num_batches > 0 else 0
+
+    print("\n--- Benchmark Results ---")
+    print(f"Total time for {num_batches} batches: {total_time:.4f} seconds")
+    print(f"Average time per batch: {avg_time_per_batch:.4f} seconds")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Evaluate a model's generation.")
+    parser = argparse.ArgumentParser(description="Benchmark a model's forward/backward pass.")
     parser.add_argument(
         "--model_name",
         type=str,
@@ -108,12 +122,6 @@ if __name__ == "__main__":
     parser.add_argument(
         "--use_tiny_onn", action="store_true", help="Use TinyOnn model architecture."
     )
-    parser.add_argument(
-        "--dynamic_k_inference",
-        action="store_true",
-        help="Enable dynamic K inference for TinyOnn.",
-    )
-
     args = parser.parse_args()
     evaluate_baseline(
         args.model_name,
@@ -121,5 +129,4 @@ if __name__ == "__main__":
         args.max_seq_length,
         args.batch_size,
         args.use_tiny_onn,
-        args.dynamic_k_inference,
     )

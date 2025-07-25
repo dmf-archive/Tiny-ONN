@@ -1,0 +1,27 @@
+data:
+  mode: "local_json"
+  train_path: "data/dummy_chat_data.jsonl"
+  eval_path: "data/dummy_chat_data.jsonl"
+  max_seq_length: 512
+
+model:
+  model_path: "weights/Tiny-ONN-0.6B-Hyper-SMoE-V4"
+
+train:
+  per_device_train_batch_size: 1
+  num_train_epochs: 3
+  expert_learning_rate: 1.0e-5
+  gate_learning_rate: 1.0e-4
+  adam_beta1: 0.9
+  adam_beta2: 0.999
+  adam_epsilon: 1.0e-8
+  weight_decay: 0.01
+  lr_scheduler_warmup_steps: 10
+
+observer:
+  output_dir: "output/E2E_test_train"
+  log_interval: 1
+  eval_interval: 50
+  checkpoint_interval: 100
+  pi_gamma: 0.5
+  pi_alpha: 1.0
