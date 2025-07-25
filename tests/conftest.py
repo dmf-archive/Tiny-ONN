@@ -1,15 +1,15 @@
-import pytest
-import torch
-import shutil
-from pathlib import Path
-from transformers import AutoTokenizer, Qwen3Config
-from tiny_onn.modular import TinyOnnForCausalLM, TinyOnnModel
-import sys
 import os
+import shutil
+import sys
+from pathlib import Path
+
+import pytest
+from transformers import AutoTokenizer, Qwen3Config
 
 # Ensure scripts can be imported
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from scripts.perform_surgery import perform_surgery
+
 
 @pytest.fixture(scope="session")
 def tiny_test_model_and_tokenizer():
@@ -27,7 +27,7 @@ def tiny_test_model_and_tokenizer():
         num_key_value_heads=4,
         vocab_size=1000,
     )
-    
+
     # 2. Create a random base model from this config
     # We use TinyOnnModel here for convenience as it's already a Qwen3Model subclass
     from transformers import Qwen3ForCausalLM
@@ -37,7 +37,7 @@ def tiny_test_model_and_tokenizer():
     tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-0.6B", cache_dir="weights")
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-    
+
     # 4. Perform surgery on the tiny base model object
     tiny_onn_model, _ = perform_surgery(
         base_model_name="Qwen/Qwen3-0.6B", # Only used for tokenizer and base config props

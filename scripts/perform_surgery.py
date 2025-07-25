@@ -20,12 +20,16 @@ def perform_surgery(
     )
 
     base_config = base_model.config
-    tiny_onn_config_dict = base_config.to_dict()
+    if hasattr(base_config, "to_dict") and callable(base_config.to_dict):
+        tiny_onn_config_dict = base_config.to_dict()
+    else:
+        tiny_onn_config_dict = vars(base_config)
 
     num_experts = kwargs.get("num_experts_per_layer", 32)
-    tiny_onn_config_dict["moe_intermediate_size"] = (
-        base_config.intermediate_size // num_experts
-    )
+    if hasattr(base_config, "intermediate_size"):
+        tiny_onn_config_dict["moe_intermediate_size"] = (
+            base_config.intermediate_size // num_experts
+        )
 
     tiny_onn_config_dict.update(kwargs)
     config = TinyOnnConfig(**tiny_onn_config_dict)
@@ -71,7 +75,7 @@ def main():
     parser.add_argument(
         "--base_model_name",
         type=str,
-        default="Qwen/Qwen3-0.5B",
+        default="Qwen/Qwen3-0.6B",
         help="The name of the base model to perform surgery on.",
     )
     parser.add_argument(
@@ -116,6 +120,30 @@ def main():
     model.save_pretrained(output_path)
     tokenizer.save_pretrained(output_path)
     print("Surgery complete.")
+
+    print("\n--- Verifying Surgery ---")
+    print("Loading base model for comparison...")
+    base_model_verify = AutoModelForCausalLM.from_pretrained(
+        args.base_model_name, cache_dir=args.cache_dir, trust_remote_code=True
+    )
+    print("Loading surgically modified model...")
+    surgical_model_verify = TinyOnnForCausalLM.from_pretrained(output_path, trust_remote_code=True)
+
+    print("\nBase Model Architecture (Layer 0 MLP):")
+    print(base_model_verify.model.layers[0].mlp)
+
+    print("\nSurgical Model Architecture (Layer 0 MLP):")
+    print(surgical_model_verify.model.layers[0].mlp)
+
+    base_mlp_type = type(base_model_verify.model.layers[0].mlp)
+    surgical_mlp_type = type(surgical_model_verify.model.layers[0].mlp)
+
+    if base_mlp_type != surgical_mlp_type:
+        print("\n✅ Verification PASSED: MLP layer types are different.")
+        print(f"   - Base MLP Type: {base_mlp_type.__name__}")
+        print(f"   - Surgical MLP Type: {surgical_mlp_type.__name__}")
+    else:
+        print(f"\n❌ Verification FAILED: MLP layer types are the same ({base_mlp_type.__name__}).")
 
 
 if __name__ == "__main__":

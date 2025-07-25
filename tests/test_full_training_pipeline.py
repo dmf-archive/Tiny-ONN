@@ -1,9 +1,10 @@
 import shutil
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
-import subprocess
-import sys
+
 
 @pytest.mark.skip(reason="Full pipeline test is resource-intensive and tested separately.")
 def test_full_pipeline_runs():
@@ -21,9 +22,9 @@ def test_full_pipeline_runs():
         "--max_steps",
         "3",
     ]
-    
+
     result = subprocess.run(command, capture_output=True, text=True)
-    
+
     print("--- Subprocess stdout ---")
     print(result.stdout)
     print("--- Subprocess stderr ---")

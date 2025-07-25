@@ -3,7 +3,6 @@ import torch
 from torch.optim import AdamW
 from torch.utils.data import DataLoader, TensorDataset
 
-from tiny_onn.modular import TinyOnnForCausalLM
 from training.config import TrainConfig
 from training.engine import TrainerEngine
 
@@ -45,7 +44,7 @@ def test_meta_learning_grad_flow(tiny_test_model_and_tokenizer):
         "system": {"device": "cpu", "seed": 42}
     }
     config = TrainConfig.from_dict(config_dict)
-    
+
     trainer = TrainerEngine(
         config=config, model=model, optimizer_experts=optimizer_experts,
         optimizer_router=optimizer_router, train_dataloader=dataloader,
@@ -54,7 +53,7 @@ def test_meta_learning_grad_flow(tiny_test_model_and_tokenizer):
 
     batch = {"input_ids": input_ids, "labels": labels}
     trainer._hyper_step(batch)
-    
+
     gate_grad_found = False
     for layer in model.model.layers:
         gate = layer.mlp.gate
@@ -63,6 +62,6 @@ def test_meta_learning_grad_flow(tiny_test_model_and_tokenizer):
             if torch.any(gate.weight.grad != 0):
                 gate_grad_found = True
                 break
-    
+
     assert gate_grad_found, "Gate should have received non-zero gradients!"
     print("\n✅ PoC successful. Router (gate) received gradients from router_loss.")

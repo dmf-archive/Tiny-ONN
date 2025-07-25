@@ -60,6 +60,7 @@ class TrainingConfig:
     activation_budget: float = 0.5
     moe_capacity_factor: float = 1.25
     moe_min_capacity: int = 4
+    router_loss_lambda: float = 0.01
 
 
 @dataclass
@@ -67,6 +68,7 @@ class LoggingConfig:
     log_interval: int
     eval_interval: int
     checkpoint_interval: int
+    plot_interval: int
     rolling_checkpoint_count: int
 
 

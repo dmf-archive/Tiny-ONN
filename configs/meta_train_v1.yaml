@@ -54,15 +54,19 @@ training:
   moe_capacity_factor: 1.25
   # MoE minimum capacity
   moe_min_capacity: 4
+  # Lambda for balancing smk_loss and avg_k_loss in router_loss
+  router_loss_lambda: 0.01
 
 # Logging and Checkpointing
 logging:
   # Log metrics every N steps
-  log_interval: 10
+  log_interval: 1
   # Evaluate on the validation set every N steps
-  eval_interval: 50
+  eval_interval: 100
   # Save a checkpoint every N steps
   checkpoint_interval: 500
+  # Plot metrics every N steps
+  plot_interval: 1
   # Number of recent checkpoints to keep
   rolling_checkpoint_count: 3
 

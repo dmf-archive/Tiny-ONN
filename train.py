@@ -40,7 +40,9 @@ def main(config_path: str, max_steps: int | None = None):
         if "gate" not in n and p.requires_grad
     ]
     router_params = [
-        p for n, p in model.named_parameters() if "gate" in n and p.requires_grad
+        p
+        for n, p in model.named_parameters()
+        if ("gate" in n or "surprise_budget" in n) and p.requires_grad
     ]
 
     optimizer_experts = AdamW(

@@ -1,6 +1,7 @@
 import json
 from pathlib import Path
 
+
 def calculate_qwen3_params(config):
     """Calculates parameters for a standard Qwen3 dense model."""
     hidden_size = config["hidden_size"]
@@ -60,13 +61,13 @@ def calculate_tiny_onn_params(config):
     original_intermediate_size = moe_intermediate_size * num_experts
     mlp_params_per_layer = (hidden_size * original_intermediate_size) * 2 + (original_intermediate_size * hidden_size)
     total_moe_params = num_hidden_layers * mlp_params_per_layer
-    
+
     gating_params = num_hidden_layers * (hidden_size * num_experts)
 
     total_moe_and_gating_params = total_moe_params + gating_params
 
     norm_params = num_hidden_layers * (hidden_size * 2) + hidden_size
-    
+
     total_params = backbone_params + total_moe_and_gating_params + norm_params
 
     return {
@@ -80,10 +81,10 @@ def main():
     qwen3_config_path = Path("weights/models--Qwen--Qwen3-0.6B/snapshots/e6de91484c29aa9480d55605af694f39b081c455/config.json")
     tiny_onn_config_path = Path("weights/Tiny-ONN-0.6B-Hyper-SMoE/config.json")
 
-    with open(qwen3_config_path, "r") as f:
+    with open(qwen3_config_path) as f:
         qwen3_config = json.load(f)
 
-    with open(tiny_onn_config_path, "r") as f:
+    with open(tiny_onn_config_path) as f:
         tiny_onn_config = json.load(f)
 
     qwen3_params = calculate_qwen3_params(qwen3_config)

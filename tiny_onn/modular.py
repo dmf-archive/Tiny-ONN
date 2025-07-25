@@ -42,6 +42,7 @@ class TinyOnnMoE(Qwen3MLP):
         self.experts = nn.ModuleList(
             [TinyOnnExpert(config) for _ in range(self.num_experts)]
         )
+        self.surprise_budget = nn.Parameter(torch.tensor(0.5))
         self.last_router_logits: torch.Tensor | None = None
         self.last_expert_token_indices: dict[int, torch.Tensor] | None = None
         self.last_expert_inputs: dict[int, torch.Tensor] | None = None
@@ -52,7 +53,6 @@ class TinyOnnMoE(Qwen3MLP):
         self,
         hidden_states: torch.Tensor,
         *,
-        surprise_budget: float = 0.5,
         surprise_context: dict | None = None,
         layer_idx: int = -1,
     ) -> torch.Tensor:
@@ -62,13 +62,13 @@ class TinyOnnMoE(Qwen3MLP):
         flat_hidden_states = hidden_states.view(-1, hidden_dim)
         num_tokens = flat_hidden_states.shape[0]
 
-        router_logits = self.gate(flat_hidden_states)
+        router_logits = torch.tanh(self.gate(flat_hidden_states))
 
         if self.top_k == -1:
             selection_probs = torch.softmax(-router_logits, dim=-1, dtype=torch.float)
             sorted_probs, _ = torch.sort(selection_probs, dim=-1, descending=True)
             cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
-            k_per_token = torch.sum(cumulative_probs < surprise_budget, dim=-1) + 1
+            k_per_token = torch.sum(cumulative_probs < self.surprise_budget, dim=-1) + 1
         else:
             k_per_token = torch.full((num_tokens,), self.top_k, dtype=torch.long, device=hidden_states.device)
         self.last_k_per_token = k_per_token
@@ -77,36 +77,44 @@ class TinyOnnMoE(Qwen3MLP):
         max_k = min(max_k, self.num_experts)
 
         routing_weights, selected_experts = torch.topk(router_logits, max_k, dim=-1, largest=False)
+        
+        per_token_mask = torch.arange(max_k, device=hidden_states.device).expand(num_tokens, -1) < k_per_token.unsqueeze(1)
+        
+        routing_weights = routing_weights.masked_fill(~per_token_mask, -1e9)
         routing_weights = F.softmax(-routing_weights, dim=-1, dtype=torch.float)
-
+        
         final_hidden_states = torch.zeros_like(flat_hidden_states)
-
-        expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=self.num_experts).permute(2, 1, 0)
-
+        
         self.last_router_logits = router_logits
-        self.last_expert_token_indices = {}
-        self.last_expert_inputs = {}
-
-        for expert_idx in range(self.num_experts):
-            idx, top_x = torch.where(expert_mask[expert_idx])
-
-            if top_x.numel() == 0:
+        self.last_selected_experts = selected_experts
+        
+        for i in range(max_k):
+            expert_idx_i = selected_experts[:, i]
+            token_mask_i = per_token_mask[:, i]
+            
+            if not token_mask_i.any():
                 continue
 
-            self.last_expert_token_indices[expert_idx] = top_x
+            tokens_i = torch.where(token_mask_i)[0]
+            
+            for expert_idx in range(self.num_experts):
+                expert_token_mask = (expert_idx_i[tokens_i] == expert_idx)
+                if not expert_token_mask.any():
+                    continue
+                
+                current_tokens = tokens_i[expert_token_mask]
+                current_state = flat_hidden_states[current_tokens]
 
-            current_state = flat_hidden_states[top_x].clone()
-            self.last_expert_inputs[expert_idx] = current_state
+                if self.training and surprise_context is not None:
+                     current_state = CaptureSurprise.apply(
+                        current_state, layer_idx, expert_idx, current_tokens, surprise_context
+                    )
+                
+                current_routing_weights = routing_weights[current_tokens, i]
+                expert_output = self.experts[expert_idx](current_state)
+                weighted_output = expert_output * current_routing_weights.unsqueeze(1)
+                final_hidden_states.index_add_(0, current_tokens, weighted_output.to(hidden_states.dtype))
 
-            if self.training and surprise_context is not None:
-                current_state = CaptureSurprise.apply(
-                    current_state, layer_idx, expert_idx, top_x, surprise_context
-                )
-
-            current_hidden_states = self.experts[expert_idx](current_state) * routing_weights[top_x, idx, None]
-            final_hidden_states.index_add_(0, top_x, current_hidden_states.to(hidden_states.dtype))
-
-        self.last_selected_experts = selected_experts
         return final_hidden_states.view(batch_size, sequence_length, hidden_dim)
 
 
@@ -129,7 +137,6 @@ class TinyOnnDecoderLayer(Qwen3DecoderLayer):
         hidden_states = self.post_attention_layernorm(hidden_states)
 
         mlp_kwargs = {
-            "surprise_budget": kwargs.get("surprise_budget"),
             "surprise_context": kwargs.get("surprise_context"),
             "layer_idx": self.layer_idx,
         }
@@ -154,9 +161,6 @@ class TinyOnnModel(Qwen3Model):
         self.post_init()
 
     def forward(self, *args, **kwargs):
-        # Allow passing kwargs down to the layers
-        # This is the only way to pass kwargs down to the layers
-        # in the `transformers` framework.
         return super().forward(*args, **kwargs)
 
 
@@ -169,6 +173,11 @@ class TinyOnnForCausalLM(Qwen3ForCausalLM):
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.post_init()
 
+    @classmethod
+    def from_pretrained(cls, pretrained_model_name_or_path, *model_args, **kwargs):
+        return super().from_pretrained(
+            pretrained_model_name_or_path, *model_args, **kwargs
+        )
+
     def forward(self, *args, **kwargs):
-        # This is the only way to pass kwargs down to the model
         return super().forward(*args, **kwargs)

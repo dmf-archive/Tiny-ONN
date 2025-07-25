@@ -1,7 +1,6 @@
 import os
-from collections import defaultdict
 from pathlib import Path
-from typing import Dict, List, cast
+from typing import Any, cast
 
 import numpy as np
 import torch
@@ -19,8 +18,9 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from tiny_onn.modular import TinyOnnForCausalLM, TinyOnnMoE
 
-from .callbacks import MatplotlibVisualizer, TensorBoardLogger
+from .callbacks import TensorBoardLogger
 from .config import TrainConfig
+from .plotter import LivePlotter
 
 
 class TrainerEngine:
@@ -42,6 +42,8 @@ class TrainerEngine:
         self.eval_dataloader = eval_dataloader
         self.device = device
         self.grad_scaler = None
+        self.last_main_loss: float | None = None
+
         self.teacher_model = None
         if config.model.teacher_model_name:
             bnb_config = BitsAndBytesConfig(
@@ -62,31 +64,74 @@ class TrainerEngine:
         self.img_dir = self.output_dir / "img"
 
         self.logger = TensorBoardLogger(self.log_dir)
-        self.visualizer = MatplotlibVisualizer(
-            self.img_dir, config.model.base_model_name
-        )
-        self.metrics_cache: defaultdict[str, list[float]] = defaultdict(list)
-        self.expert_data_cache: defaultdict[str, list[np.ndarray]] = defaultdict(list)
+        self.plotter = LivePlotter(self.img_dir)
+
+        self.metrics_history: list[dict[str, Any]] = []
+        self.expert_data: dict[str, np.ndarray] = {
+            "selected_experts_steps": np.array([], dtype=int),
+            "selected_experts_values": np.array([], dtype=int),
+            "optimal_experts_steps": np.array([], dtype=int),
+            "optimal_experts_values": np.array([], dtype=int),
+        }
+
         self.global_step = 0
         self.start_epoch = 0
 
         self.surprise_ema = {"mean": 0.0, "var": 1.0, "count": 0}
         self.cost_ema = {"mean": 0.0, "var": 1.0, "count": 0}
 
+        num_training_steps = len(self.train_dataloader) * config.training.num_train_epochs
         self.lr_scheduler_experts = get_scheduler(
             name="linear",
             optimizer=self.optimizer_experts,
             num_warmup_steps=config.training.lr_scheduler_warmup_steps,
-            num_training_steps=len(self.train_dataloader)
-            * config.training.num_train_epochs,
+            num_training_steps=num_training_steps,
         )
         self.lr_scheduler_router = get_scheduler(
             name="linear",
             optimizer=self.optimizer_router,
             num_warmup_steps=config.training.lr_scheduler_warmup_steps,
-            num_training_steps=len(self.train_dataloader)
-            * config.training.num_train_epochs,
+            num_training_steps=num_training_steps,
         )
+
+    def _update_expert_data(
+        self,
+        all_selected_experts: list[tuple[int, torch.Tensor]],
+        optimal_indices: torch.Tensor,
+        all_router_logits: list[torch.Tensor]
+    ):
+        num_experts_per_layer = self.model.config.num_experts_per_layer
+
+        # Selected experts
+        selected_experts_list = []
+        for layer_idx, experts_tensor in all_selected_experts:
+            global_expert_ids = (experts_tensor + layer_idx * num_experts_per_layer).cpu().numpy()
+            selected_experts_list.append(global_expert_ids)
+
+        if selected_experts_list:
+            all_selected = np.concatenate(selected_experts_list).flatten()
+            self.expert_data["selected_experts_values"] = np.concatenate([self.expert_data["selected_experts_values"], all_selected])
+            steps = np.full(all_selected.shape, self.global_step)
+            self.expert_data["selected_experts_steps"] = np.concatenate([self.expert_data["selected_experts_steps"], steps])
+
+        # Optimal experts
+        token_to_layer_map = []
+        for i, layer in enumerate(self.model.model.layers):
+            moe_layer = cast(TinyOnnMoE, layer.mlp)
+            if moe_layer.last_router_logits is not None:
+                num_layer_tokens = moe_layer.last_router_logits.shape[0]
+                token_to_layer_map.extend([i] * num_layer_tokens)
+
+        flat_optimal_indices = optimal_indices.cpu().numpy()
+        global_optimal_experts = np.array([
+            local_expert_idx + token_to_layer_map[i] * num_experts_per_layer
+            for i, local_expert_idx in enumerate(flat_optimal_indices)
+        ])
+
+        self.expert_data["optimal_experts_values"] = np.concatenate([self.expert_data["optimal_experts_values"], global_optimal_experts])
+        steps = np.full(global_optimal_experts.shape, self.global_step)
+        self.expert_data["optimal_experts_steps"] = np.concatenate([self.expert_data["optimal_experts_steps"], steps])
+
 
     def _hyper_step(self, batch: dict[str, torch.Tensor]) -> dict[str, float]:
         inputs = {k: v.to(self.device) for k, v in batch.items() if v is not None}
@@ -96,31 +141,15 @@ class TrainerEngine:
 
         surprise_context: dict[tuple[int, int], tuple[torch.Tensor, torch.Tensor]] = {}
         forward_kwargs = {"surprise_context": surprise_context}
-        if self.model.config.num_experts_per_tok == -1:
-            if self.last_main_loss is None:
-                # On the first step, use a default budget
-                surprise_budget = 0.5
-            else:
-                # Dynamically adjust budget based on last step's loss
-                # Clamp the loss to a reasonable range before sigmoid to ensure sensitivity
-                clamped_loss = torch.clamp(torch.tensor(self.last_main_loss), 0.1, 5.0)
-                surprise_budget = torch.sigmoid(clamped_loss).item()
-            forward_kwargs["surprise_budget"] = surprise_budget
 
-        inputs.update(forward_kwargs) # type: ignore
-
-        student_outputs: CausalLMOutputWithPast = self.model(**inputs)
+        student_outputs: CausalLMOutputWithPast = self.model(**inputs, **forward_kwargs) # type: ignore
         main_loss = student_outputs.loss
         assert main_loss is not None
 
         main_loss.backward(retain_graph=True)
 
-        # --- Surprise Processing and Router Loss Calculation ---
-        all_router_logits: List[torch.Tensor] = []
-        all_selected_experts: List[Tuple[int, torch.Tensor]] = []
-        all_k_per_token: List[torch.Tensor] = []
-        layer_token_offsets: Dict[int, int] = {}
-        
+        all_router_logits, all_selected_experts, all_k_per_token = [], [], []
+        layer_token_offsets: dict[int, int] = {}
         current_offset = 0
         for i, layer in enumerate(self.model.model.layers):
             moe_layer = cast(TinyOnnMoE, layer.mlp)
@@ -128,16 +157,14 @@ class TrainerEngine:
                 all_router_logits.append(moe_layer.last_router_logits)
                 layer_token_offsets[i] = current_offset
                 current_offset += moe_layer.last_router_logits.shape[0]
-
             if moe_layer.last_selected_experts is not None:
                 all_selected_experts.append((i, moe_layer.last_selected_experts))
-            
             if moe_layer.last_k_per_token is not None:
                 all_k_per_token.append(moe_layer.last_k_per_token)
 
         router_loss = torch.tensor(0.0, device=self.device)
         gating_acc = 0.0
-        per_token_surprise = torch.tensor([], device=self.device) # Initialize empty tensor
+        per_token_surprise = torch.tensor([], device=self.device)
 
         if all_router_logits:
             concatenated_logits = torch.cat(all_router_logits, dim=0)
@@ -145,107 +172,70 @@ class TrainerEngine:
 
             for (layer_idx, expert_idx), (token_indices, surprise) in surprise_context.items():
                 if layer_idx in layer_token_offsets:
-                    row_offset = layer_token_offsets[layer_idx]
-                    per_token_surprise[row_offset + token_indices, expert_idx] = surprise.to(per_token_surprise.dtype)
+                    offset = layer_token_offsets[layer_idx]
+                    original_dtype = per_token_surprise.dtype
+                    per_token_surprise[offset + token_indices, expert_idx] = surprise.to(original_dtype)
 
             optimal_indices = torch.argmin(per_token_surprise, dim=1)
-            router_loss = F.cross_entropy(concatenated_logits, optimal_indices)
+            smk_loss = F.cross_entropy(concatenated_logits, optimal_indices)
             
+            avg_k_tensor = torch.cat([k.float() for k in all_k_per_token]).mean()
+            avg_k_loss = avg_k_tensor.clone()
+            
+            router_loss = smk_loss + self.config.training.router_loss_lambda * avg_k_loss
+
             with torch.no_grad():
                 predicted_indices = torch.argmin(concatenated_logits, dim=1)
                 gating_acc = (predicted_indices == optimal_indices).float().mean().item()
-                
-                num_experts_per_layer = self.model.config.num_experts_per_layer
-                
-                selected_experts_to_plot = []
-                for layer_idx, experts_tensor in all_selected_experts:
-                    global_expert_ids = experts_tensor + layer_idx * num_experts_per_layer
-                    selected_experts_to_plot.append(global_expert_ids.reshape(-1, 1))
-                if selected_experts_to_plot:
-                    selected_experts_np = torch.cat(selected_experts_to_plot, dim=0).cpu().numpy()
-                    step_col = np.full((selected_experts_np.shape[0], 1), self.global_step)
-                    self.expert_data_cache["selected_experts"].append(np.hstack([step_col, selected_experts_np]))
-
-                token_to_layer_map = []
-                for i, layer in enumerate(self.model.model.layers):
-                    moe_layer = cast(TinyOnnMoE, layer.mlp)
-                    if moe_layer.last_router_logits is not None:
-                        num_layer_tokens = moe_layer.last_router_logits.shape[0]
-                        token_to_layer_map.extend([i] * num_layer_tokens)
-                
-                global_optimal_experts = []
-                flat_optimal_indices = optimal_indices.cpu().numpy()
-                for i, local_expert_idx in enumerate(flat_optimal_indices):
-                    layer_idx = token_to_layer_map[i]
-                    global_expert_idx = local_expert_idx + layer_idx * num_experts_per_layer
-                    global_optimal_experts.append(global_expert_idx)
-                
-                optimal_experts_np = np.array(global_optimal_experts).reshape(-1, 1)
-                step_col_optimal = np.full((optimal_experts_np.shape[0], 1), self.global_step)
-                self.expert_data_cache["optimal_experts"].append(np.hstack([step_col_optimal, optimal_experts_np]))
+                self._update_expert_data(all_selected_experts, optimal_indices, all_router_logits)
 
         if router_loss.requires_grad:
             router_loss.backward()
-        
+
         self.optimizer_experts.step()
         self.optimizer_router.step()
-        
+
         self.lr_scheduler_experts.step()
         self.lr_scheduler_router.step()
 
         with torch.no_grad():
-            labels = inputs.get("labels")
-            main_acc = 0.0
-            tau = 1.0
-            if student_outputs.logits is not None and labels is not None:
-                main_acc = (student_outputs.logits.argmax(-1) == labels).float().mean().item()
+            if student_outputs.logits is not None and "labels" in inputs:
+                main_acc = (student_outputs.logits.argmax(-1) == inputs["labels"]).float().mean().item()
                 tau = torch.distributions.Categorical(logits=student_outputs.logits.float()).entropy().mean().item()
-
-            if per_token_surprise.numel() > 0:
-                valid_surprise = per_token_surprise[torch.isfinite(per_token_surprise)]
             else:
-                valid_surprise = torch.tensor([], device=self.device)
+                main_acc = 0.0
+                tau = 1.0
+            valid_surprise = per_token_surprise[torch.isfinite(per_token_surprise)]
             surprise_val = valid_surprise.mean().item() if valid_surprise.numel() > 0 else 0.0
-            # Update EMAs for surprise and cost
-            def update_ema(ema_dict, value, beta=0.99):
-                if ema_dict["count"] == 0:
-                    ema_dict["mean"] = value
-                    ema_dict["var"] = 0
-                else:
-                    ema_dict["mean"] = beta * ema_dict["mean"] + (1 - beta) * value
-                    ema_dict["var"] = beta * ema_dict["var"] + (1 - beta) * (value - ema_dict["mean"])**2
-                ema_dict["count"] += 1
-    
-            cost = main_loss.item() / tau
-            update_ema(self.surprise_ema, surprise_val)
-            update_ema(self.cost_ema, cost)
-    
-            # Calculate Z-scores
-            surprise_z = (surprise_val - self.surprise_ema["mean"]) / (self.surprise_ema["var"]**0.5 + 1e-8)
-            cost_z = (cost - self.cost_ema["mean"]) / (self.cost_ema["var"]**0.5 + 1e-8)
-            
-            pi_score_tensor_input = torch.tensor(-self.config.training.pi_alpha * (cost_z + self.config.training.pi_gamma * surprise_z), device=self.device)
-            pi_score = torch.exp(pi_score_tensor_input).item()
 
-        if all_k_per_token:
-            avg_k = np.mean([k.float().mean().item() for k in all_k_per_token])
-        else:
-            avg_k = 0.0
-        
-        metrics: Dict[str, float] = {
+            cost = main_loss.item() / tau
+            pi_score = torch.exp(torch.tensor(-self.config.training.pi_alpha * cost)).item()
+
+            avg_k_float = avg_k_tensor.item() if all_k_per_token else 0.0
+
+        metrics: dict[str, Any] = {
+            "type": "train",
+            "step": self.global_step,
             "main_loss": main_loss.item(),
             "router_loss": router_loss.item(),
+            "smk_loss": smk_loss.item(),
+            "avg_k_loss": avg_k_loss.item(),
             "main_acc": main_acc,
             "gating_acc": gating_acc,
             "surprise": surprise_val,
             "tau": float(tau),
             "pi_score": pi_score,
-            "avg_k": avg_k,
+            "avg_k": avg_k_float,
         }
-        for k, v in metrics.items():
-            self.metrics_cache[k].append(v)
-            self.last_main_loss = main_loss.item()
-            return metrics
+        self.metrics_history.append(metrics)
+        self.last_main_loss = main_loss.item()
+
+        if torch.cuda.is_available():
+            metrics["cuda_mem_allocated_mb"] = torch.cuda.memory_allocated() / 1024**2
+            metrics["cuda_mem_peak_mb"] = torch.cuda.max_memory_allocated() / 1024**2
+
+        return {k: v for k, v in metrics.items() if isinstance(v, int | float)}
+
 
     def _save_checkpoint(self, epoch: int):
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -275,39 +265,55 @@ class TrainerEngine:
         print(f"Resumed from checkpoint {checkpoint_path} at epoch {self.start_epoch} and global step {self.global_step}")
 
     def train(self, max_steps: int | None = None):
+        self.model.train()
         for epoch in range(self.start_epoch, self.config.training.num_train_epochs):
-            self.model.train()
             progress_bar = tqdm(self.train_dataloader, desc=f"Epoch {epoch + 1}")
             for batch in progress_bar:
                 if max_steps is not None and self.global_step >= max_steps:
                     self.logger.close()
                     return
+
                 metrics = self._hyper_step(batch)
                 progress_bar.set_postfix(metrics)
+
                 if self.global_step % self.config.logging.log_interval == 0:
                     self.logger.log_metrics(metrics, self.global_step)
-                
-                # Always update plots
-                expert_data_to_plot = {
-                    k: np.vstack(v) for k, v in self.expert_data_cache.items() if v
-                }
-                if expert_data_to_plot: # Only plot if there is data
-                    self.visualizer.update_plots(
-                        self.metrics_cache, expert_data_to_plot, self.global_step, self.model
-                    )
-                if self.global_step % self.config.logging.checkpoint_interval == 0:
+
+                if self.global_step > 0 and self.global_step % self.config.logging.eval_interval == 0:
+                    eval_metrics = self.evaluate()
+                    self.metrics_history.append(eval_metrics)
+                    self.logger.log_metrics(eval_metrics, self.global_step)
+
+                if self.global_step > 0 and self.global_step % self.config.logging.plot_interval == 0:
+                    self.plotter.plot_metrics_dashboard(self.metrics_history, self.global_step)
+                    self.plotter.plot_expert_dashboard(self.expert_data, self.global_step, self.model.config)
+
+                if self.global_step > 0 and self.global_step % self.config.logging.checkpoint_interval == 0:
                     self._save_checkpoint(epoch)
+
                 self.global_step += 1
+
         self.logger.close()
 
-    def evaluate(self) -> dict[str, float]:
+    def evaluate(self) -> dict[str, Any]:
         self.model.eval()
         total_loss = 0.0
+        total_acc = 0.0
+        total_tokens = torch.tensor(0, device=self.device)
         with torch.no_grad():
             for batch in tqdm(self.eval_dataloader, desc="Evaluating"):
-                inputs = {k: v.to(self.device) for k, v in batch.items()}
+                inputs = {k: v.to(self.device) for k, v in batch.items() if v is not None}
                 outputs = self.model(**inputs)
                 if outputs.loss is not None:
-                    total_loss += outputs.loss.item()
-        avg_loss = total_loss / len(self.eval_dataloader)
-        return {"eval_loss": avg_loss, "perplexity": torch.exp(torch.tensor(avg_loss)).item()}
+                    loss = outputs.loss
+                    num_tokens = inputs["attention_mask"].sum()
+                    total_loss += loss.item() * num_tokens
+                    total_tokens += num_tokens
+                    if outputs.logits is not None and "labels" in inputs:
+                        total_acc += ((outputs.logits.argmax(-1) == inputs["labels"]) * inputs["attention_mask"]).sum().item()
+
+        avg_loss = total_loss / total_tokens.item() if total_tokens.item() > 0 else 0
+        avg_acc = total_acc / total_tokens.item() if total_tokens.item() > 0 else 0
+
+        self.model.train()
+        return {"main_loss": avg_loss, "main_acc": avg_acc, "type": "eval", "step": self.global_step}

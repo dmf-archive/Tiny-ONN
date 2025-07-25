@@ -4,8 +4,8 @@ import sys
 from pathlib import Path
 from typing import cast
 
-import torch
 import pytest
+import torch
 
 from tiny_onn.modular import TinyOnnMoE
 
@@ -22,7 +22,7 @@ def test_surgery_preserves_gradient_flow():
 
     if output_path.exists():
         shutil.rmtree(output_path)
-    
+
     model, tokenizer = perform_surgery(
         base_model_name=base_model_name,
         cache_dir=cache_dir,

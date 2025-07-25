@@ -1,11 +1,6 @@
-import os
-import os
-from pathlib import Path
 
 import pytest
 import torch
-
-from scripts.perform_surgery import perform_surgery
 
 
 @pytest.mark.skip(reason="Generation with tiny custom config is failing due to a deep CUDA error in masking.")

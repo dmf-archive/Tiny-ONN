@@ -22,7 +22,8 @@ class CaptureSurprise(torch.autograd.Function):
     @staticmethod
     def backward(ctx: Any, grad_output: torch.Tensor) -> tuple[Any, ...]:
         surprise = torch.linalg.norm(grad_output.flatten(start_dim=1), dim=1).detach()
+        surprise_fp8 = surprise.to(torch.float8_e5m2)
 
-        ctx.surprise_context[(ctx.layer_idx, ctx.expert_idx)] = (ctx.token_indices, surprise)
+        ctx.surprise_context[(ctx.layer_idx, ctx.expert_idx)] = (ctx.token_indices, surprise_fp8)
 
         return grad_output, None, None, None, None
