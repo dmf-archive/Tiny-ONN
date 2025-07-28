@@ -12,19 +12,26 @@ def get_dataloaders(
     batch_size: int,
     num_workers: int,
 ) -> tuple[DataLoader, DataLoader]:
-
     if data_config.mode == "local_json":
         if not data_config.train_path or not data_config.eval_path:
-            raise ValueError("train_path and eval_path must be specified for local_json mode")
-        train_dataset = JSONLDataset(data_config.train_path, tokenizer, data_config.max_seq_length)
-        val_dataset = JSONLDataset(data_config.eval_path, tokenizer, data_config.max_seq_length)
+            raise ValueError(
+                "train_path and eval_path must be specified for local_json mode"
+            )
+        train_dataset = JSONLDataset(
+            data_config.train_path, tokenizer, data_config.max_seq_length
+        )
+        val_dataset = JSONLDataset(
+            data_config.eval_path, tokenizer, data_config.max_seq_length
+        )
     elif data_config.mode == "transformers":
         if not data_config.dataset_name:
             raise ValueError("dataset_name must be specified for transformers mode")
         dataset = load_dataset(data_config.dataset_name, data_config.dataset_subset)
-        split_dataset = dataset["train"].train_test_split(test_size=data_config.validation_split_percentage / 100)
-        train_dataset = split_dataset['train']
-        val_dataset = split_dataset['test']
+        split_dataset = dataset["train"].train_test_split(
+            test_size=data_config.validation_split_percentage / 100
+        )
+        train_dataset = split_dataset["train"]
+        val_dataset = split_dataset["test"]
     else:
         raise ValueError(f"Unknown data mode: {data_config.mode}")
 

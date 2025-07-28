@@ -42,22 +42,24 @@ class ModelConfig:
 class TrainConfig:
     per_device_train_batch_size: int = 1
     num_train_epochs: int = 1
-    expert_learning_rate: float = 1.0e-5
-    gate_learning_rate: float = 1.0e-4
-    sparsity_learning_rate: float = 1.0e-3
+    learning_rate: float = 1.0e-5
     weight_decay: float = 0.01
     adam_beta1: float = 0.9
     adam_beta2: float = 0.999
     adam_epsilon: float = 1.0e-8
     lr_scheduler_warmup_steps: int = 10
-    smk_loss_weight: float = 0.1
+    surprise_threshold_sigma: float = 2.0
+    w_smk: float = 1.0
+    w_balance: float = 0.01
+    pi_threshold: float = 0.75
+    pi_sensitivity: float = 10.0
+    expert_regeneration_interval: int = 1000
 
 
 @dataclass
 class ObserverConfig:
     output_dir: str
     log_interval: int = 1
-    checkpoint_interval: int = 100
     pi_gamma: float = 0.5
     pi_alpha: float = 1.0
 

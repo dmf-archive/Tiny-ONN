@@ -25,14 +25,14 @@ def setup_student_model():
         model, tokenizer = perform_surgery(BASE_MODEL_NAME, cache_dir=str(CACHE_DIR))
         model.save_pretrained(STUDENT_MODEL_PATH)
         tokenizer.save_pretrained(STUDENT_MODEL_PATH)
-        print(
-            f"Surgically modified model and tokenizer saved to {STUDENT_MODEL_PATH}"
-        )
+        print(f"Surgically modified model and tokenizer saved to {STUDENT_MODEL_PATH}")
     else:
         print(f"Found existing student model at {STUDENT_MODEL_PATH}.")
 
 
-@pytest.mark.skip(reason="Distillation test is resource-intensive and currently disabled.")
+@pytest.mark.skip(
+    reason="Distillation test is resource-intensive and currently disabled."
+)
 def test_distillation_training_run():
     """
     Test the full distillation training pipeline by running the main training script

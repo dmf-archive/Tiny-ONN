@@ -18,9 +18,13 @@ def calculate_qwen3_params(config):
     k_proj_params = hidden_size * (num_kv_heads * head_dim)
     v_proj_params = hidden_size * (num_kv_heads * head_dim)
     o_proj_params = (num_attn_heads * head_dim) * hidden_size
-    attn_params_per_layer = q_proj_params + k_proj_params + v_proj_params + o_proj_params
+    attn_params_per_layer = (
+        q_proj_params + k_proj_params + v_proj_params + o_proj_params
+    )
 
-    mlp_params_per_layer = (hidden_size * intermediate_size) * 2 + (intermediate_size * hidden_size)
+    mlp_params_per_layer = (hidden_size * intermediate_size) * 2 + (
+        intermediate_size * hidden_size
+    )
 
     norm_params = num_hidden_layers * (hidden_size * 2) + hidden_size
 
@@ -53,13 +57,17 @@ def calculate_tiny_onn_params(config):
     k_proj_params = hidden_size * (num_kv_heads * head_dim)
     v_proj_params = hidden_size * (num_kv_heads * head_dim)
     o_proj_params = (num_attn_heads * head_dim) * hidden_size
-    attn_params_per_layer = q_proj_params + k_proj_params + v_proj_params + o_proj_params
+    attn_params_per_layer = (
+        q_proj_params + k_proj_params + v_proj_params + o_proj_params
+    )
     total_attn_params = num_hidden_layers * attn_params_per_layer
 
     backbone_params = embedding_params + total_attn_params
 
     original_intermediate_size = moe_intermediate_size * num_experts
-    mlp_params_per_layer = (hidden_size * original_intermediate_size) * 2 + (original_intermediate_size * hidden_size)
+    mlp_params_per_layer = (hidden_size * original_intermediate_size) * 2 + (
+        original_intermediate_size * hidden_size
+    )
     total_moe_params = num_hidden_layers * mlp_params_per_layer
 
     gating_params = num_hidden_layers * (hidden_size * num_experts)
@@ -77,8 +85,11 @@ def calculate_tiny_onn_params(config):
         "single_expert": (mlp_params_per_layer / num_experts),
     }
 
+
 def main():
-    qwen3_config_path = Path("weights/models--Qwen--Qwen3-0.6B/snapshots/e6de91484c29aa9480d55605af694f39b081c455/config.json")
+    qwen3_config_path = Path(
+        "weights/models--Qwen--Qwen3-0.6B/snapshots/e6de91484c29aa9480d55605af694f39b081c455/config.json"
+    )
     tiny_onn_config_path = Path("weights/Tiny-ONN-0.6B-Hyper-SMoE/config.json")
 
     with open(qwen3_config_path) as f:
@@ -96,12 +107,12 @@ def main():
     print(f"  - Attention: {qwen3_params['attention'] / 1e6:.2f} M")
     print(f"  - MLP: {qwen3_params['mlp'] / 1e6:.2f} M")
 
-
     print("\n--- Tiny-ONN-0.6B-Hyper-SMoE ---")
     print(f"Total Parameters: {tiny_onn_params['total'] / 1e9:.3f} B")
     print(f"  - Shared Backbone: {tiny_onn_params['backbone'] / 1e6:.2f} M")
     print(f"  - Experts + Gating: {tiny_onn_params['experts_and_gating'] / 1e6:.2f} M")
     print(f"  - Single Expert: {tiny_onn_params['single_expert'] / 1e6:.3f} M")
+
 
 if __name__ == "__main__":
     main()

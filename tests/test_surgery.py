@@ -1,9 +1,10 @@
-
 import pytest
 import torch
 
 
-@pytest.mark.skip(reason="Generation with tiny custom config is failing due to a deep CUDA error in masking.")
+@pytest.mark.skip(
+    reason="Generation with tiny custom config is failing due to a deep CUDA error in masking."
+)
 def test_surgery_and_generation(tiny_test_model_and_tokenizer):
     model, tokenizer = tiny_test_model_and_tokenizer
     assert model is not None

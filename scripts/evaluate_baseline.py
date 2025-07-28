@@ -20,7 +20,7 @@ def evaluate_baseline(
     data_path: str,
     max_seq_length: int,
     batch_size: int,
-    use_tiny_onn: bool
+    use_tiny_onn: bool,
 ):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"--- BENCHMARKING on {device} ---")
@@ -67,7 +67,9 @@ def evaluate_baseline(
         inputs = {k: v.to(device) for k, v in batch.items()}
         labels = inputs.pop("labels")
         outputs = model(**inputs)
-        loss = F.cross_entropy(outputs.logits.view(-1, model.config.vocab_size), labels.view(-1))
+        loss = F.cross_entropy(
+            outputs.logits.view(-1, model.config.vocab_size), labels.view(-1)
+        )
         loss.backward()
 
     torch.cuda.synchronize()
@@ -82,7 +84,9 @@ def evaluate_baseline(
 
         # Forward pass
         outputs = model(**inputs)
-        loss = F.cross_entropy(outputs.logits.view(-1, model.config.vocab_size), labels.view(-1))
+        loss = F.cross_entropy(
+            outputs.logits.view(-1, model.config.vocab_size), labels.view(-1)
+        )
 
         # Backward pass
         loss.backward()
@@ -100,7 +104,9 @@ def evaluate_baseline(
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Benchmark a model's forward/backward pass.")
+    parser = argparse.ArgumentParser(
+        description="Benchmark a model's forward/backward pass."
+    )
     parser.add_argument(
         "--model_name",
         type=str,

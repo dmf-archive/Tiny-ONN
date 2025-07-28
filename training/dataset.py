@@ -6,9 +6,7 @@ from transformers import PreTrainedTokenizer
 
 
 class JSONLDataset(Dataset):
-    def __init__(
-        self, file_path: str, tokenizer: PreTrainedTokenizer, max_length: int
-    ):
+    def __init__(self, file_path: str, tokenizer: PreTrainedTokenizer, max_length: int):
         self.tokenizer = tokenizer
         self.max_length = max_length
         with open(file_path, encoding="utf-8") as f:

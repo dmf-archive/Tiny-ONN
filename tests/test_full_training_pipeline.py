@@ -6,7 +6,9 @@ from pathlib import Path
 import pytest
 
 
-@pytest.mark.skip(reason="Full pipeline test is resource-intensive and tested separately.")
+@pytest.mark.skip(
+    reason="Full pipeline test is resource-intensive and tested separately."
+)
 def test_full_pipeline_runs():
     config_path = "configs/dummy_test_config.yaml"
     output_dir = Path("tests/test_output/full_pipeline_test")
@@ -40,9 +42,13 @@ def test_full_pipeline_runs():
     assert len(list(log_dir.glob("*"))) > 0, "No log files were created."
 
     assert img_dir.exists(), "Image directory was not created."
-    assert (img_dir / "core_metrics_latest.png").exists(), "Core metrics plot was not created."
+    assert (img_dir / "core_metrics_latest.png").exists(), (
+        "Core metrics plot was not created."
+    )
 
     assert checkpoint_dir.exists(), "Checkpoint directory was not created."
-    assert len(list(checkpoint_dir.glob("*.pt"))) > 0, "No checkpoint files were created."
+    assert len(list(checkpoint_dir.glob("*.pt"))) > 0, (
+        "No checkpoint files were created."
+    )
 
     print("\n✅ PoC successful. Full training pipeline ran and produced artifacts.")

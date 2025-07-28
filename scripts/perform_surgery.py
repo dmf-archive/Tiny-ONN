@@ -9,7 +9,10 @@ from tiny_onn.modular import TinyOnnForCausalLM
 
 
 def perform_surgery(
-    base_model_name: str, cache_dir: str, base_model: torch.nn.Module | None = None, **kwargs
+    base_model_name: str,
+    cache_dir: str,
+    base_model: torch.nn.Module | None = None,
+    **kwargs,
 ) -> tuple[TinyOnnForCausalLM, AutoTokenizer]:
     if base_model is None:
         base_model = AutoModelForCausalLM.from_pretrained(
@@ -127,7 +130,9 @@ def main():
         args.base_model_name, cache_dir=args.cache_dir, trust_remote_code=True
     )
     print("Loading surgically modified model...")
-    surgical_model_verify = TinyOnnForCausalLM.from_pretrained(output_path, trust_remote_code=True)
+    surgical_model_verify = TinyOnnForCausalLM.from_pretrained(
+        output_path, trust_remote_code=True
+    )
 
     print("\nBase Model Architecture (Layer 0 MLP):")
     print(base_model_verify.model.layers[0].mlp)
@@ -143,7 +148,9 @@ def main():
         print(f"   - Base MLP Type: {base_mlp_type.__name__}")
         print(f"   - Surgical MLP Type: {surgical_mlp_type.__name__}")
     else:
-        print(f"\n❌ Verification FAILED: MLP layer types are the same ({base_mlp_type.__name__}).")
+        print(
+            f"\n❌ Verification FAILED: MLP layer types are the same ({base_mlp_type.__name__})."
+        )
 
 
 if __name__ == "__main__":

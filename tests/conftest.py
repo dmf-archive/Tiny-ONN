@@ -7,7 +7,7 @@ import pytest
 from transformers import AutoTokenizer, Qwen3Config
 
 # Ensure scripts can be imported
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from scripts.perform_surgery import perform_surgery
 
 
@@ -22,7 +22,7 @@ def tiny_test_model_and_tokenizer():
     base_config = Qwen3Config(
         num_hidden_layers=2,
         hidden_size=64,
-        intermediate_size=256, # Standard MLP size
+        intermediate_size=256,  # Standard MLP size
         num_attention_heads=4,
         num_key_value_heads=4,
         vocab_size=1000,
@@ -31,6 +31,7 @@ def tiny_test_model_and_tokenizer():
     # 2. Create a random base model from this config
     # We use TinyOnnModel here for convenience as it's already a Qwen3Model subclass
     from transformers import Qwen3ForCausalLM
+
     base_model = Qwen3ForCausalLM(base_config)
 
     # 3. Use a real tokenizer
@@ -40,7 +41,7 @@ def tiny_test_model_and_tokenizer():
 
     # 4. Perform surgery on the tiny base model object
     tiny_onn_model, _ = perform_surgery(
-        base_model_name="Qwen/Qwen3-0.6B", # Only used for tokenizer and base config props
+        base_model_name="Qwen/Qwen3-0.6B",  # Only used for tokenizer and base config props
         cache_dir="weights",
         base_model=base_model,
         num_experts_per_layer=4,

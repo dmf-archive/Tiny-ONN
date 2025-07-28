@@ -13,6 +13,7 @@ def config():
         moe_intermediate_size=32,
     )
 
+
 def test_tiny_onn_moe_forward(config):
     config.num_experts_per_tok = 2
     moe = TinyOnnMoE(config)
@@ -23,8 +24,9 @@ def test_tiny_onn_moe_forward(config):
     assert moe.last_router_logits is not None
     assert moe.last_router_logits.shape == (4 * 10, config.num_experts_per_layer)
 
+
 def test_tiny_onn_moe_dynamic_k_forward(config):
-    config.num_experts_per_tok = -1 # Enable dynamic k
+    config.num_experts_per_tok = -1  # Enable dynamic k
     moe = TinyOnnMoE(config)
     hidden_states = torch.randn(2, 5, config.hidden_size)
 

@@ -35,21 +35,33 @@ def test_unified_observer():
             "tau": rng.random() * 2,
             "pi_score": rng.random(),
             "avg_k": avg_k,
-            "global_avg_k": avg_k * model_config.num_hidden_layers * (0.95 + rng.random() * 0.1),
+            "global_avg_k": avg_k
+            * model_config.num_hidden_layers
+            * (0.95 + rng.random() * 0.1),
         }
         observer.log_metrics(metrics, step)
 
         num_tokens = 100
-        optimal_indices = torch.randint(0, model_config.num_experts_per_layer, (num_tokens,), device=device)
+        optimal_indices = torch.randint(
+            0, model_config.num_experts_per_layer, (num_tokens,), device=device
+        )
 
         all_router_logits_list = [
             torch.randn(num_tokens, model_config.num_experts_per_layer, device=device)
             for _ in range(model_config.num_hidden_layers)
         ]
 
-        layer_token_offsets = {i: i * num_tokens for i in range(model_config.num_hidden_layers)}
+        layer_token_offsets = {
+            i: i * num_tokens for i in range(model_config.num_hidden_layers)
+        }
 
-        observer.update_expert_data(optimal_indices, all_router_logits_list, layer_token_offsets, model_config, step)
+        observer.update_expert_data(
+            optimal_indices,
+            all_router_logits_list,
+            layer_token_offsets,
+            model_config,
+            step,
+        )
 
         if step == num_steps - 1:
             observer.plot_dashboards(step, model_config)

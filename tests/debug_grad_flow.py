@@ -19,7 +19,9 @@ def test_manual_surprise_calculation():
         tokenizer.pad_token = tokenizer.eos_token
 
     batch_size, seq_len = 4, 32
-    input_ids = torch.randint(0, model.config.vocab_size, (batch_size, seq_len), device=device)
+    input_ids = torch.randint(
+        0, model.config.vocab_size, (batch_size, seq_len), device=device
+    )
     labels = input_ids.clone()
 
     outputs = model(input_ids=input_ids, labels=labels)
@@ -45,7 +47,7 @@ def test_manual_surprise_calculation():
         outputs=[loss],
         inputs=all_expert_inputs,
         grad_outputs=torch.ones_like(loss),
-        allow_unused=True
+        allow_unused=True,
     )
 
     for i, grad_tensor in enumerate(grads):
@@ -53,14 +55,20 @@ def test_manual_surprise_calculation():
             surprise = torch.linalg.norm(grad_tensor.flatten(start_dim=1), dim=1)
             total_surprise_norm += surprise.sum().item()
             num_experts_with_grad += 1
-            print(f"  - Grad for expert input {i}: Shape={grad_tensor.shape}, Norm={torch.linalg.norm(grad_tensor).item():.4f}")
+            print(
+                f"  - Grad for expert input {i}: Shape={grad_tensor.shape}, Norm={torch.linalg.norm(grad_tensor).item():.4f}"
+            )
         else:
             print(f"  - Grad for expert input {i}: None")
 
     print("\nAnalysis complete.")
-    print(f"Total experts with non-None gradients: {num_experts_with_grad} / {len(all_expert_inputs)}")
+    print(
+        f"Total experts with non-None gradients: {num_experts_with_grad} / {len(all_expert_inputs)}"
+    )
     print(f"Total surprise norm calculated: {total_surprise_norm:.4f}")
 
-    assert num_experts_with_grad > 0, "No gradients were calculated for any expert inputs!"
+    assert num_experts_with_grad > 0, (
+        "No gradients were calculated for any expert inputs!"
+    )
     assert total_surprise_norm > 0, "Total surprise norm is zero!"
     print("\n✅ PoC successful. Gradients are flowing to expert inputs.")

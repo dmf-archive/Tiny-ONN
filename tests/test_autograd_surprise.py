@@ -19,7 +19,9 @@ def test_autograd_surprise_calculation():
         tokenizer.pad_token = tokenizer.eos_token
 
     batch_size, seq_len = 4, 32
-    input_ids = torch.randint(0, model.config.vocab_size, (batch_size, seq_len), device=device)
+    input_ids = torch.randint(
+        0, model.config.vocab_size, (batch_size, seq_len), device=device
+    )
     labels = input_ids.clone()
 
     surprise_context: dict[tuple[int, int], tuple[torch.Tensor, torch.Tensor]] = {}
@@ -29,7 +31,7 @@ def test_autograd_surprise_calculation():
         input_ids=input_ids,
         labels=labels,
         surprise_context=surprise_context,
-        surprise_budget=0.5
+        surprise_budget=0.5,
     )
     loss = outputs.loss
     assert loss is not None
@@ -48,11 +50,18 @@ def test_autograd_surprise_calculation():
         calculated_surprises += surprise.numel()
 
     print("\n--- V12.1 Autograd-based Surprise Calculation ---")
-    print(f"Total number of token-expert routes in forward pass: {total_routed_tokens_in_forward}")
-    print(f"Total number of surprise values calculated via autograd: {calculated_surprises}")
+    print(
+        f"Total number of token-expert routes in forward pass: {total_routed_tokens_in_forward}"
+    )
+    print(
+        f"Total number of surprise values calculated via autograd: {calculated_surprises}"
+    )
 
     assert calculated_surprises > 0, "No surprise values were calculated!"
-    assert calculated_surprises == total_routed_tokens_in_forward, \
+    assert calculated_surprises == total_routed_tokens_in_forward, (
         "Mismatch between calculated surprises and routed tokens!"
+    )
 
-    print("\n✅ PoC successful. Per-token surprise calculated correctly via custom autograd.")
+    print(
+        "\n✅ PoC successful. Per-token surprise calculated correctly via custom autograd."
+    )

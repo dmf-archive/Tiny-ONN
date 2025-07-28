@@ -10,194 +10,189 @@ import torch
 from numpy.random import default_rng
 from torch.utils.tensorboard import SummaryWriter
 
-from tiny_onn.modular import TinyOnnForCausalLM
-
 matplotlib.use("Agg")
 
 
 class UnifiedObserver:
-    def __init__(self, output_dir: Path, device: torch.device):
+    def __init__(
+        self, output_dir: Path, device: torch.device, max_history_steps: int = 1000
+    ):
         self.log_dir = output_dir / "logs"
         self.plot_dir = output_dir / "img"
         self.log_dir.mkdir(parents=True, exist_ok=True)
         self.plot_dir.mkdir(parents=True, exist_ok=True)
-
         self.writer = SummaryWriter(log_dir=self.log_dir)
         sns.set_theme(style="whitegrid")
-
         self.metrics_history: list[dict[str, Any]] = []
-        self.expert_data: dict[str, torch.Tensor] = {
-            "selected_experts_steps": torch.tensor([], device=device, dtype=torch.long),
-            "selected_experts_values": torch.tensor([], device=device, dtype=torch.long),
-            "optimal_experts_steps": torch.tensor([], device=device, dtype=torch.long),
-            "optimal_experts_values": torch.tensor([], device=device, dtype=torch.long),
-        }
+        self.expert_history: list[dict[str, torch.Tensor]] = []
+        self.timing_history: list[dict[str, float]] = []
         self.device = device
-        self.max_history_size = 50000
+        self.max_history_steps = max_history_steps
+        self.rng = default_rng()
 
-    def log_metrics(self, metrics: dict[str, Any], step: int):
-        if len(self.metrics_history) > self.max_history_size:
-            self.metrics_history = self.metrics_history[::2]
+    def _downsample(self):
+        if len(self.metrics_history) > self.max_history_steps:
+            steps_to_keep = {
+                m["step"]
+                for m in self.rng.choice(
+                    self.metrics_history, self.max_history_steps, replace=False
+                )
+            }
+            self.metrics_history = [
+                m for m in self.metrics_history if m["step"] in steps_to_keep
+            ]
+            self.expert_history = [
+                e for e in self.expert_history if e["global_step"] in steps_to_keep
+            ]
+            self.timing_history = [
+                t for t in self.timing_history if t["step"] in steps_to_keep
+            ]
+
+    def log_metrics_and_expert_data(
+        self, metrics: dict[str, Any], expert_data: dict[str, torch.Tensor], step: int
+    ):
+        metrics["step"] = step
         self.metrics_history.append(metrics)
+        expert_data["global_step"] = torch.tensor(step, device=self.device)
+        self.expert_history.append(expert_data)
 
         for key, value in metrics.items():
             if isinstance(value, int | float):
-                self.writer.add_scalar(f"metrics/{key}", value, step)
+                self.writer.add_scalar(f"Metrics/{key}", value, step)
+        self._downsample()
 
-    def update_expert_data(
-        self,
-        optimal_indices: torch.Tensor,
-        all_router_logits: list[torch.Tensor],
-        model: TinyOnnForCausalLM,
-        global_step: int,
-        routing_mask_list: list[torch.Tensor],
-    ):
-        num_experts_per_layer = model.config.num_experts_per_layer
-
-        concatenated_routing_mask = torch.cat([m.view(-1, m.shape[-1]) for m in routing_mask_list])
-
-        token_to_layer_map = torch.zeros(concatenated_routing_mask.shape[0], dtype=torch.long, device=self.device)
-        current_offset = 0
-        for i, r in enumerate(all_router_logits):
-            num_tokens = r.view(-1, r.shape[-1]).shape[0]
-            token_to_layer_map[current_offset:current_offset + num_tokens] = i
-            current_offset += num_tokens
-
-        routing_mask = concatenated_routing_mask
-        token_indices, expert_indices = torch.where(routing_mask)
-
-        if token_indices.numel() == 0:
-            global_selected_experts = torch.tensor([], device=self.device, dtype=torch.long)
-        else:
-            activated_layers = token_to_layer_map[token_indices]
-            global_selected_experts = expert_indices + activated_layers * num_experts_per_layer
-
-        for key in ["selected_experts_values", "selected_experts_steps", "optimal_experts_values", "optimal_experts_steps"]:
-            if self.expert_data[key].numel() > self.max_history_size:
-                self.expert_data[key] = self.expert_data[key][::2]
-
-        self.expert_data["selected_experts_values"] = torch.cat([self.expert_data["selected_experts_values"], global_selected_experts])
-        steps = torch.full_like(global_selected_experts, global_step, device=self.device)
-        self.expert_data["selected_experts_steps"] = torch.cat([self.expert_data["selected_experts_steps"], steps])
-
-        optimal_layers = token_to_layer_map
-        global_optimal_experts = optimal_indices + optimal_layers * num_experts_per_layer
-
-        self.expert_data["optimal_experts_values"] = torch.cat([self.expert_data["optimal_experts_values"], global_optimal_experts])
-        steps_opt = torch.full_like(global_optimal_experts, global_step, device=self.device)
-        self.expert_data["optimal_experts_steps"] = torch.cat([self.expert_data["optimal_experts_steps"], steps_opt])
-
+    def log_timing(self, timing_data: dict[str, float], step: int):
+        timing_data["step"] = step
+        self.timing_history.append(timing_data)
+        for key, value in timing_data.items():
+            if key != "step":
+                self.writer.add_scalar(f"Timings/{key}", value, step)
 
     def plot_dashboards(self, step: int, model_config: Any):
         self._plot_metrics_dashboard(step)
         self._plot_expert_dashboard(step, model_config)
+        self._plot_timing_dashboard(step)
 
-    def _save_plot(self, fig, filename: str):
+    def _save_plot(self, fig: plt.Figure, filename: str):
         fig.savefig(self.plot_dir / f"{filename}.png", bbox_inches="tight", dpi=150)
         plt.close(fig)
 
     def _plot_metrics_dashboard(self, step: int):
-        if not self.metrics_history:
-            return
-
         df = pd.DataFrame(self.metrics_history)
-        df_train = df[df["type"] == "train"]
-        df_eval = df[df["type"] == "eval"]
+        fig, axes = plt.subplots(4, 2, figsize=(20, 24), constrained_layout=True)
+        fig.suptitle(f"Core Metrics at Step {step}", fontsize=20)
 
-        fig, axes = plt.subplots(4, 2, figsize=(20, 24))
-        fig.suptitle(f"Core Metrics at Step {step}", fontsize=16)
+        plot_specs = [
+            ("main_loss", "smk_loss", "Losses", 0, 0),
+            ("main_acc", "gating_acc", "Accuracies", 0, 1),
+            ("pi_score", None, "Predictive Integrity (PI)", 1, 0),
+            ("surprise", None, "Surprise (Gradient Norm)", 1, 1),
+            ("tau", None, "Model Uncertainty (Tau)", 2, 0),
+            ("gating_kld", None, "Gating KLD (Optimal vs Selected)", 2, 1),
+            ("avg_k", None, "Average Activated Experts per Token", 3, 0),
+            ("global_avg_k", None, "Global Average Activated Experts", 3, 1),
+        ]
 
-        sns.lineplot(data=df_train, x="step", y="main_loss", ax=axes[0, 0], label="Train Main Loss")
-        sns.lineplot(data=df_train, x="step", y="smk_loss", ax=axes[0, 0], label="Train SMK Loss")
-        if not df_eval.empty:
-            sns.lineplot(data=df_eval, x="step", y="main_loss", ax=axes[0, 0], label="Eval Main Loss", linestyle='--')
-        axes[0, 0].set_title("Losses")
-        axes[0, 0].legend()
+        for y1, y2, title, r, c in plot_specs:
+            ax = axes[r, c]
+            sns.lineplot(
+                data=df, x="step", y=y1, ax=ax, label=y1.replace("_", " ").title()
+            )
+            if y2 and y2 in df.columns:
+                sns.lineplot(
+                    data=df, x="step", y=y2, ax=ax, label=y2.replace("_", " ").title()
+                )
+            ax.set_title(title)
+            ax.legend()
 
-        sns.lineplot(data=df_train, x="step", y="main_acc", ax=axes[0, 1], label="Train Main Acc")
-        sns.lineplot(data=df_train, x="step", y="gating_acc", ax=axes[0, 1], label="Train Gating Acc")
-        if not df_eval.empty:
-            sns.lineplot(data=df_eval, x="step", y="main_acc", ax=axes[0, 1], label="Eval Main Acc", linestyle='--')
-        axes[0, 1].set_title("Accuracies")
-        axes[0, 1].legend()
-
-        sns.lineplot(data=df_train, x="step", y="pi_score", ax=axes[1, 0], label="PI Score")
-        axes[1, 0].set_title("PI Score")
-        sns.lineplot(data=df_train, x="step", y="surprise", ax=axes[1, 1], label="Surprise")
-        axes[1, 1].set_title("Surprise")
-        sns.lineplot(data=df_train, x="step", y="tau", ax=axes[2, 0], label="Tau")
-        axes[2, 0].set_title("Tau")
-
-        fig.delaxes(axes[2, 1])
-
-        sns.lineplot(data=df_train, x="step", y="avg_k", ax=axes[3, 0], label="Avg K per Token")
-        axes[3, 0].set_title("Average K per Token")
-        axes[3, 0].legend()
-
-        if "global_avg_k" in df_train.columns:
-            sns.lineplot(data=df_train, x="step", y="global_avg_k", ax=axes[3, 1], label="Global Avg K")
-            axes[3, 1].set_title("Global Average K")
-            axes[3, 1].legend()
-
-        plt.tight_layout(rect=(0, 0.03, 1, 0.95))
-        self._save_plot(fig, "core_metrics_latest")
+        self._save_plot(fig, "metrics_dashboard")
 
     def _plot_expert_dashboard(self, step: int, model_config: Any):
-        expert_data_np = {k: v.cpu().numpy() for k, v in self.expert_data.items()}
-
-        if not any(val.size > 0 for val in expert_data_np.values()):
-            return
-
-        fig, axs = plt.subplots(3, 2, figsize=(20, 27))
-        fig.suptitle(f"Expert Activation Dashboard at Step {step}", fontsize=16)
-
+        fig, axs = plt.subplots(3, 2, figsize=(20, 27), constrained_layout=True)
+        fig.suptitle(f"Expert Dashboard at Step {step}", fontsize=20)
         num_experts = getattr(model_config, "num_experts_per_layer", 1)
         num_layers = getattr(model_config, "num_hidden_layers", 1)
         total_experts = num_experts * num_layers
-        max_points = 50000
 
-        for ax, key_suffix, title, color in [
-            (axs[0, 0], "selected", "Top-K", None),
-            (axs[0, 1], "optimal", "Surprise Min-K", "orange"),
-        ]:
-            steps_key = f"{key_suffix}_experts_steps"
-            values_key = f"{key_suffix}_experts_values"
-            if steps_key in expert_data_np and values_key in expert_data_np:
-                steps = expert_data_np[steps_key]
-                values = expert_data_np[values_key]
-                rng = default_rng()
-                indices = rng.choice(len(steps), min(len(steps), max_points), replace=False)
-                steps, values = steps[indices], values[indices]
-                ax.scatter(steps, values, s=0.5, alpha=0.2, c=color)
-            ax.set_title(f"{title} Activation Scatter")
-            ax.set_xlabel("Global Step")
-            ax.set_ylabel("Global Expert ID")
-            ax.set_ylim(-1, total_experts)
+        steps_data = (
+            torch.cat(
+                [
+                    torch.full_like(e["selected_experts"], e["global_step"].item())
+                    for e in self.expert_history
+                ]
+            )
+            .cpu()
+            .numpy()
+        )
 
-        for ax_heatmap, ax_zscore, key_suffix, title in [
-            (axs[1, 0], axs[2, 0], "selected", "Top-K"),
-            (axs[1, 1], axs[2, 1], "optimal", "Surprise Min-K"),
-        ]:
-            values_key = f"{key_suffix}_experts_values"
-            if values_key in expert_data_np and expert_data_np[values_key].size > 0:
-                data = expert_data_np[values_key]
-                layers = data // num_experts
-                experts_in_layer = data % num_experts
-                heatmap, _, _ = np.histogram2d(layers, experts_in_layer, bins=[num_layers, num_experts])
-                sns.heatmap(heatmap.T, ax=ax_heatmap, cmap="viridis")
+        plot_data = {
+            "selected": torch.cat([e["selected_experts"] for e in self.expert_history])
+            .cpu()
+            .numpy(),
+            "optimal": torch.cat([e["optimal_experts"] for e in self.expert_history])
+            .cpu()
+            .numpy(),
+        }
 
-                heatmap_norm = (heatmap - heatmap.mean(axis=0, keepdims=True)) / (heatmap.std(axis=0, keepdims=True) + 1e-6)
-                sns.heatmap(heatmap_norm.T, ax=ax_zscore, cmap="viridis")
+        for i, (key, title_suffix, color) in enumerate(
+            [
+                ("selected", "Selected (Top-K)", "C0"),
+                ("optimal", "Optimal (Min-Surprise)", "C1"),
+            ]
+        ):
+            ax_scatter = axs[0, i]
+            ax_heatmap = axs[1, i]
+            ax_zscore = axs[2, i]
 
-            ax_heatmap.set_title(f"Cumulative {title} Activation Heatmap")
-            ax_heatmap.set_xlabel("Expert ID in Layer")
-            ax_heatmap.set_ylabel("Layer ID")
-            ax_zscore.set_title(f"Layer-Normalized {title} (Z-Score)")
-            ax_zscore.set_xlabel("Expert ID in Layer")
+            values = plot_data[key]
+            ax_scatter.scatter(steps_data, values, s=1, alpha=0.3, c=color)
+            ax_scatter.set_title(f"{title_suffix} Activation Scatter")
+            ax_scatter.set_xlabel("Global Step")
+            ax_scatter.set_ylabel("Global Expert ID")
+            ax_scatter.set_ylim(-1, total_experts)
+            ax_scatter.grid(True, which="both", linestyle="--", linewidth=0.5)
+
+            layers, experts_in_layer = values // num_experts, values % num_experts
+            heatmap, _, _ = np.histogram2d(
+                layers,
+                experts_in_layer,
+                bins=[num_layers, num_experts],
+                range=[[-0.5, num_layers - 0.5], [-0.5, num_experts - 0.5]],
+            )
+            sns.heatmap(heatmap.T, ax=ax_heatmap, cmap="viridis", cbar=True)
+            ax_heatmap.set_title(f"Cumulative {title_suffix} Activation Heatmap")
+            ax_heatmap.set_xlabel("Layer ID")
+            ax_heatmap.set_ylabel("Expert ID in Layer")
+
+            mean_act = heatmap.mean(axis=1, keepdims=True)
+            std_act = heatmap.std(axis=1, keepdims=True)
+            heatmap_z_score = (heatmap - mean_act) / (std_act + 1e-6)
+            sns.heatmap(
+                heatmap_z_score.T, ax=ax_zscore, cmap="coolwarm", center=0, cbar=True
+            )
+            ax_zscore.set_title(f"Layer-wise {title_suffix} Activation Z-Score")
+            ax_zscore.set_xlabel("Layer ID")
             ax_zscore.set_ylabel("Layer ID")
 
-        plt.tight_layout(rect=(0, 0.03, 1, 0.95))
-        self._save_plot(fig, "expert_dashboard_latest")
+        self._save_plot(fig, "expert_dashboard")
+
+    def _plot_timing_dashboard(self, step: int):
+        if not self.timing_history:
+            return
+
+        df = pd.DataFrame(self.timing_history)
+        avg_timings = df.drop(columns="step").mean()
+
+        fig, ax = plt.subplots(figsize=(12, 8))
+        avg_timings.plot(kind="barh", ax=ax)
+        ax.set_title(f"Average Step Time by Phase at Step {step}")
+        ax.set_xlabel("Time (seconds)")
+        ax.set_ylabel("Training Phase")
+
+        for index, value in enumerate(avg_timings):
+            ax.text(value, index, f"{value:.4f}s", va="center")
+
+        self._save_plot(fig, "timing_dashboard")
 
     def close(self):
         self.writer.close()
