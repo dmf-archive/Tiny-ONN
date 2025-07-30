@@ -84,7 +84,7 @@ def main():
     parser.add_argument(
         "--output_path",
         type=str,
-        required=True,
+        default="weights/Tiny-ONN-0.6B-Hyper-SMoE-V5",
         help="The path to save the surgically modified model.",
     )
     parser.add_argument(

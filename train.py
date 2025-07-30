@@ -1,7 +1,7 @@
 import argparse
 import time
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any
 
 import torch
 import torch.nn.functional as F
@@ -9,7 +9,7 @@ from bitsandbytes.optim import AdamW8bit
 from tqdm import tqdm
 from transformers import AutoTokenizer, get_scheduler
 
-from tiny_onn.modular import TinyOnnForCausalLM, CausalLMOutputWithAux
+from tiny_onn.modular import CausalLMOutputWithAux, TinyOnnForCausalLM
 from training.config import FullConfig, load_config
 from training.data import get_dataloaders
 from training.expert_manager import ExpertManager
@@ -70,58 +70,77 @@ def main(config_path: str):
         progress_bar = tqdm(train_dataloader, desc=f"Epoch {epoch + 1}")
         for batch in progress_bar:
             step_start_time = time.time()
-            
-            # === Phase 1: Forward Pass & Main Task Learning ===
+
             optimizer_expert.zero_grad()
             optimizer_gate.zero_grad()
 
             inputs = {k: v.to(device) for k, v in batch.items()}
             labels = inputs.pop("labels")
-            surprise_cache: List[Dict[str, Any]] = []
+            surprise_cache: list[dict[str, Any]] = []
+            hidden_states_cache: list[torch.Tensor] = []
             inputs["surprise_cache"] = surprise_cache
-            
+            inputs["hidden_states_cache"] = hidden_states_cache
+
             fwd_pass_start_time = time.time()
             outputs: CausalLMOutputWithAux = model(**inputs)
+            assert outputs.logits is not None
             main_loss = F.cross_entropy(outputs.logits.view(-1, model.config.vocab_size), labels.view(-1))
             main_loss.backward()
             optimizer_expert.step()
             fwd_pass_time = time.time() - fwd_pass_start_time
 
-            # === Phase 2: Gating Meta-Learning ===
             gating_loss_start_time = time.time()
-            
-            # --- Surprise Matrix Construction ---
-            num_layers = model.config.num_hidden_layers
-            num_tokens, num_experts = next(iter(outputs.aux_outputs)).get("raw_logits").shape
-            surprise_matrix = torch.full((num_layers, num_tokens, num_experts), float("inf"), device=device, dtype=torch.bfloat16)
-            for entry in surprise_cache:
-                surprise_matrix[entry["layer_idx"], entry["token_idx"], entry["expert_idx"]] = entry["norm"]
-            flat_surprise_matrix = surprise_matrix.view(-1, num_experts)
-            
-            # --- Gating Loss Calculation ---
-            all_activated_scores = torch.cat([d["activated_scores"] for d in outputs.aux_outputs], dim=0)
-            all_routing_weights = torch.cat([d["routing_weights"] for d in outputs.aux_outputs], dim=0)
-            all_raw_logits = torch.cat([d["raw_logits"] for d in outputs.aux_outputs], dim=0)
 
-            loss_smk = compute_smk_weighted_loss(flat_surprise_matrix, all_activated_scores)
-            loss_balance = compute_load_balancing_loss(all_routing_weights, all_activated_scores)
+            num_layers = model.config.num_hidden_layers
+            if not outputs.aux_outputs or not surprise_cache:
+                continue
+
+            num_tokens = hidden_states_cache[0].shape[1]
+            num_experts = model.config.num_experts_per_layer
+
+            surprise_matrix_l_t_e = torch.full((num_layers, num_tokens, num_experts), float("inf"), device=device, dtype=torch.bfloat16)
+
+            layer_indices = torch.tensor([d['layer_idx'] for d in surprise_cache], device=device)
+            token_indices = torch.tensor([d['token_idx'] for d in surprise_cache], device=device)
+            expert_indices = torch.tensor([d['expert_idx'] for d in surprise_cache], device=device)
+            norms = torch.tensor([d['norm'] for d in surprise_cache], device=device, dtype=torch.bfloat16)
+            surprise_matrix_l_t_e[layer_indices, token_indices, expert_indices] = norms
+            surprise_matrix = surprise_matrix_l_t_e.permute(1, 0, 2)
+
+            surprise_for_loss = surprise_matrix.clone().detach()
+
+            hidden_dim = model.config.hidden_size
+            stacked_hidden_states = torch.stack(hidden_states_cache, dim=0)
+            recomputed_scores_list = []
+            for i in range(num_layers):
+                h_states = stacked_hidden_states[i]
+                flat_h_states = h_states.view(-1, hidden_dim)
+                _, _, activated_scores = model.model.layers[i].mlp.gate(flat_h_states)
+                recomputed_scores_list.append(activated_scores)
+            all_activated_scores = torch.stack(recomputed_scores_list, dim=1)
+
+            routing_mask = all_activated_scores > 0
+            masked_scores = torch.where(routing_mask, all_activated_scores, torch.tensor(float('-inf'), device=all_activated_scores.device, dtype=all_activated_scores.dtype))
+            recomputed_routing_weights = F.softmax(masked_scores, dim=-1, dtype=torch.float)
+
+            loss_smk = compute_smk_weighted_loss(surprise_for_loss, all_activated_scores)
+            loss_balance = compute_load_balancing_loss(recomputed_routing_weights, all_activated_scores)
 
             with torch.no_grad():
                 main_loss_item = main_loss.item()
-                valid_surprise = flat_surprise_matrix[torch.isfinite(flat_surprise_matrix)]
+                valid_surprise = surprise_matrix[torch.isfinite(surprise_matrix)]
                 surprise_val = valid_surprise.mean().item() if valid_surprise.numel() > 0 else 0.0
+                assert outputs.logits is not None
                 tau = max(torch.distributions.Categorical(logits=outputs.logits.float()).entropy().mean().item(), 1e-9)
                 cost = (1 - config.observer.pi_gamma) * (main_loss_item / tau) + config.observer.pi_gamma * surprise_val
                 pi_score = torch.exp(torch.tensor(-config.observer.pi_alpha * cost)).item()
 
             lambda_balance = 1.0 - torch.sigmoid(torch.tensor((pi_score - config.train.pi_threshold) * config.train.pi_sensitivity)).item()
             gating_loss_total = (1.0 - lambda_balance) * loss_smk + lambda_balance * loss_balance
-            
             gating_loss_total.backward()
             optimizer_gate.step()
             gating_loss_time = time.time() - gating_loss_start_time
 
-            # === Phase 3: System Maintenance & Observation ===
             maintenance_start_time = time.time()
             lr_scheduler_expert.step()
             lr_scheduler_gate.step()
@@ -131,26 +150,40 @@ def main(config_path: str):
             obs_start_time = time.time()
             with torch.no_grad():
                 main_acc = (outputs.logits.argmax(-1) == labels).float().mean().item()
+
+                optimal_expert_indices = torch.argmin(surprise_matrix, dim=-1)
+                topk_indices = torch.topk(all_activated_scores, k=1, dim=-1).indices.squeeze(-1)
+                gating_acc = (topk_indices == optimal_expert_indices).float().mean().item()
+
+                num_activated_experts = (all_activated_scores > 0).sum(dim=-1).float()
+                avg_k = num_activated_experts.mean().item()
+                global_avg_k = num_activated_experts.sum(dim=1).mean().item()
+
+                log_probs_gating = F.log_softmax(masked_scores, dim=-1)
+                safe_surprise_matrix = torch.where(torch.isinf(surprise_matrix), torch.full_like(surprise_matrix, 1e9), surprise_matrix)
+                log_probs_surprise = F.log_softmax(-safe_surprise_matrix, dim=-1)
+                gating_kld = F.kl_div(log_probs_gating, log_probs_surprise, reduction='batchmean', log_target=True)
+
                 metrics = {
                     "main_loss": main_loss_item,
                     "smk_loss": loss_smk.item(),
                     "balance_loss": loss_balance.item(),
                     "gating_loss": gating_loss_total.item(),
                     "main_acc": main_acc,
+                    "gating_acc": gating_acc,
+                    "gating_kld": gating_kld.item(),
+                    "avg_k": avg_k,
+                    "global_avg_k": global_avg_k,
                     "surprise": surprise_val,
                     "tau": float(tau),
                     "pi_score": pi_score,
                     "lambda": lambda_balance,
                 }
-                
-                selected_experts_mask = (all_activated_scores > 0)
-                selected_experts = torch.where(selected_experts_mask)[1] + (torch.where(selected_experts_mask)[0] // num_tokens) * num_experts
-                
-                optimal_experts_indices = torch.argmin(flat_surprise_matrix, dim=-1)
-                optimal_experts_mask = torch.isfinite(flat_surprise_matrix.min(dim=-1).values)
-                optimal_experts = optimal_experts_indices[optimal_experts_mask] + torch.where(optimal_experts_mask)[0] * num_experts
-                
-                expert_data = {"selected_experts": selected_experts, "optimal_experts": optimal_experts}
+
+                expert_data = {
+                    "activated_scores": all_activated_scores.clone().detach(),
+                    "surprise_matrix": surprise_matrix.clone().detach(),
+                }
                 observer.log_metrics_and_expert_data(metrics, expert_data, global_step)
 
                 timings = {
@@ -162,7 +195,7 @@ def main(config_path: str):
                 }
                 observer.log_timing(timings, global_step)
 
-            observer.plot_dashboards(global_step, model.config)
+            observer.plot_all_dashboards(global_step, model.config)
             global_step += 1
 
     observer.close()

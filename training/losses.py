@@ -16,7 +16,7 @@ def compute_smk_weighted_loss(
     )
     log_probs = F.log_softmax(masked_scores, dim=-1)
 
-    surprise_clean = surprise_matrix.clone().detach()
+    surprise_clean = surprise_matrix
     surprise_clean[torch.isinf(surprise_clean)] = 1e9
 
     smk_loss = torch.sum(log_probs.exp() * surprise_clean, dim=-1).mean()
@@ -28,14 +28,15 @@ def compute_load_balancing_loss(
 ) -> torch.Tensor:
     num_experts = routing_weights.shape[-1]
 
-    tokens_per_expert = routing_weights.sum(dim=0)
+    # Sum across tokens and layers for each expert, works for both 2D and 3D
+    tokens_per_expert = routing_weights.sum(dim=list(range(routing_weights.dim() - 1)))
     load_loss = (
         num_experts
         * torch.sum(tokens_per_expert**2)
         / (torch.sum(tokens_per_expert) ** 2)
     )
 
-    importance_per_expert = activated_scores.sum(dim=0)
+    importance_per_expert = activated_scores.sum(dim=list(range(activated_scores.dim() - 1)))
     imp_loss = (
         num_experts
         * torch.sum(importance_per_expert**2)

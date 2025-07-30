@@ -1,6 +1,6 @@
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Optional, Tuple, List, Dict
+from typing import TYPE_CHECKING, Any
 
 import torch
 from torch import nn
@@ -32,7 +32,7 @@ class GateSTE(torch.autograd.Function):
 
 @dataclass
 class CausalLMOutputWithAux(CausalLMOutputWithPast):
-    aux_outputs: Optional[List[Dict[str, torch.Tensor]]] = None
+    aux_outputs: list[dict[str, torch.Tensor]] | None = None
 
 
 class TinyOnnExpert(nn.Module):
@@ -57,11 +57,11 @@ class TinyOnnGate(nn.Module):
         self.sim_matrix = nn.Parameter(torch.randn(config.hidden_size, config.num_experts_per_layer))
         self.gates = nn.Parameter(torch.zeros(config.num_experts_per_layer))
 
-    def forward(self, hidden_states: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         norm_hidden_states = F.normalize(hidden_states, dim=-1)
         norm_sim_matrix = F.normalize(self.sim_matrix, dim=0)
         raw_logits = torch.matmul(norm_hidden_states, norm_sim_matrix)
-        
+
         scaled_logits = torch.sigmoid(raw_logits)
         scaled_gates = torch.sigmoid(self.gates)
         activated_scores = F.relu(scaled_logits - scaled_gates)
@@ -69,7 +69,7 @@ class TinyOnnGate(nn.Module):
 
 
 def _create_sparse_hook(
-    cache: List[Dict[str, Any]],
+    cache: list[dict[str, Any]],
     layer_idx: int,
     expert_idx: int,
     token_indices: torch.Tensor,
@@ -103,10 +103,10 @@ class TinyOnnMoE(Qwen3MLP):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        surprise_cache: Optional[List[Dict]] = None,
+        surprise_cache: list[dict] | None = None,
         layer_idx: int = -1,
-        ignored_experts: Optional[set[int]] = None,
-    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        ignored_experts: set[int] | None = None,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         batch_size, sequence_length, hidden_dim = hidden_states.shape
         flat_hidden_states = hidden_states.view(-1, hidden_dim)
 
@@ -124,33 +124,37 @@ class TinyOnnMoE(Qwen3MLP):
         if torch.any(k_per_token == 0):
             fallback_mask = F.one_hot(raw_logits[k_per_token == 0].argmax(dim=-1), num_classes=self.num_experts).bool()
             routing_mask[k_per_token == 0] = fallback_mask
-        
+
         ste_scores = GateSTE.apply(activated_scores)
         masked_scores = torch.where(routing_mask, ste_scores, torch.tensor(float('-inf'), device=ste_scores.device, dtype=ste_scores.dtype))
         routing_weights = F.softmax(masked_scores, dim=-1, dtype=torch.float).to(hidden_states.dtype)
 
         aux_output = {
-            "raw_logits": raw_logits.detach(),
-            "activated_scores": activated_scores.detach(),
-            "routing_weights": routing_weights.detach(),
+            "raw_logits": raw_logits.clone().detach(),
+            "activated_scores": activated_scores,
+            "routing_weights": routing_weights.clone().detach(),
         }
 
         final_hidden_states = torch.zeros_like(flat_hidden_states)
         token_indices, expert_indices = torch.where(routing_mask)
-        
-        for expert_idx in torch.unique(expert_indices).tolist():
-            expert = self.experts[expert_idx]
-            token_mask_for_expert = (expert_indices == expert_idx)
-            tokens_for_expert = token_indices[token_mask_for_expert]
 
-            if tokens_for_expert.numel() > 0:
-                current_hidden_states = flat_hidden_states[tokens_for_expert]
-                if self.training and surprise_cache is not None and current_hidden_states.requires_grad:
-                    current_hidden_states.register_hook(_create_sparse_hook(surprise_cache, layer_idx, expert_idx, tokens_for_expert))
-                
-                expert_output = expert(current_hidden_states)
-                weighted_output = expert_output * routing_weights[tokens_for_expert, expert_idx].unsqueeze(1)
-                final_hidden_states.index_add_(0, tokens_for_expert, weighted_output)
+        for i in range(self.num_experts):
+            expert_mask = (expert_indices == i)
+            tokens_for_this_expert = token_indices[expert_mask]
+
+            if tokens_for_this_expert.numel() == 0:
+                continue
+
+            h_states_for_expert = flat_hidden_states[tokens_for_this_expert]
+
+            if self.training and surprise_cache is not None and h_states_for_expert.requires_grad:
+                h_states_for_expert.register_hook(_create_sparse_hook(surprise_cache, layer_idx, i, tokens_for_this_expert))
+
+            expert_output = self.experts[i](h_states_for_expert)
+            weights_for_expert = routing_weights[tokens_for_this_expert, i].unsqueeze(1)
+
+            weighted_output = expert_output * weights_for_expert
+            final_hidden_states.index_add_(0, tokens_for_this_expert, weighted_output)
 
         return final_hidden_states.view(batch_size, sequence_length, hidden_dim), aux_output
 
@@ -163,20 +167,24 @@ class TinyOnnDecoderLayer(Qwen3DecoderLayer):
 
     def forward(self, *args, **kwargs):
         aux_outputs_list = kwargs.get("aux_outputs_list")
-        
+        hidden_states_cache = kwargs.get("hidden_states_cache")
+
         residual = args[0]
         hidden_states = self.input_layernorm(args[0])
-        
+
         attn_outputs = self.self_attn(hidden_states, *args[1:], **kwargs)
         hidden_states = attn_outputs[0]
         hidden_states = residual + hidden_states
 
         residual = hidden_states
         hidden_states_pre_mlp = self.post_attention_layernorm(hidden_states)
-        
+
+        if hidden_states_cache is not None:
+            hidden_states_cache.append(hidden_states_pre_mlp.clone().detach())
+
         ignored_experts = kwargs.get("ignored_experts")
         layer_ignored_experts = ignored_experts.get(self.layer_idx) if ignored_experts else None
-        
+
         surprise_cache = kwargs.get("surprise_cache")
         mlp_output, aux_output = self.mlp(
             hidden_states_pre_mlp,
@@ -186,7 +194,7 @@ class TinyOnnDecoderLayer(Qwen3DecoderLayer):
         )
 
         if aux_outputs_list is not None:
-            aux_outputs_list.append(aux_output)
+            aux_outputs_list.append({k: v.clone().detach() for k, v in aux_output.items()})
 
         hidden_states = residual + mlp_output
         outputs = (hidden_states,) + attn_outputs[1:]
@@ -201,12 +209,12 @@ class TinyOnnModel(Qwen3Model):
         )
         self.post_init()
 
-    def forward(self, *args, **kwargs) -> Tuple[torch.Tensor, List[Dict[str, torch.Tensor]]]:
-        aux_outputs_list: List[Dict[str, torch.Tensor]] = []
+    def forward(self, *args, **kwargs) -> tuple[torch.Tensor, list[dict[str, torch.Tensor]]]:
+        aux_outputs_list: list[dict[str, torch.Tensor]] = []
         kwargs["aux_outputs_list"] = aux_outputs_list
-        
+
         hidden_states = super().forward(*args, **kwargs)[0]
-        
+
         return hidden_states, aux_outputs_list
 
 
@@ -222,7 +230,7 @@ class TinyOnnForCausalLM(Qwen3ForCausalLM):
     def forward(self, *args, **kwargs) -> CausalLMOutputWithAux:
         hidden_states, aux_outputs = self.model(*args, **kwargs)
         logits = self.lm_head(hidden_states)
-        
+
         return CausalLMOutputWithAux(
             logits=logits,
             aux_outputs=aux_outputs,

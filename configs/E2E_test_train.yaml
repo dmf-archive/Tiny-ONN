@@ -5,7 +5,7 @@ data:
   max_seq_length: 512
 
 model:
-  model_path: "weights/Tiny-ONN-0.6B-Hyper-SMoE-V4"
+  model_path: "weights/Tiny-ONN-0.6B-Hyper-SMoE-V5"
 
 train:
   per_device_train_batch_size: 1
