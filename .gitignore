@@ -40,3 +40,4 @@ weights/
 .mypy_cache/
 
 *.pt
+smk_poc_checkpoint/

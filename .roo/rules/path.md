@@ -11,3 +11,4 @@
 
 - `Qwen3` 模型架构定义： `.venv\Lib\site-packages\transformers\models\qwen3\modeling_qwen3.py`
 - `DynMoE`的动态 MoE：`ref\DynMoE\DeepSpeed-0.9.5\deepspeed\moe\sharded_moe.py`
+- `DynMoE`的普通负载均衡loss和门限STE：`ref\DynMoE\DeepSpeed-0.9.5\deepspeed\moe\loss.py`
