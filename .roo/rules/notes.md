@@ -5,7 +5,7 @@
 我们放弃“器官嫁接”式的模型手术，回归第一性原理。我们将从一个极简的、随机初始化的“盆景模型”开始，通过一种模拟有机体发育的“永续预训练”范式，让其成为一个**在有限资源下通过高效信息整合（专家分化与动态生长）来最小化自身变分自由能（VFE）的自组织智能体。**
 
 - **内部状态 (Internal States) - 专家网络**: 一组**超迷你**专家，负责对世界（数据）建立生成模型。其学习目标是最小化**预测误差 (`main_loss`)**，并在一个受保护的梯度环境（选择性激活和基于正态分布阈值的梯度过滤）中稳定学习。
-- **马尔可夫毯 (Markov Blanket) - 门控网络**: 负责感知内部状态（`ΔSC`）并采取行动（路由决策）。其学习目标是**将信息路由到能以最高协同贡献（最大化 `ΔSC`）处理它的专家**，从而以最高效率降低整个系统的 VFE。
+- **马尔可夫毯 (Markov Blanket) - 门控网络**: 负责感知内部状态（`Surprise`）并采取行动（路由决策）。其学习目标是**将信息路由到能以最低“惊奇度”（最小化 `Surprise`）稳定处理它的专家**，从而优先巩固已有知识，降低整体系统的 VFE。`ΔSC` 在此过程中可作为一个重要的**观察指标**，用于分析专家激活与协同贡献之间的关系，但**不直接作为**训练目标。
 - **生长机制**: 模型的**横向宽度（专家数量）**是动态的。当系统无法有效处理某些新信息时（体现为存在未被路由的 token），它会“生长”出新的专家来专门应对这些信息，这是一种结构性的主动推理。
 
 ## 2. 核心架构：基于模块化组合的 Tiny-ONN
@@ -33,82 +33,56 @@ graph TD
     G["训练循环 (train.py)"] -- "加载" --> F
 ```
 
-## 3. 训练范式：2f2b2o - 解耦的专家学习与门控元学习
+## 3. 训练范式：统一训练循环与混合损失 (已验证方案)
+
+经 `exp/smk_poc.py` 实验验证，解耦的 `2f2b2o` 元学习范式无法稳定收敛。当前**唯一、正确**的训练范式是**统一训练循环**，将门控损失作为辅助损失（`aux_loss`）与主损失相加，进行单次联合反向传播。
 
 ### 3.1. 核心流程图
 
 ```mermaid
 graph TD
-    subgraph "永续训练循环"
-        Start["开始: 随机初始化 TinyOnn"] --> TrainStep{"训练步"};
-
-        subgraph "Phase 1: 专家学习 (1fwd + 1bwd + 1opt)"
-            TrainStep --> FWD["1. 主前向传播 (Full Forward)"];
-            FWD -- "生成 full_expert_outputs" --> CACHE_A;
-            FWD -- "缓存 detached hidden_states" --> CACHE_H;
-            FWD --> L_main["2. 计算 main_loss"];
-            L_main & CACHE_A -- "autograd" --> CACHE_G["3. 计算并缓存 Surprise 矩阵"];
-            L_main --> BWD_main["4. main_loss.backward()"];
-            BWD_main --> OPT_EXPERT["5. 专家优化器步进 (清空门控梯度)"];
+    subgraph "统一训练步"
+        Start["开始"] --> FWD["1. 全模型前向传播"];
+        FWD --> Outputs["logits, full_expert_outputs, router_logits"];
+        
+        Outputs --> L_main["2. 计算 main_loss"];
+        
+        subgraph "门控损失计算"
+            L_main & Outputs -- "autograd.grad" --> Surprise["3. 计算 Surprise 矩阵"];
+            Surprise & Outputs --> L_gate["4. 计算混合门控损失 (Hybrid Gating Loss)"];
+        end
+        
+        L_main & L_gate --> L_combined["5. 计算 combined_loss = main_loss + w_aux * gating_loss"];
+        L_combined --> BWD["6. combined_loss.backward()"];
+        
+        subgraph "参数更新"
+            BWD --> Filter["7. (可选) 专家梯度 2σ 过滤"];
+            Filter --> Step["8. optimizer.step()"];
         end
 
-        subgraph "Phase 2: 门控元学习 (1fwd_partial + 1bwd + 1opt)"
-            OPT_EXPERT --> GATING_FWD["6. 门控重计算 (Partial Forward)"];
-            CACHE_H -- "使用 detached hidden_states" --> GATING_FWD;
-            GATING_FWD --> P_recomputed["7. 生成带梯度的 P'(e|t)"];
-            
-            CACHE_A & CACHE_G --> DELTA_SC["8. 计算 ΔSC 矩阵"];
-            DELTA_SC --> Q["9. 确定最优路由目标 Q(e|t)"];
-            
-            P_recomputed & Q --> L_smk["10. 计算 smk_loss"];
-            L_smk --> BWD_gating["11. smk_loss.backward()"];
-            BWD_gating --> OPT_GATE["12. 门控优化器步进"];
-        end
-
-        subgraph "Phase 3: 系统维护与生长"
-            OPT_GATE --> CheckGrowth{"13. 每 N 步检查生长条件"};
-            CheckGrowth -- "存在未路由的token" --> Grow["14. ExpertManager.grow()"];
-            Grow --> TrainStep;
-            CheckGrowth -- "否则" --> TrainStep;
-        end
+        Step --> End["结束"];
     end
 ```
 
-### 3.2. 核心元学习机制：基于 ΔSC 的 `gating_loss`
+### 3.2. 核心学习机制：基于 `Surprise` 的混合 `gating_loss`
 
-#### a. 梯度捕获 (`autograd.grad` - 已验证方案)
+#### a. 梯度捕获 (`autograd.grad`)
+此部分与原方案一致，是**已验证**的核心组件。通过创建并填充 `full_expert_outputs` 稠密张量，再调用 `torch.autograd.grad(main_loss, full_expert_outputs)` 来获取 `per-token-per-expert` 粒度的梯度范数，即 `Surprise` 矩阵。
 
-经 PoC 脚本 (`exp/final_grad_poc.py`) 最终实验验证，捕获 `per-token-per-expert` 粒度梯度（`Surprise`）的**唯一、正确方案是 `torch.autograd.grad`**，`hook` 方案已被证明不可行。
+#### b. 混合损失函数
+为解决单一目标导致的模型坍缩问题，门控损失被设计为两种目标的加权和，以平衡“利用”和“探索”：
 
-1. **构造完整输出张量**: 在 MoE 层的 `forward` 方法中，创建一个形状为 `[num_tokens, num_experts, hidden_dim]` 的全零张量 `full_expert_outputs`。
-2. **稀疏填充**: 对每个 token，只计算被 top-k 选中的专家的输出，并将结果填充到 `full_expert_outputs` 张量的对应 `(token, expert)` 位置。
-3. **连接计算图**: **必须**使用这个 `full_expert_outputs` 张量（而非 `index_add_` 等旁路操作）来计算最终的、用于 `loss` 计算的 MoE 层输出。例如，通过 `torch.einsum` 进行加权求和。
-4. **调用 `autograd.grad`**: 在 `main_loss.backward()` **之前**，调用 `torch.autograd.grad(main_loss, full_expert_outputs, retain_graph=True)`。这将返回一个与 `full_expert_outputs` 形状完全相同的梯度张量，其中包含了我们需要的所有梯度信息（激活路径为真实梯度，未激活路径为零）。
+- **硬目标 (利用)**: `ce_loss = CrossEntropy(router_logits, argmin(Surprise))`
+  - 鼓励门控精确地选择 `Surprise` 最小的最优专家。
+- **软目标 (探索)**: `kl_loss = KL_Div(log_softmax(router_logits), log_softmax(-Surprise))`
+  - 鼓励门控的输出概率分布，从整体上拟合 `-Surprise` 的分布，从而考虑到次优选项，避免坍缩到单一专家。
 
-#### b. `ΔSC` (协同贡献) 定义
+**`gating_loss = w_ce * ce_loss + w_kl * kl_loss`**
 
-**`ΔSC(t, e) = sigmoid(Activation(t, e)) - sigmoid(Gradient(t, e))`**
+### 3.3. 关键稳定化机制
 
-- `Activation(t, e)`: 专家 `e` 对 token `t` 的输出激活张量，代表各专家对输出的影响力。
-- `Gradient(t, e)`: 从 `autograd.grad` 获取的梯度张量中提取的、对应 `(t,e)` 的梯度范数，即 `Surprise` 值。
-
-#### c. 解耦的优化与独立计算图
-
-门控的学习是一个**元学习**过程，它必须在专家完成自己的学习步骤之后，在一个独立的计算图上进行。
-
-1. **专家学习**:
-    - 调用 `main_loss.backward(retain_graph=True)`。
-    - **手动将门控参数的 `.grad` 设置为零**。
-    - 调用 `optimizer_expert.step()` 更新专家及其他参数。
-2. **门控元学习**:
-    - **创建独立计算图**: 使用缓存的 `detached` 的 `hidden_states`，重新进行一次**部分前向传播**，仅通过门控网络，得到新的、附着了计算图的 `router_logits`，记为 `P'(e|t)`。
-    - **计算损失**: 利用 `ΔSC` 矩阵确定最优目标 `Q(e|t)`，然后计算 `gating_loss = CrossEntropy(P'(e|t), Q(e|t))`。
-    - **反向传播与优化**: 调用 `gating_loss.backward()`，最后调用 `optimizer_gate.step()`。
-
-### 3.3. 关键机制详解
-
-- **动态生长 (`ExpertManager.grow()`)**: 当存在未路由的 token 时触发，将随机初始化一个新专家。
-- **专家保护 (异常梯度置零)**: 可选。在 `optimizer_expert.step()` 前对梯度进行 `2σ` 置零操作。
+- **强制探索**: 在 `DynamicGate` 的前向传播中，如果一个 token 没有激活任何专家，则强制激活 `k = num_experts / 2` 个 `logits` 最高的专家。这是防止模型早期“沉默”、保证学习信号传递的关键。
+- **专家梯度保护**: 在 `optimizer.step()` 之前，对所有专家的参数梯度进行 `2σ` 离群值过滤，将异常梯度置零。这可以保护专家网络不被少数高难度样本产生的巨大梯度所“污染”，从而稳定学习过程。
 
 ## 4. 观测数据与可视化实施备忘录
 
@@ -132,11 +106,11 @@ graph TD
 | 指标名称 | 计算公式 / 伪代码 | 记录工具 | 描述 |
 | :--- | :--- | :--- | :--- |
 | **`main_loss`** | `CrossEntropyLoss(outputs.logits, labels)` | TB, Matplotlib | 模型的标准预测损失。 |
-| **`gating_loss`** | `CrossEntropyLoss(router_logits, argmax(delta_sc))` | TB, Matplotlib | 门控的元学习损失。 |
+| **`gating_loss`** | `w_ce * ce_loss + w_kl * kl_loss` | TB, Matplotlib | 基于 `Surprise` 的混合门控损失。 |
 | **`main_acc`** | `(outputs.logits.argmax(-1) == labels).float().mean()` | TB, Matplotlib | 模型的标准预测准确率。 |
-| **`gating_acc`** | `(router_logits.argmax(-1) == argmax(delta_sc)).float().mean()` | TB, Matplotlib | 门控路由的“正确率”，衡量其选择是否与最高ΔSC专家一致。 |
-| **`routing_similarity`**| `cosine_similarity(router_logits, delta_sc).mean()` | TB, Matplotlib | 门控输出与ΔSC分数的分布相似度，比gating_acc更精细。 |
-| **`delta_sc`** | `mean(sigmoid(Activation) - sigmoid(Gradient))` | TB, Matplotlib | 净协同贡献。|
+| **`gating_acc`** | `(router_logits.argmax(-1) == surprise.argmin(-1)).float().mean()` | TB, Matplotlib | 门控路由“正确率”，衡量其选择是否与最低`Surprise`专家一致。 |
+| **`routing_similarity`**| `cosine_similarity(softmax(logits), softmax(-surprise)).mean()` | TB, Matplotlib | 门控输出分布与 `-Surprise` 分布的相似度。 |
+| **`delta_sc`** | `mean(sigmoid(Activation) - sigmoid(Gradient))` | TB, Matplotlib | **(仅观察指标)** 净协同贡献。|
 | **`surprise`** | `mean(norm(grad(L_main, expert_outputs)))` | TB, Matplotlib | **仅由 `L_main` 产生的**专家参数梯度范数。 |
 | **`pi_score`** | `exp(-alpha * (main_loss/tau + gamma*surprise))` | TB, Matplotlib | 预测完整性分数，综合评估模型的“认知健康度”。 |
 | **`tau`** | `Categorical(logits=outputs.logits).entropy().mean()` | TB, Matplotlib | 模型输出的平均不确定性（熵）。 |

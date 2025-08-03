@@ -6,6 +6,7 @@
 - **pytorch**: `pytorch/pytorch`
 - **bitsandbytes**: `bitsandbytes-foundation/bitsandbytes`
 - **DynMoE**：`LINs-lab/DynMoE`
+- **Native Sparse Attention**：`fla-org/native-sparse-attention`
 
 以下是重要的参考源代码在工作区内的路径：
 
