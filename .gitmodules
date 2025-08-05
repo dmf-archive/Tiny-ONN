@@ -1,3 +1,6 @@
 [submodule "ref/DynMoE"]
 	path = ref/DynMoE
 	url = https://github.com/LINs-lab/DynMoE
+[submodule "ref/native-sparse-attention-pytorch"]
+	path = ref/native-sparse-attention-pytorch
+	url = https://github.com/lucidrains/native-sparse-attention-pytorch.git
