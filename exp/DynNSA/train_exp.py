@@ -68,7 +68,7 @@ def main():
     sparse_optimizer = AdamW(sparse_model.parameters(), lr=config.learning_rate)
     dense_optimizer = AdamW(dense_model.parameters(), lr=config.learning_rate)
 
-    tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-0.6B", cache_dir="../../weights", trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-0.6B", cache_dir="./weights", trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.add_special_tokens({'pad_token': '[PAD]'})
     config.vocab_size = len(tokenizer)
@@ -80,7 +80,7 @@ def main():
     dense_model.lm_head = sparse_model.lm_head
 
 
-    with open("../../data/dummy_chat_data.jsonl", "r", encoding="utf-8") as f:
+    with open("data/dummy_chat_data.jsonl", "r", encoding="utf-8") as f:
         data = [json.loads(line) for line in f]
 
     history = {k: [] for k in ['sparse_loss', 'dense_loss', 'sparse_acc', 'dense_acc', 'sparse_surprise', 'dense_surprise', 'sparse_tau', 'dense_tau', 'sparse_pi', 'dense_pi']}

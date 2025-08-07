@@ -1,25 +1,27 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, is_dataclass
 from pathlib import Path
 from typing import Any
-
 import yaml
-
+from tiny_onn.config import TinyOnnConfig
 
 def _from_dict(data_class, data):
     if data is None:
         return None
-    return data_class(
-        **{
-            key: (
-                _from_dict(field, data[key])
-                if isinstance(data.get(key), dict)
-                else data[key]
-            )
-            for key, field in data_class.__annotations__.items()
-            if key in data
-        }
-    )
 
+    kwargs = {}
+    for field_name, field_type in data_class.__annotations__.items():
+        if field_name in data:
+            field_value = data[field_name]
+            if is_dataclass(field_type):
+                kwargs[field_name] = _from_dict(field_type, field_value)
+            elif field_type is TinyOnnConfig:
+                kwargs[field_name] = TinyOnnConfig(**field_value)
+            else:
+                try:
+                    kwargs[field_name] = field_type(field_value)
+                except (TypeError, ValueError):
+                    kwargs[field_name] = field_value
+    return data_class(**kwargs)
 
 @dataclass
 class DataConfig:
@@ -29,19 +31,9 @@ class DataConfig:
     dataset_name: str | None = None
     dataset_subset: str | None = None
     validation_split_percentage: int = 5
-    max_seq_length: int = 512
-
-
-@dataclass
-class ModelConfig:
-    model_path: str
-    resume_from_checkpoint: str | None = None
-
 
 @dataclass
 class TrainConfig:
-    per_device_train_batch_size: int = 1
-    num_train_epochs: int = 1
     learning_rate: float = 1.0e-5
     weight_decay: float = 0.01
     adam_beta1: float = 0.9
@@ -49,32 +41,25 @@ class TrainConfig:
     adam_epsilon: float = 1.0e-8
     lr_scheduler_warmup_steps: int = 10
     surprise_threshold_sigma: float = 2.0
-    w_smk: float = 1.0
-    w_balance: float = 0.01
-    pi_threshold: float = 0.75
-    pi_sensitivity: float = 10.0
-    expert_regeneration_interval: int = 1000
-
+    num_epochs: int = 1
+    log_interval: int = 10
 
 @dataclass
 class ObserverConfig:
     output_dir: str
-    log_interval: int = 1
     pi_gamma: float = 0.5
     pi_alpha: float = 1.0
-
 
 @dataclass
 class FullConfig:
     data: DataConfig
-    model: ModelConfig
+    model: TinyOnnConfig
     train: TrainConfig
     observer: ObserverConfig
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "FullConfig":
         return _from_dict(cls, data)
-
 
 def load_config(config_path: Path) -> FullConfig:
     with open(config_path) as f:

@@ -1,31 +1,32 @@
 data:
   mode: "local_json"
   train_path: "data/dummy_chat_data.jsonl"
-  eval_path: "data/dummy_chat_data.jsonl"
-  max_seq_length: 512
 
 model:
-  model_path: "weights/Tiny-ONN-0.6B-Hyper-SMoE-V5"
+  vocab_size: 50257
+  num_hidden_layers: 2
+  num_attention_heads: 4
+  hidden_size: 32
+  head_dim: 8
+  intermediate_size: 32
+  moe_intermediate_size: 32
+  num_experts_per_layer: 32
+  selection_block_size: 16
+  max_selected_blocks: 16
+  w_ce: 1.0
+  w_kl: 0.5
+  w_entropy: 1.0
+  w_sparse: 1.0
+  pi_alpha: 1.0
+  pi_gamma: 0.5
 
 train:
-  per_device_train_batch_size: 1
-  num_train_epochs: 3
-  learning_rate: 1.0e-4
-  adam_beta1: 0.9
-  adam_beta2: 0.999
-  adam_epsilon: 1.0e-8
-  weight_decay: 0.01
-  lr_scheduler_warmup_steps: 10
-  w_smk: 1.0
-  w_balance: 0.01
-  pi_threshold: 0.75
-  pi_sensitivity: 10.0
-  expert_regeneration_interval: 1000
+  learning_rate: 1e-4
+  num_epochs: 30
+  log_interval: 10
+  surprise_threshold_sigma: 2.0
 
 observer:
   output_dir: "output/E2E_test_train"
-  log_interval: 1
-  eval_interval: 50
-  checkpoint_interval: 100
   pi_gamma: 0.5
   pi_alpha: 1.0

@@ -1,234 +1,298 @@
-from collections.abc import Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
 
 import torch
-from torch import nn
-from torch.nn import functional as F
-from transformers.activations import ACT2FN
+import torch.nn as nn
+import torch.nn.functional as F
+from einops import rearrange
+from einops.layers.torch import Rearrange
+from local_attention import LocalAttention
+from transformers import PreTrainedModel
 from transformers.modeling_outputs import CausalLMOutputWithPast
-from transformers.models.qwen3.modeling_qwen3 import (
-    Qwen3DecoderLayer,
-    Qwen3ForCausalLM,
-    Qwen3MLP,
-    Qwen3Model,
-)
 
 from .config import TinyOnnConfig
 
-if TYPE_CHECKING:
-    pass
 
-
-class GateSTE(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, input):
-        return input
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        return grad_output
+def max_neg_value(t):
+    return -torch.finfo(t.dtype).max
 
 
 @dataclass
 class CausalLMOutputWithAux(CausalLMOutputWithPast):
     aux_outputs: list[dict[str, torch.Tensor]] | None = None
 
+class STEFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, scores):
+        return (scores > 0).to(scores.dtype)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return grad_output
+
+class TinyOnnAttention(nn.Module):
+    def __init__(self, config: TinyOnnConfig):
+        super().__init__()
+        self.config = config
+        self.num_heads = config.num_attention_heads
+        self.head_dim = config.head_dim
+
+        self.q_proj = nn.Linear(config.hidden_size, self.num_heads * self.head_dim, bias=False)
+        self.k_proj = nn.Linear(config.hidden_size, self.num_heads * self.head_dim, bias=False)
+        self.v_proj = nn.Linear(config.hidden_size, self.num_heads * self.head_dim, bias=False)
+        self.o_proj = nn.Linear(self.num_heads * self.head_dim, config.hidden_size, bias=False)
+
+        self.sliding_window = LocalAttention(
+            dim=self.head_dim,
+            window_size=config.selection_block_size,
+            causal=True,
+            autopad=True,
+            use_rotary_pos_emb=False,
+        )
+
+        compress_mlp = nn.Sequential(
+            nn.Linear(config.selection_block_size * self.head_dim, self.head_dim),
+            nn.GELU(),
+        )
+        self.k_compress = compress_mlp
+        self.v_compress = compress_mlp
+
+        self.k_scale = nn.Parameter(torch.ones(1, self.num_heads, 1))
+        self.k_bias = nn.Parameter(torch.zeros(1, self.num_heads, 1))
+
+        self.to_strategy_combine = nn.Sequential(
+            nn.Linear(config.hidden_size, 3 * self.num_heads),
+            nn.Sigmoid(),
+            Rearrange('b n (h s) -> b h n s', h=self.num_heads),
+        )
+        self.merge_heads = Rearrange('b h n d -> b n (h d)')
+
+    def forward(self, hidden_states: torch.Tensor, attention_mask: torch.Tensor | None = None):
+        B, T, _ = hidden_states.shape
+        S = self.config.selection_block_size
+        H = self.num_heads
+
+        q_raw, k_raw, v_raw = self.q_proj(hidden_states), self.k_proj(hidden_states), self.v_proj(hidden_states)
+
+        q = rearrange(q_raw, 'b t (h d) -> b h t d', h=H)
+        k = rearrange(k_raw, 'b t (h d) -> b h t d', h=H)
+        v = rearrange(v_raw, 'b t (h d) -> b h t d', h=H)
+
+        sliding_window_attn_out = self.sliding_window(q, k, v)
+
+        padding = (S - T % S) % S
+        k_padded, v_padded, q_padded = (
+            (F.pad(t, (0, 0, 0, padding), 'constant', 0) if padding > 0 else t)
+            for t in (k, v, q)
+        )
+
+        padded_T = T + padding
+        num_blocks = padded_T // S
+
+        k_blocked = rearrange(k_padded, 'b h (n s) d -> (b h n) (s d)', s=S)
+        v_blocked = rearrange(v_padded, 'b h (n s) d -> (b h n) (s d)', s=S)
+
+        k_compressed = self.k_compress(k_blocked).view(B, H, num_blocks, -1)
+        v_compressed = self.v_compress(v_blocked).view(B, H, num_blocks, -1)
+
+        importance_scores = torch.einsum('b h i d, b h j d -> b h i j', q_padded, k_compressed) / (self.head_dim ** 0.5)
+        compressed_attn_probs = F.softmax(importance_scores, dim=-1)
+        compressed_attn_out = torch.einsum('b h i j, b h j d -> b h i d', compressed_attn_probs, v_compressed)
+
+        block_attn_scores = rearrange(importance_scores, 'b h (i s) j -> b h i s j', s=S).mean(dim=-2)
+
+        block_attn_probs = F.softmax(block_attn_scores, dim=-1)
+        entropy = -torch.sum(block_attn_probs * torch.log(block_attn_probs + 1e-9), dim=-1)
+        max_entropy = torch.log(torch.tensor(num_blocks, device=hidden_states.device))
+        normalized_entropy = entropy / (max_entropy + 1e-9)
+
+        k_logit = self.k_scale * normalized_entropy + self.k_bias
+        k_ratio = torch.sigmoid(k_logit)
+        dynamic_k = torch.clamp(self.config.max_selected_blocks * k_ratio, min=1, max=self.config.max_selected_blocks).long()
+        avg_k = dynamic_k.float().mean()
+
+        top_k_indices = torch.topk(block_attn_scores, self.config.max_selected_blocks, dim=-1).indices
+        mask = torch.zeros_like(block_attn_scores, dtype=torch.bool)
+        
+        arange_k = torch.arange(self.config.max_selected_blocks, device=hidden_states.device)[None, None, None, :]
+        k_mask = arange_k < dynamic_k.unsqueeze(-1)
+        
+        top_k_to_set = torch.masked_select(top_k_indices, k_mask)
+        batch_indices, head_indices, block_q_indices, _ = torch.where(k_mask)
+        if top_k_to_set.numel() > 0:
+            mask[batch_indices, head_indices, block_q_indices, top_k_to_set] = True
+
+        mask |= torch.eye(num_blocks, device=hidden_states.device, dtype=torch.bool).unsqueeze(0).unsqueeze(0)
+        sparse_mask = torch.repeat_interleave(mask, S, dim=2).repeat_interleave(S, dim=3)
+
+        attn_weights = torch.einsum('b h i d, b h j d -> b h i j', q_padded, k_padded) / (self.head_dim ** 0.5)
+        if attention_mask is not None:
+             attn_weights.masked_fill_(~attention_mask[:,:,:padded_T,:padded_T], max_neg_value(attn_weights))
+        attn_weights.masked_fill_(~sparse_mask, max_neg_value(attn_weights))
+
+        final_attn_probs = F.softmax(attn_weights, dim=-1)
+        fine_attn_out = torch.einsum('b h i j, b h j d -> b h i d', final_attn_probs, v_padded)
+
+        fine_attn_out = fine_attn_out[:, :, :T, :]
+        compressed_attn_out = compressed_attn_out[:, :, :T, :]
+
+        strategy_weights = self.to_strategy_combine(hidden_states)
+        combined_out = torch.stack([sliding_window_attn_out, compressed_attn_out, fine_attn_out], dim=-1)
+        out = torch.einsum('b h n d s, b h n s -> b h n d', combined_out, strategy_weights)
+
+        out = self.merge_heads(out)
+        output = self.o_proj(out)
+
+        aux_outputs = {
+            "avg_k": avg_k,
+            "k_ratio": k_ratio,
+            "normalized_entropy": normalized_entropy,
+        }
+        return output, aux_outputs
 
 class TinyOnnExpert(nn.Module):
     def __init__(self, config: TinyOnnConfig):
         super().__init__()
         self.w1 = nn.Linear(config.hidden_size, config.moe_intermediate_size, bias=False)
-        self.w3 = nn.Linear(config.hidden_size, config.moe_intermediate_size, bias=False)
         self.w2 = nn.Linear(config.moe_intermediate_size, config.hidden_size, bias=False)
-        self.act_fn = ACT2FN[config.hidden_act]
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        current_hidden_states = self.act_fn(self.w1(hidden_states)) * self.w3(
-            hidden_states
-        )
-        current_hidden_states = self.w2(current_hidden_states)
-        return current_hidden_states
-
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.w2(F.gelu(self.w1(x)))
 
 class TinyOnnGate(nn.Module):
     def __init__(self, config: TinyOnnConfig):
         super().__init__()
+        self.config = config
         self.sim_matrix = nn.Parameter(torch.randn(config.hidden_size, config.num_experts_per_layer))
         self.gates = nn.Parameter(torch.zeros(config.num_experts_per_layer))
 
-    def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        norm_hidden_states = F.normalize(hidden_states, dim=-1)
-        norm_sim_matrix = F.normalize(self.sim_matrix, dim=0)
-        raw_logits = torch.matmul(norm_hidden_states, norm_sim_matrix)
+    def forward(self, x: torch.Tensor):
+        logits = torch.matmul(F.normalize(x, dim=-1), F.normalize(self.sim_matrix, dim=0))
+        gate_thresholds = torch.sigmoid(self.gates)
+        pre_activation_logits = logits - gate_thresholds
 
-        scaled_logits = torch.sigmoid(raw_logits)
-        scaled_gates = torch.sigmoid(self.gates)
-        activated_scores = F.relu(scaled_logits - scaled_gates)
-        return raw_logits, scaled_logits, activated_scores
+        gated_logits = F.relu(pre_activation_logits)
+        activation_mask = STEFunction.apply(gated_logits)
 
+        num_active_experts = torch.sum(activation_mask, dim=1)
+        inactive_tokens_mask = num_active_experts == 0
+        if self.training and inactive_tokens_mask.any():
+            k_fallback = self.config.num_experts_per_layer // 2
+            topk_expert_indices = torch.topk(logits[inactive_tokens_mask], k=k_fallback, dim=1).indices
 
-def _create_sparse_hook(
-    cache: list[dict[str, Any]],
-    layer_idx: int,
-    expert_idx: int,
-    token_indices: torch.Tensor,
-) -> Callable:
-    def hook(grad: torch.Tensor) -> None:
-        if grad is not None:
-            norms = torch.linalg.norm(grad.float(), dim=-1)
-            for i, token_idx in enumerate(token_indices):
-                cache.append({
-                    "layer_idx": layer_idx,
-                    "token_idx": token_idx.item(),
-                    "expert_idx": expert_idx,
-                    "norm": norms[i].item(),
-                })
-    return hook
+            batch_indices = torch.where(inactive_tokens_mask)[0].unsqueeze(1).expand(-1, k_fallback)
 
+            activation_mask[batch_indices, topk_expert_indices] = 1.0
 
-class TinyOnnMoE(Qwen3MLP):
+        gated_logits_masked = torch.where(activation_mask > 0, gated_logits, max_neg_value(gated_logits))
+        active_expert_probs = F.softmax(gated_logits_masked, dim=-1)
+
+        return active_expert_probs, pre_activation_logits, activation_mask
+
+class TinyOnnMoE(nn.Module):
     def __init__(self, config: TinyOnnConfig):
-        super().__init__(config)
+        super().__init__()
+        self.config = config
         self.num_experts = config.num_experts_per_layer
+        self.experts = nn.ModuleList([TinyOnnExpert(config) for _ in range(self.num_experts)])
         self.gate = TinyOnnGate(config)
-        self.experts = nn.ModuleList(
-            [TinyOnnExpert(config) for _ in range(self.num_experts)]
-        )
-        self.register_buffer("routing_records", torch.zeros(self.num_experts, dtype=torch.long))
 
-    def reset_routing_records(self):
-        self.routing_records.zero_()
+    def forward(self, hidden_states: torch.Tensor):
+        B, T, C = hidden_states.shape
+        flat_hs = hidden_states.view(-1, C)
 
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        surprise_cache: list[dict] | None = None,
-        layer_idx: int = -1,
-        ignored_experts: set[int] | None = None,
-    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        batch_size, sequence_length, hidden_dim = hidden_states.shape
-        flat_hidden_states = hidden_states.view(-1, hidden_dim)
+        routing_weights, pre_act_logits, activation_mask = self.gate(flat_hs)
+        token_indices, expert_indices = torch.where(activation_mask > 0)
 
-        raw_logits, scaled_logits, activated_scores = self.gate(flat_hidden_states)
-        routing_mask = (activated_scores > 0).bool()
+        full_expert_outputs = torch.zeros(B * T, self.num_experts, C, device=hidden_states.device, dtype=hidden_states.dtype)
 
-        if self.training:
-            self.routing_records.add_(routing_mask.sum(dim=0).to(self.routing_records.device))
+        if token_indices.numel() > 0:
+            dispatched_outputs = torch.empty_like(flat_hs[token_indices])
+            for i in range(self.num_experts):
+                if (mask := expert_indices == i).any():
+                    dispatched_outputs[mask] = self.experts[i](flat_hs[token_indices][mask])
+            full_expert_outputs.index_put_((token_indices, expert_indices), dispatched_outputs)
 
-        if ignored_experts:
-            for expert_idx in ignored_experts:
-                routing_mask[:, expert_idx] = False
+        final_output = torch.einsum('te,tec->tc', routing_weights, full_expert_outputs).view(B, T, C)
 
-        k_per_token = routing_mask.sum(dim=-1)
-        if torch.any(k_per_token == 0):
-            fallback_mask = F.one_hot(raw_logits[k_per_token == 0].argmax(dim=-1), num_classes=self.num_experts).bool()
-            routing_mask[k_per_token == 0] = fallback_mask
-
-        ste_scores = GateSTE.apply(activated_scores)
-        masked_scores = torch.where(routing_mask, ste_scores, torch.tensor(float('-inf'), device=ste_scores.device, dtype=ste_scores.dtype))
-        routing_weights = F.softmax(masked_scores, dim=-1, dtype=torch.float).to(hidden_states.dtype)
-
-        aux_output = {
-            "raw_logits": raw_logits.clone().detach(),
-            "activated_scores": activated_scores,
-            "routing_weights": routing_weights.clone().detach(),
+        aux_outputs = {
+            "full_expert_outputs": full_expert_outputs,
+            "pre_act_logits": pre_act_logits,
+            "activation_mask": activation_mask,
         }
-
-        final_hidden_states = torch.zeros_like(flat_hidden_states)
-        token_indices, expert_indices = torch.where(routing_mask)
-
-        for i in range(self.num_experts):
-            expert_mask = (expert_indices == i)
-            tokens_for_this_expert = token_indices[expert_mask]
-
-            if tokens_for_this_expert.numel() == 0:
-                continue
-
-            h_states_for_expert = flat_hidden_states[tokens_for_this_expert]
-
-            if self.training and surprise_cache is not None and h_states_for_expert.requires_grad:
-                h_states_for_expert.register_hook(_create_sparse_hook(surprise_cache, layer_idx, i, tokens_for_this_expert))
-
-            expert_output = self.experts[i](h_states_for_expert)
-            weights_for_expert = routing_weights[tokens_for_this_expert, i].unsqueeze(1)
-
-            weighted_output = expert_output * weights_for_expert
-            final_hidden_states.index_add_(0, tokens_for_this_expert, weighted_output)
-
-        return final_hidden_states.view(batch_size, sequence_length, hidden_dim), aux_output
+        return final_output, aux_outputs
 
 
-class TinyOnnDecoderLayer(Qwen3DecoderLayer):
-    def __init__(self, config: TinyOnnConfig, layer_idx: int):
-        super().__init__(config, layer_idx)
+class TinyOnnDecoderLayer(nn.Module):
+    def __init__(self, config: TinyOnnConfig):
+        super().__init__()
+        self.self_attn = TinyOnnAttention(config)
         self.mlp = TinyOnnMoE(config)
-        self.layer_idx = layer_idx
+        self.input_layernorm = nn.LayerNorm(config.hidden_size)
+        self.post_attention_layernorm = nn.LayerNorm(config.hidden_size)
 
-    def forward(self, *args, **kwargs):
-        aux_outputs_list = kwargs.get("aux_outputs_list")
-        hidden_states_cache = kwargs.get("hidden_states_cache")
+    def forward(self, hidden_states: torch.Tensor, attention_mask: torch.Tensor | None = None):
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
 
-        residual = args[0]
-        hidden_states = self.input_layernorm(args[0])
+        attn_output, attn_aux = self.self_attn(hidden_states, attention_mask=attention_mask)
 
-        attn_outputs = self.self_attn(hidden_states, *args[1:], **kwargs)
-        hidden_states = attn_outputs[0]
-        hidden_states = residual + hidden_states
+        hidden_states = residual + attn_output
 
         residual = hidden_states
-        hidden_states_pre_mlp = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.post_attention_layernorm(hidden_states)
 
-        if hidden_states_cache is not None:
-            hidden_states_cache.append(hidden_states_pre_mlp.clone().detach())
-
-        ignored_experts = kwargs.get("ignored_experts")
-        layer_ignored_experts = ignored_experts.get(self.layer_idx) if ignored_experts else None
-
-        surprise_cache = kwargs.get("surprise_cache")
-        mlp_output, aux_output = self.mlp(
-            hidden_states_pre_mlp,
-            surprise_cache=surprise_cache,
-            layer_idx=self.layer_idx,
-            ignored_experts=layer_ignored_experts,
-        )
-
-        if aux_outputs_list is not None:
-            aux_outputs_list.append({k: v.clone().detach() for k, v in aux_output.items()})
+        mlp_output, moe_aux = self.mlp(hidden_states)
 
         hidden_states = residual + mlp_output
-        outputs = (hidden_states,) + attn_outputs[1:]
-        return outputs
 
+        aux_outputs = {"attn": attn_aux, "moe": moe_aux}
+        return hidden_states, aux_outputs
 
-class TinyOnnModel(Qwen3Model):
+class TinyOnnModel(PreTrainedModel):
+    config_class = TinyOnnConfig
+
     def __init__(self, config: TinyOnnConfig):
         super().__init__(config)
-        self.layers = nn.ModuleList(
-            [TinyOnnDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
-        )
-        self.post_init()
+        self.padding_idx = -1
+        self.vocab_size = config.vocab_size
 
-    def forward(self, *args, **kwargs) -> tuple[torch.Tensor, list[dict[str, torch.Tensor]]]:
-        aux_outputs_list: list[dict[str, torch.Tensor]] = []
-        kwargs["aux_outputs_list"] = aux_outputs_list
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
+        self.layers = nn.ModuleList([TinyOnnDecoderLayer(config) for _ in range(config.num_hidden_layers)])
+        self.norm = nn.LayerNorm(config.hidden_size)
 
-        hidden_states = super().forward(*args, **kwargs)[0]
+    def forward(self, input_ids: torch.LongTensor, attention_mask: torch.Tensor | None = None):
+        hidden_states = self.embed_tokens(input_ids)
 
-        return hidden_states, aux_outputs_list
+        if attention_mask is None:
+            B, T = input_ids.shape
+            padding = (self.config.selection_block_size - T % self.config.selection_block_size) % self.config.selection_block_size
+            padded_T = T + padding
+            attention_mask = torch.tril(torch.ones(padded_T, padded_T, device=hidden_states.device)).view(1, 1, padded_T, padded_T).bool()
 
+        all_aux_outputs = []
+        for decoder_layer in self.layers:
+            hidden_states, aux_outputs = decoder_layer(hidden_states, attention_mask)
+            all_aux_outputs.append(aux_outputs)
 
-class TinyOnnForCausalLM(Qwen3ForCausalLM):
+        hidden_states = self.norm(hidden_states)
+        return hidden_states, all_aux_outputs
+
+class TinyOnnForCausalLM(PreTrainedModel):
     config_class = TinyOnnConfig
 
     def __init__(self, config: TinyOnnConfig):
         super().__init__(config)
         self.model = TinyOnnModel(config)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-        self.post_init()
 
-    def forward(self, *args, **kwargs) -> CausalLMOutputWithAux:
-        hidden_states, aux_outputs = self.model(*args, **kwargs)
+    def get_input_embeddings(self):
+        return self.model.embed_tokens
+
+    def set_input_embeddings(self, value):
+        self.model.embed_tokens = value
+
+    def forward(self, input_ids: torch.LongTensor, attention_mask: torch.Tensor | None = None, **kwargs):
+        hidden_states, aux_outputs = self.model(input_ids=input_ids, attention_mask=attention_mask)
         logits = self.lm_head(hidden_states)
 
         return CausalLMOutputWithAux(

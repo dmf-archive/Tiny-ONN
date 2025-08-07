@@ -25,8 +25,8 @@ class STEFunction(torch.autograd.Function):
 class Config(PretrainedConfig):
     model_type = "unified_hybrid_loss_poc"
     hidden_size: int = 32
-    intermediate_size: int = 128
-    num_experts: int = 32
+    intermediate_size: int = 64
+    num_experts: int = 64
     vocab_size: int = 50257
     num_attention_heads: int = 4
     max_seq_len: int = 256
@@ -195,6 +195,18 @@ def apply_gradient_filtering(model: nn.Module):
         if param.grad is not None:
             param.grad.data[param.grad.data > threshold] = 0.0
 
+def log_gradient_stats(model: nn.Module):
+    print("\n--- Gradient Stats ---")
+    stats = {}
+    for name, param in model.named_parameters():
+        if param.grad is not None:
+            grad_norm = param.grad.data.norm(2).item()
+            stats[name] = grad_norm
+    
+    for name, norm in sorted(stats.items(), key=lambda item: item[1], reverse=True):
+        print(f"{name:<50} | norm: {norm:.4e}")
+    print("----------------------")
+
 def main():
     config = Config()
     model = DynamicMoEModel(config).to(DEVICE, dtype=DTYPE)
@@ -214,7 +226,7 @@ def main():
         pbar = tqdm(data, desc=f"Epoch {epoch+1}/{config.epochs}")
         total_main_loss, total_gating_loss, total_main_acc, total_avg_k, total_gate_acc = 0.0, 0.0, 0.0, 0.0, 0.0
 
-        for item in pbar:
+        for item_idx, item in enumerate(pbar):
             optimizer.zero_grad()
 
             user_content = next((msg['content'] for msg in item['messages'] if msg['role'] == 'user'), "")
@@ -243,6 +255,9 @@ def main():
             combined_loss.backward()
 
             apply_gradient_filtering(model)
+
+            if item_idx % 20 == 0: # Log gradients every 20 steps
+                log_gradient_stats(model)
 
             optimizer.step()
 
