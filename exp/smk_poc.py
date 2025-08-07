@@ -1,12 +1,13 @@
 import json
+import random
 from dataclasses import dataclass
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import AdamW
 from tqdm import tqdm
 from transformers import AutoTokenizer, PretrainedConfig
-import random
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 DTYPE = torch.bfloat16
@@ -55,7 +56,7 @@ class DynamicGate(nn.Module):
         logits = torch.matmul(F.normalize(x, dim=-1), F.normalize(self.sim_matrix, dim=0))
         gate_thresholds = torch.sigmoid(self.gates)
         pre_activation_logits = logits - gate_thresholds
-        
+
         gated_logits = F.relu(pre_activation_logits)
         activation_mask = STEFunction.apply(gated_logits)
 
@@ -66,10 +67,10 @@ class DynamicGate(nn.Module):
             topk_expert_indices = torch.topk(logits[inactive_tokens_mask], k=k_fallback, dim=1).indices
             for i, idx in enumerate(torch.where(inactive_tokens_mask)[0]):
                 activation_mask[idx, topk_expert_indices[i]] = 1.0
-        
+
         gated_logits_masked = torch.where(activation_mask > 0, gated_logits, -torch.finfo(DTYPE).max)
         active_expert_probs = F.softmax(gated_logits_masked, dim=-1)
-        
+
         return active_expert_probs, pre_activation_logits, activation_mask
 
 class DynamicMoELayer(nn.Module):
@@ -83,7 +84,7 @@ class DynamicMoELayer(nn.Module):
         num_tokens, C = hidden_states.shape
         routing_weights, pre_act_logits, activation_mask = self.gate(hidden_states)
         token_indices, expert_indices = torch.where(activation_mask > 0)
-        
+
         full_expert_outputs = torch.zeros(num_tokens, self.num_experts, C, device=DEVICE, dtype=DTYPE)
 
         if token_indices.numel() > 0:
@@ -159,21 +160,21 @@ def get_hybrid_gating_loss(main_loss, full_expert_outputs, pre_act_logits, confi
     grad_matrix, = torch.autograd.grad(main_loss, full_expert_outputs, retain_graph=True, allow_unused=True)
     if grad_matrix is None:
         return torch.tensor(0.0, device=DEVICE), torch.zeros_like(pre_act_logits)
-        
+
     surprise_matrix = torch.linalg.norm(grad_matrix.float(), dim=-1)
-    
+
     # Cross Entropy (Hard Target)
     with torch.no_grad():
         target_indices = torch.argmin(surprise_matrix, dim=-1)
     ce_loss = F.cross_entropy(pre_act_logits, target_indices)
-    
+
     # KL Divergence (Soft Target)
     log_target_dist = F.log_softmax(-surprise_matrix, dim=-1)
     log_gate_dist = F.log_softmax(pre_act_logits, dim=-1)
     kl_loss = F.kl_div(log_gate_dist, log_target_dist, reduction='batchmean', log_target=True)
-    
+
     combined_loss = config.w_ce * ce_loss + config.w_kl * kl_loss
-    
+
     return combined_loss, surprise_matrix
 
 def apply_gradient_filtering(model: nn.Module):
@@ -181,7 +182,7 @@ def apply_gradient_filtering(model: nn.Module):
     for param in model.moe.experts.parameters():
         if param.grad is not None:
             expert_grads.append(param.grad.view(-1))
-    
+
     if not expert_grads:
         return
 
@@ -206,16 +207,16 @@ def main():
     model.embedding = nn.Embedding(config.vocab_size, config.hidden_size).to(DEVICE, dtype=DTYPE)
     model.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False).to(DEVICE, dtype=DTYPE)
 
-    with open("data/dummy_chat_data.jsonl", "r", encoding="utf-8") as f:
+    with open("data/dummy_chat_data.jsonl", encoding="utf-8") as f:
         data = [json.loads(line) for line in f]
-        
+
     for epoch in range(config.epochs):
         pbar = tqdm(data, desc=f"Epoch {epoch+1}/{config.epochs}")
         total_main_loss, total_gating_loss, total_main_acc, total_avg_k, total_gate_acc = 0.0, 0.0, 0.0, 0.0, 0.0
-        
+
         for item in pbar:
             optimizer.zero_grad()
-            
+
             user_content = next((msg['content'] for msg in item['messages'] if msg['role'] == 'user'), "")
             assistant_content = next((msg['content'] for msg in item['messages'] if msg['role'] == 'assistant'), "")
             prompt = f"user: {user_content}\nassistant: "
@@ -229,18 +230,18 @@ def main():
             labels[labels == tokenizer.pad_token_id] = -100
 
             logits, full_expert_outputs, pre_act_logits, act_mask = model(input_ids)
-            
+
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
-            
+
             main_loss = F.cross_entropy(shift_logits.view(-1, config.vocab_size), shift_labels.view(-1), ignore_index=-100)
             if torch.isnan(main_loss): continue
-            
+
             gating_loss, surprise_matrix = get_hybrid_gating_loss(main_loss, full_expert_outputs, pre_act_logits, config)
-            
+
             combined_loss = main_loss + config.w_aux * gating_loss
             combined_loss.backward()
-            
+
             apply_gradient_filtering(model)
 
             optimizer.step()
@@ -249,7 +250,7 @@ def main():
                 main_acc = (shift_logits.argmax(dim=-1) == shift_labels).float().mean()
                 avg_k = torch.sum(act_mask) / act_mask.shape[0]
                 gate_acc = (pre_act_logits.argmax(dim=-1) == surprise_matrix.argmin(dim=-1)).float().mean()
-            
+
             total_main_loss += main_loss.item()
             total_gating_loss += gating_loss.item()
             total_main_acc += main_acc.item()
@@ -269,9 +270,9 @@ def main():
         avg_k = total_avg_k / len(data)
         avg_gate_acc = total_gate_acc / len(data)
         print(f"Epoch Summary: Avg Main Loss: {avg_main_loss:.3f}, Avg Gate Loss: {avg_gating_loss:.3f}, Avg Main Acc: {avg_main_acc:.2f}, Avg Gate Acc: {avg_gate_acc:.2f}, Avg K: {avg_k:.2f}")
-        
+
         print(f"Gate thresholds (sigmoid): {torch.sigmoid(model.moe.gate.gates).data.float().cpu().numpy()}")
-        
+
         sample_item = random.choice(data)
         user_content = next((msg['content'] for msg in sample_item['messages'] if msg['role'] == 'user'), "")
         prompt = f"user: {user_content}\nassistant: "
