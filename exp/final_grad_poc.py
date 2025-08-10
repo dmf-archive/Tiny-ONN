@@ -1,141 +1,135 @@
-from dataclasses import dataclass
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from einops import rearrange
+from typing import Tuple
 
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 DTYPE = torch.bfloat16
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+VOCAB_SIZE = 512
+HIDDEN_SIZE = 128
+NUM_HEADS = 8
+HEAD_DIM = HIDDEN_SIZE // NUM_HEADS
+SEQ_LEN = 64
+BATCH_SIZE = 4
 
-@dataclass
-class MoELayerMetrics:
-    activations: torch.Tensor       # Dense tensor [N, E]
-    surprises: torch.Tensor         # Sparse COO tensor [N, E]
-
-class TinyExpert(nn.Module):
-    def __init__(self, hidden_size: int, intermediate_size: int):
+class GatedMHALayer(nn.Module):
+    def __init__(self):
         super().__init__()
-        self.w1 = nn.Linear(hidden_size, intermediate_size, bias=False)
-        self.w2 = nn.Linear(intermediate_size, hidden_size, bias=False)
+        self.q_proj = nn.Linear(HIDDEN_SIZE, NUM_HEADS * HEAD_DIM, bias=False)
+        self.k_proj = nn.Linear(HIDDEN_SIZE, NUM_HEADS * HEAD_DIM, bias=False)
+        self.v_proj = nn.Linear(HIDDEN_SIZE, NUM_HEADS * HEAD_DIM, bias=False)
+        self.o_proj = nn.Linear(NUM_HEADS * HEAD_DIM, HIDDEN_SIZE, bias=False)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.w2(F.gelu(self.w1(x)))
-
-class MoELayer(nn.Module):
-    def __init__(self, num_experts: int, hidden_size: int, intermediate_size: int, top_k: int):
-        super().__init__()
-        self.num_experts = num_experts
-        self.top_k = top_k
-        self.experts = nn.ModuleList([TinyExpert(hidden_size, intermediate_size) for _ in range(num_experts)])
-        self.gate = nn.Linear(hidden_size, num_experts, bias=False)
-
-    def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    def forward(self, hidden_states: torch.Tensor, routing_weights: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         B, T, C = hidden_states.shape
-        flat_hidden_states = hidden_states.view(-1, C)
-        num_tokens = flat_hidden_states.shape[0]
+        
+        q = self.q_proj(hidden_states)
+        k = self.k_proj(hidden_states)
+        v = self.v_proj(hidden_states)
 
-        router_logits = self.gate(flat_hidden_states)
-        routing_weights, selected_experts = torch.topk(router_logits, self.top_k, dim=-1)
-        routing_weights = F.softmax(routing_weights, dim=-1, dtype=torch.float).to(DTYPE)
+        q = rearrange(q, 'b t (h d) -> b h t d', h=NUM_HEADS)
+        k = rearrange(k, 'b t (h d) -> b h t d', h=NUM_HEADS)
+        v = rearrange(v, 'b t (h d) -> b h t d', h=NUM_HEADS)
+        
+        all_head_outputs = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        
+        weighted_output = all_head_outputs * routing_weights.view(B, NUM_HEADS, 1, 1)
 
-        full_expert_outputs = torch.zeros(num_tokens, self.num_experts, C, device=DEVICE, dtype=DTYPE)
+        combined_heads = rearrange(weighted_output, 'b h t d -> b t (h d)')
+        final_output = self.o_proj(combined_heads)
+        
+        return final_output, all_head_outputs
 
-        for i in range(num_tokens):
-            for k in range(self.top_k):
-                expert_idx = selected_experts[i, k].item()
-                expert_input = flat_hidden_states[i:i+1]
-                full_expert_outputs[i, expert_idx, :] = self.experts[expert_idx](expert_input)
-
-        selected_expert_outputs = torch.gather(full_expert_outputs, 1, selected_experts.unsqueeze(-1).expand(-1, -1, C))
-        final_output = torch.bmm(routing_weights.unsqueeze(1), selected_expert_outputs).squeeze(1)
-
-        return final_output.view(B, T, C), full_expert_outputs, router_logits, selected_experts
-
-class DoubleMoEModel(nn.Module):
-    def __init__(self, num_experts: int, hidden_size: int, intermediate_size: int, top_k: int):
+class SimpleTransformer(nn.Module):
+    def __init__(self):
         super().__init__()
-        self.moe1 = MoELayer(num_experts, hidden_size, intermediate_size, top_k)
-        self.ln = nn.LayerNorm(hidden_size)
-        self.moe2 = MoELayer(num_experts, hidden_size, intermediate_size, top_k)
+        self.embedding = nn.Embedding(VOCAB_SIZE, HIDDEN_SIZE)
+        self.attn = GatedMHALayer()
+        self.lm_head = nn.Linear(HIDDEN_SIZE, VOCAB_SIZE, bias=False)
 
-    def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, list[torch.Tensor], list[torch.Tensor], list[torch.Tensor]]:
-        h1, out1, logits1, experts1 = self.moe1(hidden_states)
-        h_res = hidden_states + h1
-
-        h2, out2, logits2, experts2 = self.moe2(self.ln(h_res))
-
-        return h_res + h2, [out1, out2], [logits1, logits2], [experts1, experts2]
-
-def get_moe_metrics(loss: torch.Tensor, full_expert_outputs_list: list[torch.Tensor], router_logits_list: list[torch.Tensor]) -> list[MoELayerMetrics]:
-    grad_matrices = torch.autograd.grad(loss, full_expert_outputs_list, allow_unused=False)
-
-    metrics_list = []
-    for grads, logits in zip(grad_matrices, router_logits_list, strict=False):
-        surprise_matrix_dense = torch.linalg.norm(grads.float(), dim=-1)
-        activation_matrix = torch.softmax(logits, dim=-1)
-
-        sparse_indices = torch.nonzero(surprise_matrix_dense).t()
-        sparse_values = surprise_matrix_dense[sparse_indices[0], sparse_indices[1]]
-
-        surprise_sparse_coo = torch.sparse_coo_tensor(
-            sparse_indices, sparse_values, surprise_matrix_dense.size()
-        )
-
-        metrics_list.append(MoELayerMetrics(
-            activations=activation_matrix,
-            surprises=surprise_sparse_coo.coalesce()
-        ))
-
-    return metrics_list
+    def forward(self, input_ids: torch.Tensor, routing_weights: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        hidden_states = self.embedding(input_ids)
+        attn_output, all_head_outputs = self.attn(hidden_states, routing_weights)
+        logits = self.lm_head(attn_output)
+        return logits, all_head_outputs
 
 def main():
-    print("--- Final PoC: Verifying Sparse Tensor Metrics Structure ---")
+    print(f"Running on device: {DEVICE}")
 
-    NUM_EXPERTS = 8; HIDDEN_SIZE = 16; INTERMEDIATE_SIZE = 32; BATCH_SIZE = 4; SEQ_LEN = 10; TOP_K = 2
-    TOTAL_TOKENS = BATCH_SIZE * SEQ_LEN
+    model = SimpleTransformer().to(DEVICE, dtype=DTYPE)
+    input_ids = torch.randint(0, VOCAB_SIZE, (BATCH_SIZE, SEQ_LEN), device=DEVICE)
+    labels = torch.randint(0, VOCAB_SIZE, (BATCH_SIZE, SEQ_LEN), device=DEVICE)
 
-    model = DoubleMoEModel(NUM_EXPERTS, HIDDEN_SIZE, INTERMEDIATE_SIZE, TOP_K).to(DEVICE, dtype=DTYPE)
-    hidden_states = torch.randn(BATCH_SIZE, SEQ_LEN, HIDDEN_SIZE, device=DEVICE, dtype=DTYPE)
-    labels = torch.randn(BATCH_SIZE, SEQ_LEN, HIDDEN_SIZE, device=DEVICE, dtype=DTYPE)
+    activation_mask = torch.zeros(BATCH_SIZE, NUM_HEADS, device=DEVICE, dtype=DTYPE)
+    activation_mask[0, 0] = 1
+    activation_mask[0, 3] = 1
+    activation_mask[1, 1] = 1
+    activation_mask[1, 2] = 1
+    activation_mask[1, 5] = 1
+    activation_mask[2, :] = 1 
+    activation_mask[3, 4] = 1
+    print("--- Activation Mask (used as routing_weights) ---")
+    print(activation_mask)
+    print("-------------------------------------------------\n")
 
-    final_output, full_expert_outputs_list, router_logits_list, selected_experts_list = model(hidden_states)
-    loss = F.mse_loss(final_output, labels)
+    logits, all_head_outputs = model(input_ids, activation_mask)
+    all_head_outputs.requires_grad_(True)
+    
+    loss = F.cross_entropy(logits.view(-1, VOCAB_SIZE), labels.view(-1))
+    print(f"Loss: {loss.item():.4f}")
 
-    print("\n1. Capturing MoE Metrics...")
-    moe_metrics_list = get_moe_metrics(loss, full_expert_outputs_list, router_logits_list)
-    print("   Done.")
+    print("\nAttempting to capture gradient for 'all_head_outputs'...")
+    
+    try:
+        head_grads, = torch.autograd.grad(
+            outputs=loss,
+            inputs=all_head_outputs,
+            retain_graph=True,
+            allow_unused=False
+        )
+    except RuntimeError as e:
+        print(f"\n❌ Gradient capture FAILED with RuntimeError:")
+        print(e)
+        return
 
-    print("\n2. Verifying all metrics...")
-    for i, (metrics, selected_experts) in enumerate(zip(moe_metrics_list, selected_experts_list, strict=False)):
-        print(f"\n--- Verifying Layer {i+1} ---")
+    print("✅ Gradient capture SUCCEEDED!")
+    print(f"Gradient shape: {head_grads.shape}")
+    print(f"Gradient norm: {head_grads.norm().item():.4f}")
+    
+    print("\n--- Per-Head Gradient Norms Analysis ---")
+    all_correct = True
+    for b in range(BATCH_SIZE):
+        print(f"  Batch {b}:")
+        for h in range(NUM_HEADS):
+            norm = head_grads[b, h].norm().item()
+            is_active = activation_mask[b, h].item() > 0
+            
+            status = ""
+            correct = False
+            if is_active and norm > 1e-9:
+                status = "✅ CORRECT (Active, Grad > 0)"
+                correct = True
+            elif not is_active and norm < 1e-9:
+                status = "✅ CORRECT (Inactive, Grad == 0)"
+                correct = True
+            elif is_active and norm < 1e-9:
+                status = "❌ WRONG (Active, Grad == 0)"
+            else: # not is_active and norm > 0
+                status = "❌ WRONG (Inactive, Grad > 0)"
+            
+            if not correct:
+                all_correct = False
 
-        # Check shapes
-        print(f"   Activations shape: {metrics.activations.shape} (Expected: [{TOTAL_TOKENS}, {NUM_EXPERTS}])")
-        assert metrics.activations.shape == (TOTAL_TOKENS, NUM_EXPERTS)
-        print(f"   Sparse Surprises shape: {metrics.surprises.shape} (Expected: [{TOTAL_TOKENS}, {NUM_EXPERTS}])")
-        assert metrics.surprises.shape == (TOTAL_TOKENS, NUM_EXPERTS)
+            print(f"    Head {h}: Active={is_active}, Norm={norm:.4e} -> {status}")
+    
+    print("\n------------------------------------------")
+    if all_correct:
+        print("✅ SUCCESS: Gradient sparsity matches activation mask.")
+    else:
+        print("❌ FAILURE: Gradient sparsity does not match activation mask.")
+    print("------------------------------------------")
 
-        # Verify correspondence
-        surprise_indices = metrics.surprises.indices()
-        num_non_zero = surprise_indices.shape[1]
-
-        print(f"   Non-zero surprise values: {num_non_zero} (Expected: {TOTAL_TOKENS * TOP_K})")
-        assert num_non_zero == TOTAL_TOKENS * TOP_K
-
-        # Check a random token's indices
-        random_token_idx = torch.randint(0, TOTAL_TOKENS, (1,)).item()
-        expected_experts = selected_experts[random_token_idx].sort().values
-
-        actual_experts_mask = surprise_indices[0, :] == random_token_idx
-        actual_experts = surprise_indices[1, actual_experts_mask].sort().values
-
-        correspondence_ok = torch.equal(expected_experts, actual_experts)
-        print(f"   Token {random_token_idx} correspondence check: {'OK' if correspondence_ok else 'FAIL'}")
-
-        if correspondence_ok:
-            print(f"   ✅ SUCCESS: Layer {i+1} sparse metrics are correct and verifiable.")
-        else:
-            print(f"   ❌ FAILURE: Layer {i+1} has a mismatch in sparse indices.")
 
 if __name__ == "__main__":
     main()

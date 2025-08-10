@@ -105,7 +105,7 @@ class TinyOnnAttention(nn.Module):
         max_entropy = torch.log(torch.tensor(num_blocks, device=hidden_states.device))
         normalized_entropy = entropy / (max_entropy + 1e-9)
 
-        k_logit = self.k_scale * normalized_entropy + self.k_bias
+        k_logit = self.k_scale * normalized_entropy.detach() + self.k_bias
         k_ratio = torch.sigmoid(k_logit)
         dynamic_k = torch.clamp(self.config.max_selected_blocks * k_ratio, min=1, max=self.config.max_selected_blocks).long()
         avg_k = dynamic_k.float().mean()
