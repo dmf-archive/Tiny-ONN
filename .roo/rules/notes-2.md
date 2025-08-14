@@ -1,47 +1,68 @@
-# DynNSA v2: DynNSAv2 架构与实现备忘录
+# DynNSA: 动态原生稀疏注意力架构备忘录 (v1)
 
-## 1. 核心教训：从 DynNSA v1 的失败中学习
+## 1. 核心思想：结构化稀疏与内容驱动稀疏的融合
 
-我们之前在 `exp/DynNSA` 中的 PoC (v1) 犯了一个灾难性的错误：**它在实现上完全曲解了 `Native Sparse Attention` 的核心思想，导致了一个功能残缺、理论错误的“怪胎”**。
+本架构旨在将 **Native Sparse Attention (NSA)** 的多策略、结构化稀疏框架，与我们自研的 **DynSMHA** 的非结构化、内容驱动的专家选择机制进行深度融合。其核心思想是，将 `DynSMHA` 作为一个更强大、更灵活的**动态稀疏注意力策略**，去**取代** `NSA` 中原有的、基于静态 top-k 的“精细选择（Fine）”策略。
 
-未来的 AI Agent 必须从这个失败中吸取教训，**严禁任何形式的偷工减料**。
+通过这种方式，我们创建了一个统一的注意力层，它能够同时利用：
 
-### 1.1. `Native Sparse Attention` 的正确实现
+1. **结构化先验**: 通过固定的滑动窗口和全局压缩，高效处理局部信息和全局上下文。
+2. **内容动态选择**: 通过 `DynSMHA` 机制，根据输入内容的语义，自适应地选择和组合一组专门化的“专家”注意力头，以处理非结构化的、长距离的依赖关系。
 
-`Native Sparse Attention` 的核心思想，是一种**由粗到精 (Coarse-to-Fine)** 的、两阶段的注意力计算过程：
+## 2. `DynNSA` (v1): 最终架构
 
-1. **阶段一：全局压缩与重要性评分 (Coarse Graining & Scoring)**
+```mermaid
+graph TD
+    subgraph "输入"
+        IN[hidden_states (B,T,D)] --> NORM[LayerNorm]
+    end
 
-   - 首先，通过一个**廉价的**压缩网络（如 `Unfold` + `MLP`），将输入的 K 和 V 压缩成一个低分辨率的、全局的缓存 `ck` 和 `cv`。
-   - 然后，用全尺寸的 Q 与这个低分辨率的 `ck` 计算相似度 `csim`。这个 `csim` 本质上是一个**重要性分数图**，它以极低的计算成本，告诉了我们序列中的哪些区域（块）对于当前的查询是重要的。
+    subgraph "DynNSA Layer"
+        subgraph "策略 1: 滑动窗口注意力 (Sliding)"
+            NORM --> S_ATTN["LocalAttention"] --> S_OUT[sliding_output]
+        end
 
-2. **阶段二：精细注意力 (Fine-grained Attention)**
-   - 根据 `csim` 这个重要性分数图，使用 `top-k` 算法，为每个查询**动态地选择**出最重要的 `k` 个块。
-   - 最后，只在这些被选中的、高重要性的块上，执行**全尺寸的、昂贵的**注意力计算。
+        subgraph "策略 2: 全局压缩注意力 (Compressed)"
+            NORM --> C_ATTN["Compression + Attention"] --> C_OUT[compressed_output]
+            C_ATTN -- "importance_scores (q @ ck^T)" --> D_ATTN
+        end
 
-### 1.2. `DynNSA` v1 的致命缺陷
+        subgraph "策略 3: 动态专家注意力 (DynSMHA)"
+            NORM --> D_ATTN["DynSMHALayer"] --> D_OUT[dynsmha_output]
+        end
 
-我们 PoC 中的 `DynamicSparseAttention`，虽然也叫三重注意力，但**完全没有实现上述的“由粗到精”**。它的“精细注意力”是一个**伪概念**：它是在一个**稠密的、全尺寸的**注意力矩阵上，用一个由**外部的、不相关的** `dynamic_k` 信号生成的掩码来进行强制稀疏化。
+        subgraph "最终组合"
+            S_OUT & C_OUT & D_OUT --> STACK[Stack Outputs (3,B,H,T,D_h)]
+            NORM --> COMBINE_GATE["to_strategy_combine MLP"] -- weights (B,H,T,3) --> EINSUM
+            STACK -- "einsum" --> EINSUM[Weighted Sum] --> MERGE[Merge Heads]
+        end
+    end
 
-这导致了两个致命问题：
+    subgraph "输出"
+        MERGE --> FINAL_OUT[final_output]
+    end
+```
 
-1. **计算效率低下**: 它没有节省任何计算量，因为它依然计算了完整的 `(N, N)` 注意力矩阵。
-2. **学习机制失效**: `dynamic_k` 的学习信号（无论是 MSE 回归还是 Gumbel-Softmax），与注意力计算本身完全脱钩，导致了我们观察到的所有梯度消失和模型收敛失败的问题。
+### 3. 实现准则 (SOP)
 
-## 2. `DynNSA` v2: 最终架构
+1. **三策略并行**: 整个 `DynNSALayer` 必须并行计算三个独立的注意力策略分支：
+    - **Sliding**: 直接使用 `local-attention` 库实现。
+    - **Compressed**: 借鉴 `native-sparse-attention` 的实现，包括 `k,v` 的压缩窗口和压缩 MLP。
+    - **DynSMHA**: 使用我们已在 `exp/dyn_smha_poc` 中验证的、基于熵亲和度和动态投影的 `DynSMHALayer` 实现。
 
-为了拨乱反正，我们设计了 `DynNSAv2`，这才是我们项目中**唯一、正确**的动态稀疏注意力实现。它深度融合了 `Native Sparse Attention` 的先进思想和我们项目独特的 FEP/Surprise 驱动理论。
+2. **信号共享 (核心机制)**:
+    - `Compressed` 策略分支计算出的**重要性分数** (`csim`, 即 `q @ ck^T`) **必须**被用作 `DynSMHA` 策略分支中**门控网络的内容信号源**。
+    - 这将取代 `DynSMHA` 原本基于 `softmax(QK^T)` 的熵计算，为其提供一个更稳定、更具全局视野的路由信号。
 
-### 2.1. 核心思想
+3. **动态策略组合**:
+    - 必须复用 `native-sparse-attention` 中的 `to_strategy_combine` 模块（一个作用于输入的 `nn.Linear` + `nn.Sigmoid`）。
+    - 该模块的输出将作为权重，通过 `torch.einsum` 对三个策略分支的输出进行动态加权求和。
 
-1. **注意力头即专家 (Attention Head as an Expert)**: 我们不再拥有一个统一的多头注意力模块，而是拥有一个包含 `N` 个**独立的、拥有各自参数**的单头注意力“专家”池。这实现了真正的**架构稀疏性**。
-2. **Surprise 驱动的门控**: 门控网络将根据**两个信号**进行路由决策，这完美地体现了 FEP 的思想：
-   - **自下而上 (Bottom-up)**: 来自当前输入的**证据**（`importance_scores`）。
-   - **自上而下 (Top-down)**: 来自过去经验的**先验**（每个专家头处理信息的“能力”，由 `Surprise` 信号塑造）。
-3. **两阶段计算**: 严格遵循“由粗到精”的原则，用廉价的计算来指导昂贵的计算。
+4. **统一的训练目标**:
+    - **主损失 (`main_loss`)**: 照常计算。
+    - **辅助损失 (`aux_loss`)**: 至少包含来自 `DynSMHA` 分支的 `SurpriseMin` 门控损失。
+    - **可选**: 可以为 `to_strategy_combine` 门控的输出权重引入额外的稀疏性或熵正则化损失，以鼓励策略选择的稀疏性。
 
-### 2.3. 实现准则 (SOP)
-
-1. **严禁偷工减料**: `DynNSAv2` 的实现**必须**包含上述所有核心组件，特别是**两阶段计算**和**双信号门控**。任何对架构的简化都必须经过正式的评审，并记录在案。
-2. **复用 `DynMoE` 逻辑**: 门控机制**必须**复用 `DynMoE` 中已被验证的、基于余弦相似度的**原型路由**和**惊奇最小化路由分布损失**，严禁重造轮子。
-3. **梯度流验证**: 在 PoC 完成后，**必须**通过遥测手段（打印 `.grad`），无可辩驳地证明 `main_loss` 的梯度能够有效地通过被选中的专家头，反向传播到门控网络。
+5. **模块化实现**:
+    - 应创建一个新的 PoC 目录 `exp/dyn_nsa_poc/`。
+    - 在 `model.py` 中，创建一个 `DynNSALayer` 模块，其内部封装 `SlidingAttention`, `CompressedAttention`, 和 `DynSMHALayer` 三个子模块。

@@ -11,8 +11,8 @@ from typing import Dict, List
 from einops import rearrange
 from torch.utils.data import DataLoader, Dataset
 
-from .config import DenseConfig, DynNSAConfig, DEVICE, DTYPE
-from .model import DenseModel, DynNSAv2Model
+from exp.DynNSA.config import DenseConfig, DynNSAConfig, DEVICE, DTYPE
+from exp.DynNSA.model import DenseModel, DynNSAv2Model
 
 class ChatDataset(Dataset):
     def __init__(self, data, tokenizer, max_length):
@@ -70,10 +70,12 @@ class Visualizer:
         plt.close(fig)
 
 def get_hybrid_gating_loss(main_loss, all_head_outputs, pre_act_logits_seq, config, step):
-    if all_head_outputs is None or all_head_outputs.numel() == 0:
-        return torch.tensor(0.0, device=DEVICE), torch.zeros_like(pre_act_logits_seq)
-    
-    grad_matrix, = torch.autograd.grad(main_loss, all_head_outputs, retain_graph=True, allow_unused=False)
+    grad_matrix, = torch.autograd.grad(
+        outputs=main_loss,
+        inputs=all_head_outputs,
+        retain_graph=True,
+        allow_unused=False
+    )
     
     B, H, T, D = grad_matrix.shape
     grad_matrix_flat = rearrange(grad_matrix, 'b h t d -> (b t) h d')
@@ -152,9 +154,23 @@ def main():
             main_loss = F.cross_entropy(shift_logits_nsa.view(-1, dyn_nsa_config.vocab_size), shift_labels, ignore_index=-100)
             
             if not torch.isnan(main_loss):
+                all_head_outputs.requires_grad_(True)
                 gating_loss, surprise_seq = get_hybrid_gating_loss(main_loss, all_head_outputs, pre_act_logits_seq, dyn_nsa_config, global_step)
                 total_loss = main_loss + dyn_nsa_config.w_aux * gating_loss
                 total_loss.backward()
+
+                with torch.no_grad():
+                    params_with_grad = [p for p in dyn_nsa_model.attn.parameters() if p.grad is not None]
+                    if params_with_grad:
+                        all_grads = torch.cat([p.grad.view(-1) for p in params_with_grad])
+                        mean, std = all_grads.mean(), all_grads.std()
+                        upper_bound = mean + 2 * std
+                        lower_bound = mean - 2 * std
+                        for param in params_with_grad:
+                            grad = param.grad.data
+                            outliers = (grad > upper_bound) | (grad < lower_bound)
+                            grad[outliers] = 0.0
+                
                 dyn_nsa_optimizer.step()
 
                 epoch_metrics['dyn_nsa_loss'] += main_loss.item()

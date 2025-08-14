@@ -4,3 +4,6 @@
 [submodule "ref/native-sparse-attention-pytorch"]
 	path = ref/native-sparse-attention-pytorch
 	url = https://github.com/lucidrains/native-sparse-attention-pytorch.git
+[submodule "ref/DCFormer"]
+	path = ref/DCFormer
+	url = https://github.com/Caiyun-AI/DCFormer.git

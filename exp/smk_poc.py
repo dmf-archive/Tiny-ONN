@@ -256,8 +256,6 @@ def main():
 
             apply_gradient_filtering(model)
 
-            if item_idx % 20 == 0: # Log gradients every 20 steps
-                log_gradient_stats(model)
 
             optimizer.step()
 
@@ -285,7 +283,6 @@ def main():
         avg_k = total_avg_k / len(data)
         avg_gate_acc = total_gate_acc / len(data)
         print(f"Epoch Summary: Avg Main Loss: {avg_main_loss:.3f}, Avg Gate Loss: {avg_gating_loss:.3f}, Avg Main Acc: {avg_main_acc:.2f}, Avg Gate Acc: {avg_gate_acc:.2f}, Avg K: {avg_k:.2f}")
-
         print(f"Gate thresholds (sigmoid): {torch.sigmoid(model.moe.gate.gates).data.float().cpu().numpy()}")
 
         sample_item = random.choice(data)
