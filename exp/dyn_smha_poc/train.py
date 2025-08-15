@@ -6,7 +6,6 @@ import json
 from transformers import AutoTokenizer
 import os
 from einops import rearrange
-from tqdm import tqdm
 
 from .config import DynSMHAConfig, DEVICE, DTYPE
 from .model import TinyOnnModel
@@ -35,16 +34,7 @@ class ChatDataset(Dataset):
         labels[labels == self.tokenizer.pad_token_id] = -100
         return input_ids, labels
 
-def get_gating_loss(main_loss: torch.Tensor, all_sha_outputs: torch.Tensor, pre_act_logits: torch.Tensor, config: DynSMHAConfig) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    all_sha_outputs.requires_grad_(True)
-    grad_matrix, = torch.autograd.grad(main_loss, all_sha_outputs, retain_graph=True, allow_unused=True)
-    
-    if grad_matrix is None:
-        return torch.tensor(0.0, device=DEVICE), torch.zeros_like(pre_act_logits), torch.zeros_like(pre_act_logits)
-
-    with torch.no_grad():
-        surprise = torch.linalg.norm(grad_matrix.to(DTYPE).float(), dim=(-1, 1))
-
+def get_gating_loss(surprise: torch.Tensor, pre_act_logits: torch.Tensor, config: DynSMHAConfig) -> tuple[torch.Tensor, torch.Tensor]:
     with torch.no_grad():
         target_indices = torch.argmin(surprise, dim=-1)
     ce_loss = F.cross_entropy(pre_act_logits, target_indices)
@@ -55,7 +45,7 @@ def get_gating_loss(main_loss: torch.Tensor, all_sha_outputs: torch.Tensor, pre_
 
     combined_loss = config.w_ce * ce_loss + config.w_kl * kl_loss
     
-    return combined_loss, surprise, ce_loss
+    return combined_loss, ce_loss
 
 def main():
     config = DynSMHAConfig()
@@ -72,12 +62,11 @@ def main():
     data_loader = DataLoader(dataset, batch_size=config.batch_size, shuffle=True, drop_last=True)
 
     for epoch in range(config.epochs):
-        pbar = tqdm(data_loader, desc=f"Epoch {epoch+1}/{config.epochs}")
-        for i, (input_ids, labels) in enumerate(pbar):
+        for i, (input_ids, labels) in enumerate(data_loader):
             input_ids, labels = input_ids.to(DEVICE), labels.to(DEVICE)
             optimizer.zero_grad()
             
-            final_logits, all_sha_outputs, pre_act_logits, act_mask, fallback_count = model(input_ids)
+            final_logits, all_sha_outputs, pre_act_logits, act_mask, fallback_count, raw_affinity_score = model(input_ids)
             
             main_loss = F.cross_entropy(
                 rearrange(final_logits, 'b t d -> (b t) d'),
@@ -87,10 +76,13 @@ def main():
             
             if torch.isnan(main_loss):
                 continue
-
-            gating_loss, surprise, ce_loss = get_gating_loss(main_loss, all_sha_outputs, pre_act_logits, config)
             
-            total_loss = main_loss + config.w_aux * gating_loss
+            all_sha_outputs.requires_grad_(True)
+            grad_matrix, = torch.autograd.grad(main_loss, all_sha_outputs, retain_graph=True, allow_unused=True)
+            surprise = torch.linalg.norm(grad_matrix.to(DTYPE).float(), dim=(-1, 1)) if grad_matrix is not None else torch.zeros_like(pre_act_logits)
+
+            # Disable gating loss for this experiment
+            total_loss = main_loss
             total_loss.backward()
 
             optimizer.step()
@@ -98,19 +90,25 @@ def main():
             if (i + 1) % 5 == 0:
                 with torch.no_grad():
                     main_acc = (final_logits.argmax(-1) == labels).float().mean().item()
-                    avg_active = act_mask.sum(dim=-1).float().mean().item()
-                    gate_acc = (pre_act_logits.argmax(-1) == surprise.argmin(-1)).float().mean().item()
-                    kl_div = gating_loss.item() - ce_loss.item()
-                    fallback_percent = (fallback_count.float() / config.batch_size) * 100
-
-                    pbar.set_postfix({
-                        "Loss": f"{main_loss.item():.3f}",
-                        "Acc": f"{main_acc:.2%}",
-                        "GateAcc": f"{gate_acc:.2%}",
-                        "AvgK": f"{avg_active:.2f}",
-                        "KL": f"{kl_div:.3f}",
-                        "Fallback": f"{fallback_percent:.1f}%"
-                    })
+                    
+                    # Reshape to (B, T, M) and average over sequence length T
+                    surprise_per_seq = surprise.view(config.batch_size, config.max_seq_len, -1).mean(dim=1)
+                    affinity_per_seq = raw_affinity_score.view(config.batch_size, config.max_seq_len, -1).mean(dim=1)
+                    
+                    # Flatten to (B*M) for correlation calculation
+                    flat_surprise = surprise_per_seq.flatten()
+                    flat_affinity = affinity_per_seq.flatten()
+                    
+                    # We expect affinity (-entropy) to be correlated with -surprise
+                    corr_matrix = torch.corrcoef(torch.stack([-flat_surprise, flat_affinity]))
+                    correlation = corr_matrix[0, 1].item() if not torch.isnan(corr_matrix).any() else 0.0
+                    
+                    log_str = (
+                        f"Epoch {epoch+1}/{config.epochs} | Step {i+1}/{len(data_loader)} | "
+                        f"Loss: {main_loss.item():.3f} | Acc: {main_acc:.2%} | "
+                        f"Corr: {correlation:.3f}"
+                    )
+                    print(log_str)
 
 if __name__ == "__main__":
     main()

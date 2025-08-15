@@ -23,5 +23,5 @@ class DynSMHAConfig:
     # SurpriseMin Loss Weights
     w_aux: float = 1.0
     w_ce: float = 1.0
-    w_kl: float = 1.0
+    w_kl: float = 0.8
     compress_ratio: int = 4
