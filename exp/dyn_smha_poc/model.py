@@ -1,10 +1,12 @@
+from typing import Any, Dict, Tuple
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
-from typing import Tuple
 
-from .config import DynSMHAConfig, DTYPE
+from .config import DTYPE, DynSMHAConfig
+
 
 class STEFunction(torch.autograd.Function):
     @staticmethod
@@ -15,6 +17,7 @@ class STEFunction(torch.autograd.Function):
     def backward(ctx, grad_output):
         return grad_output
 
+
 class SingleHeadAttention(nn.Module):
     def __init__(self, config: DynSMHAConfig):
         super().__init__()
@@ -23,49 +26,54 @@ class SingleHeadAttention(nn.Module):
         self.k_proj = nn.Linear(config.hidden_size, config.head_dim, bias=config.bias, dtype=DTYPE)
         self.v_proj = nn.Linear(config.hidden_size, config.head_dim, bias=config.bias, dtype=DTYPE)
 
-    def forward(self, hidden_states: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         q = self.q_proj(hidden_states)
         k = self.k_proj(hidden_states)
         v = self.v_proj(hidden_states)
-        
-        attn_output = F.scaled_dot_product_attention(
-            q.unsqueeze(1), k.unsqueeze(1), v.unsqueeze(1)
-        ).squeeze(1)
-        
+        attn_output = F.scaled_dot_product_attention(q.unsqueeze(1), k.unsqueeze(1), v.unsqueeze(1)).squeeze(1)
         return attn_output, q, k
 
 class GatingNetwork(nn.Module):
     def __init__(self, config: DynSMHAConfig):
         super().__init__()
         self.config = config
+        self.sim_matrix = nn.Parameter(torch.randn(config.hidden_size, config.num_experts, dtype=DTYPE))
         self.gates = nn.Parameter(torch.zeros(config.num_experts, dtype=DTYPE))
-        self.gate_scale = nn.Parameter(torch.ones(1, dtype=DTYPE))
-        self.gate_bias = nn.Parameter(torch.zeros(1, dtype=DTYPE))
 
-    def forward(self, all_q: torch.Tensor, all_k: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        attn_scores = torch.einsum('bmtd,bmjd->bmtj', all_q, all_k) / (self.config.head_dim ** 0.5)
-        attn_probs = F.softmax(attn_scores, dim=-1)
-        entropy = -torch.sum(attn_probs * torch.log(attn_probs + 1e-9), dim=-1)
-        mean_entropy = entropy.mean(dim=-1)
+    def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+        B, T, C = hidden_states.shape
+        flat_hidden_states = hidden_states.view(-1, C)
+
+        token_affinity = torch.matmul(flat_hidden_states, self.sim_matrix)
+        logits = token_affinity - torch.sigmoid(self.gates)
         
-        affinity_score = -mean_entropy
-        raw_affinity_score = affinity_score.detach()
-        
-        adjusted_affinity = self.gate_scale * affinity_score + self.gate_bias
-        pre_activation_logits = adjusted_affinity - torch.sigmoid(self.gates)
-        
-        activation_mask = STEFunction.apply(pre_activation_logits)
-        
-        num_active = torch.sum(activation_mask, dim=1)
+        gated_logits = F.relu(logits)
+        activation_mask = STEFunction.apply(gated_logits).view(B, T, -1)
+
+        num_active = torch.sum(activation_mask, dim=2)
         inactive_mask = num_active == 0
         
-        fallback_count = 0
+        fallback_count = torch.tensor(0.0, device=activation_mask.device)
         if inactive_mask.any():
-            fallback_count = inactive_mask.sum().item()
-            fallback_indices = torch.topk(affinity_score[inactive_mask], self.config.k_fallback, dim=1).indices
-            activation_mask[inactive_mask] = activation_mask[inactive_mask].scatter(1, fallback_indices, 1.0)
+            fallback_count = inactive_mask.sum().float()
+            k_fallback = self.config.num_experts // 2
             
-        return pre_activation_logits, activation_mask, torch.tensor(fallback_count, device=activation_mask.device), raw_affinity_score
+            fallback_logits = logits.view(B, T, -1)[inactive_mask]
+            fallback_indices = torch.topk(fallback_logits, k_fallback, dim=1).indices
+
+            inactive_b_indices, inactive_t_indices = inactive_mask.nonzero(as_tuple=True)
+            
+            expanded_b = inactive_b_indices.unsqueeze(1).expand(-1, k_fallback)
+            expanded_t = inactive_t_indices.unsqueeze(1).expand(-1, k_fallback)
+            
+            activation_mask[expanded_b, expanded_t, fallback_indices] = 1.0
+
+        gated_logits_masked = torch.where(activation_mask > 0, gated_logits.view(B, T, -1), -torch.finfo(DTYPE).max)
+        active_expert_probs = F.softmax(gated_logits_masked, dim=-1)
+
+        cache = {"logits": logits.view(B, T, -1), "activation_mask": activation_mask}
+        return active_expert_probs, fallback_count, cache
+
 
 class DynSMHALayer(nn.Module):
     def __init__(self, config: DynSMHAConfig):
@@ -75,27 +83,24 @@ class DynSMHALayer(nn.Module):
         self.gating_network = GatingNetwork(config)
         self.o_weights = nn.Parameter(torch.randn(config.num_experts, config.head_dim, config.hidden_size, dtype=DTYPE))
 
-    def forward(self, hidden_states: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        expert_outputs = [expert(hidden_states) for expert in self.experts]
-        all_sha_outputs = torch.stack([out[0] for out in expert_outputs], dim=2)
-        all_q = torch.stack([out[1] for out in expert_outputs], dim=1)
-        all_k = torch.stack([out[2] for out in expert_outputs], dim=1)
+    def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
+        expert_outputs = torch.stack([expert(hidden_states)[0] for expert in self.experts], dim=2)
+        
+        routing_weights, fallback_count, gate_cache = self.gating_network(hidden_states)
 
-        _, _, _, raw_affinity_score = self.gating_network(all_q, all_k)
-        
-        activation_mask = torch.ones(hidden_states.shape[0], self.config.num_experts, device=hidden_states.device, dtype=DTYPE)
-        pre_activation_logits = torch.zeros_like(activation_mask)
-        fallback_count = torch.tensor(0.0, device=hidden_states.device)
+        num_active = torch.sum(routing_weights > 0, dim=2).float().mean()
 
-        normalized_mask = activation_mask / self.config.num_experts
+        combined_heads = torch.einsum('bteh,bte->bth', expert_outputs, routing_weights)
+        dynamic_o_proj = torch.einsum('ehd,bte->bthd', self.o_weights, routing_weights)
         
-        combined_heads = torch.einsum('btmh,bm->bth', all_sha_outputs, normalized_mask)
-        
-        dynamic_o_proj = torch.einsum('mhd,bm->bhd', self.o_weights, normalized_mask)
-        
-        final_output = torch.einsum('bth,bhd->btd', combined_heads, dynamic_o_proj)
+        final_output = torch.einsum('bth,bthd->btd', combined_heads, dynamic_o_proj)
 
-        return final_output, all_sha_outputs, pre_activation_logits, activation_mask, fallback_count, raw_affinity_score
+        forward_cache: Dict[str, Any] = {
+            "gate_cache": gate_cache,
+            "all_sha_outputs": expert_outputs,
+            "num_active_experts": num_active,
+        }
+        return final_output, fallback_count, forward_cache
 
 class TinyOnnModel(nn.Module):
     def __init__(self, config: DynSMHAConfig):
@@ -107,17 +112,16 @@ class TinyOnnModel(nn.Module):
         self.ln2 = nn.LayerNorm(config.hidden_size, dtype=DTYPE)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False, dtype=DTYPE)
 
-    def forward(self, input_ids: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    def forward(self, input_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
         hidden_states = self.embedding(input_ids)
         residual = hidden_states
-        
+
         normalized_states = self.ln1(hidden_states)
-        
-        attn_output, all_sha_outputs, pre_act_logits, act_mask, fallback_count, raw_affinity_score = self.smha_layer(normalized_states)
-        
+        attn_output, fallback_count, forward_cache = self.smha_layer(normalized_states)
+
         hidden_states = residual + attn_output
         hidden_states = self.ln2(hidden_states)
-        
+
         final_logits = self.lm_head(hidden_states)
-        
-        return final_logits, all_sha_outputs, pre_act_logits, act_mask, fallback_count, raw_affinity_score
+
+        return final_logits, fallback_count, forward_cache

@@ -27,7 +27,7 @@
 - **门控**: 基于 `Surprise`（`main_loss` 对专家输出的梯度范数）的路由。
 - **梯度捕获**: 通过 `torch.autograd.grad(main_loss, full_expert_outputs)` 来获取 `per-token-per-expert` 粒度的梯度范数，即 `Surprise` 矩阵。
 - **损失函数**: 混合损失 `gating_loss = w_ce * CrossEntropy(logits, argmin(Surprise)) + w_kl * KL_Div(logits, softmax(-Surprise))`。该损失函数已被验证可以有效引导门控进行效率最大化路由，并自然产生稀疏性。
-- **专家梯度保护**: 在 `optimizer.step()` 之前，对所有专家的参数梯度进行 `2σ` 离群值过滤，将异常梯度置零。这可以保护专家网络不被少数高难度样本产生的巨大梯度所“污染”，从而稳定学习过程。
+- **废弃机制：专家梯度保护**: 经 `exp/SurpriseMin_DynMoE_PoC.py` 实验最终验证，任何形式的手工梯度干预（无论是裁剪还是选择性更新）都是不必要的过度设计。最有效、最符合自由能原理的训练范式是让 `main_loss` 和 `gating_loss` 组成的联合损失函数进行端到端的、无干预的自由优化。系统本身的动态（DynMoE 动态稀疏路由+ `gating_loss` 作为梯度的函数）已经构成了足够且更优的自调节机制。
 
 ## 观测数据与可视化实施备忘录
 
