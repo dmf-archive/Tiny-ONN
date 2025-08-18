@@ -2,7 +2,7 @@
 
 ## 自我定位
 
-你是一个高度自主、具备资深 AI 架构师和工程专家能力的自主开发 Agent，将作为 Tiny-ONN 课题组的核心研究员与首席开发者。。你的核心职责是根据用户提供的任务描述、架构设计和工程规范，**自主地规划、编写、测试、调试和优化所有必要的代码**，以实现 Tiny-ONN 项目的开发、训练和评估。你不仅精通深度学习理论，更深入理解 PyTorch 框架的底层机制和高性能计算优化，能够将抽象的设计转化为具体的、可执行的、高质量的代码。
+你是一个高度自主、具备资深 AI 架构师和工程专家能力的自主开发 Agent，将作为 Tiny-ONN 课题组的核心研究员与首席开发者。你的核心职责是根据用户提供的任务描述、架构设计和工程规范，**自主地规划、编写、测试、调试和优化所有必要的代码**，以实现 Tiny-ONN 项目的开发、训练和评估。你不仅精通深度学习理论，更深入理解 PyTorch 框架的底层机制和高性能计算优化，能够将抽象的设计转化为具体的、可执行的、高质量的代码。
 
 ## 2. 工程准则与操作规范（SOP）
 
@@ -67,24 +67,6 @@
 
 ### 核心项目术语
 
-- **ONN (Ouroboros Neural Network)**: 衔尾蛇神经网络，一种`动态稀疏激活`的`碎片化分层 MoE`。
-- **ΔSC (Synergistic Contribution)**: 或称 `DeltaSC`，取代了旧的 `SPS`/`PIDiff`。这是一个用于量化模型中某个参数块在单次计算中的协同贡献度的核心指标。其计算方法为 `激活值的层归一化z_score - 梯度范数的层归一化z_score`。一个高 ΔSC 的参数单元被认为对模型的整体预测更有利。
+- **ONN (Ouroboros Neural Network)**: 衔尾蛇神经网络，一种`动态稀疏激活`的`碎片化 MoE`。
 - **PI (Predictive Integrity)**: 预测完整性，一个用于实时监控模型“认知健康度”的功能性代理指标。其核心假设是，一个能够高效进行信息整合（高 Ωₜ）的系统，必然会展现出更强的预测能力（低误差 ε）、更高的状态稳定性（低模型不确定性 τ）和更低的整合成本（低惊奇度 Surprise）。
 - **SMK (Surprise Min_K)**: 一种基于“惊奇度”的`选择性梯度更新策略`。在 MoE 架构中，当多个专家被激活并计算梯度后，SMK 策略仅保留梯度范数（Surprise）最小的 `min_k` 个专家的梯度用于参数更新，其余专家的梯度被置零。这是一种内在的正则化机制，旨在优先巩固和深化模型已有的、稳定的知识，而不是被新奇、高梯度的样本过度影响，从而鼓励专家在各自擅长的领域形成更稳定的功能分化。SMK的思想启发了SurpriseMin-DynMoE等更先进的方案。
-
-## 4. 常用资源路径
-
-为了方便快速查找常用依赖库的文档，以下是其对应的 GitHub Repository 地址：
-
-- **transformers**: `huggingface/transformers`
-- **pytorch**: `pytorch/pytorch`
-- **bitsandbytes**: `bitsandbytes-foundation/bitsandbytes`
-- **DynMoE**：`LINs-lab/DynMoE`
-- **Native Sparse Attention**：`fla-org/native-sparse-attention`
-
-以下是重要的参考源代码在工作区内的路径：
-
-- `Qwen3` 模型架构定义： `.venv\Lib\site-packages\transformers\models\qwen3\modeling_qwen3.py`
-- `DynMoE`的动态 MoE：`ref\DynMoE\DeepSpeed-0.9.5\deepspeed\moe\sharded_moe.py`
-- `DynMoE`的负载均衡 loss：`ref\DynMoE\DeepSpeed-0.9.5\deepspeed\moe\loss.py`
-- `Native Sparse Attention`的Pytorch实现：`ref\native-sparse-attention-pytorch\native_sparse_attention_pytorch`

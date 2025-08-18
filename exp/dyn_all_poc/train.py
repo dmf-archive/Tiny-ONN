@@ -1,189 +1,252 @@
 import json
-import os
 import random
+import time
 
 import torch
 import torch.nn.functional as F
 from einops import rearrange
-from torch.optim import AdamW
-from torch.utils.data import DataLoader, Dataset
 from tokenizers import Tokenizer
 from tokenizers.models import BPE
-from tokenizers.trainers import BpeTrainer
 from tokenizers.pre_tokenizers import Whitespace
+from tokenizers.trainers import BpeTrainer
+from torch.distributions import Categorical
+from torch.optim import AdamW
+from torch.utils.data import Dataset
 from transformers import PreTrainedTokenizerFast
 
-from .config import DEVICE, DTYPE, DynSMHAConfig
+from .config import DEVICE, UnifiedConfig
 from .model import TinyOnnModel
 
 
 class ChatDataset(Dataset):
-    def __init__(self, file_path: str, tokenizer: PreTrainedTokenizerFast, max_length: int, data: list):
+    def __init__(self, tokenizer: PreTrainedTokenizerFast, max_length: int, data: list):
         self.tokenizer = tokenizer
         self.max_length = max_length
-        self.data = data
-        self.prompts, self.full_texts = [], []
-        for item in self.data:
-            user_content = next((msg['content'] for msg in item['messages'] if msg['role'] == 'user'), "")
-            assistant_content = next((msg['content'] for msg in item['messages'] if msg['role'] == 'assistant'), "")
-            prompt = f"user: {user_content}\nassistant: "
-            self.prompts.append(prompt)
-            self.full_texts.append(f"{prompt}{assistant_content}{tokenizer.eos_token}")
 
-        self.inputs = self.tokenizer(self.full_texts, max_length=self.max_length, padding="max_length", truncation=True, return_tensors="pt")
-        self.prompt_inputs = self.tokenizer(self.prompts, padding=True, truncation=True, max_length=self.max_length, return_tensors="pt")
+        prompts = [f"user: {next((msg['content'] for msg in item['messages'] if msg['role'] == 'user'), '')}\nassistant: " for item in data]
+        responses = [f"{next((msg['content'] for msg in item['messages'] if msg['role'] == 'assistant'), '')}{tokenizer.eos_token or ''}" for item in data]
+        full_texts = [p + r for p, r in zip(prompts, responses, strict=False)]
+
+        self.inputs = self.tokenizer(full_texts, max_length=self.max_length, padding="max_length", truncation=True, return_tensors="pt")
+
+        prompt_token_lengths = [len(self.tokenizer(p, add_special_tokens=False).input_ids) for p in prompts]
+
+        self.labels = self.inputs.input_ids.clone()
+        for i, prompt_len in enumerate(prompt_token_lengths):
+            self.labels[i, :prompt_len] = -100
+
+        if self.tokenizer.pad_token_id is not None:
+            self.labels[self.labels == self.tokenizer.pad_token_id] = -100
 
     def __len__(self) -> int:
-        return len(self.data)
+        return len(self.inputs.input_ids)
 
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
-        input_ids = self.inputs.input_ids[idx]
-        labels = input_ids.clone()
-        prompt_len = self.prompt_inputs.attention_mask[idx].sum()
-        labels[:prompt_len] = -100
-        if self.tokenizer.pad_token_id is not None:
-            labels[labels == self.tokenizer.pad_token_id] = -100
-        return input_ids, labels
+        return self.inputs.input_ids[idx], self.labels[idx]
 
-def get_hybrid_gating_loss(main_loss: torch.Tensor, forward_cache: dict, config: DynSMHAConfig) -> tuple[torch.Tensor, torch.Tensor]:
-    all_sha_outputs = forward_cache["all_sha_outputs"]
-    gate_cache = forward_cache["gate_cache"]
-    logits = gate_cache["logits"]  # Shape: [B, E]
-    
-    B, T, E, H = all_sha_outputs.shape
-    
-    flat_all_sha_outputs = rearrange(all_sha_outputs, 'b t e h -> (b t) e h')
 
-    grad_matrix, = torch.autograd.grad(main_loss, flat_all_sha_outputs, create_graph=True, allow_unused=True)
-
-    per_token_surprise = torch.zeros(B * T, E, device=DEVICE, dtype=DTYPE)
-    if grad_matrix is not None:
-        per_token_surprise = torch.linalg.norm(grad_matrix.to(DTYPE).float(), dim=-1)
-
-    # Aggregate surprise from per-token to per-sequence by averaging over the sequence length
-    seq_surprise = rearrange(per_token_surprise, '(b t) e -> b t e', b=B, t=T).mean(dim=1)
-
-    with torch.no_grad():
-        target_indices = torch.argmin(seq_surprise, dim=-1)
-        gating_acc = (logits.argmax(dim=-1) == target_indices).float().mean()
-    
-    ce_loss = F.cross_entropy(logits, target_indices)
-
-    log_target_dist = F.log_softmax(-seq_surprise, dim=-1)
-    log_gate_dist = F.log_softmax(logits, dim=-1)
-    kl_loss = F.kl_div(log_gate_dist, log_target_dist, reduction='batchmean', log_target=True)
-
-    combined_loss = config.w_ce * ce_loss + config.w_kl * kl_loss
-    return combined_loss, gating_acc
-
-def generate_text(model, tokenizer, prompt, max_new_tokens=30, top_p=0.9):
+def generate_text(model, tokenizer, prompt, max_new_tokens=30):
     model.eval()
     with torch.no_grad():
         input_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(DEVICE)
+        prompt_len = input_ids.shape[1]
+
         for _ in range(max_new_tokens):
-            outputs, _, _ = model(input_ids)
+            outputs, _ = model(input_ids)
             next_token_logits = outputs[:, -1, :]
-            sorted_logits, sorted_indices = torch.sort(next_token_logits, descending=True)
-            cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
-            sorted_indices_to_remove = cumulative_probs > top_p
-            sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
-            sorted_indices_to_remove[..., 0] = 0
-            indices_to_remove = sorted_indices[sorted_indices_to_remove]
-            next_token_logits[:, indices_to_remove] = -float("Inf")
-            probs = F.softmax(next_token_logits, dim=-1)
-            next_token_id = torch.multinomial(probs, num_samples=1)
+            next_token_id = torch.argmax(next_token_logits, dim=-1).unsqueeze(0)
             if tokenizer.eos_token_id is not None and next_token_id.item() == tokenizer.eos_token_id:
                 break
             input_ids = torch.cat([input_ids, next_token_id], dim=-1)
+
     model.train()
-    return tokenizer.decode(input_ids[0, len(tokenizer(prompt).input_ids):], skip_special_tokens=True)
+    return tokenizer.decode(input_ids[0, prompt_len:], skip_special_tokens=True)
+
 
 def main():
-    config = DynSMHAConfig()
-    
+    config = UnifiedConfig()
+
     with open("data/dummy_chat_data.jsonl", encoding="utf-8") as f:
         data = [json.loads(line) for line in f]
 
-    def get_training_corpus():
-        return (
-            f"user: {next((msg['content'] for msg in item['messages'] if msg['role'] == 'user'), '')}\n"
-            f"assistant: {next((msg['content'] for msg in item['messages'] if msg['role'] == 'assistant'), '')}"
-            for item in data
-        )
+    get_training_corpus = lambda: (f"user: {next((msg['content'] for msg in item['messages'] if msg['role'] == 'user'), '')}\nassistant: {next((msg['content'] for msg in item['messages'] if msg['role'] == 'assistant'), '')}" for item in data)
 
     base_tokenizer = Tokenizer(BPE(unk_token="[UNK]"))
     base_tokenizer.pre_tokenizer = Whitespace()
-    trainer = BpeTrainer(special_tokens=["[UNK]", "[PAD]", "[EOS]"], vocab_size=config.vocab_size)
-    base_tokenizer.train_from_iterator(get_training_corpus(), trainer)
-    
-    tokenizer = PreTrainedTokenizerFast(
-        tokenizer_object=base_tokenizer,
-        pad_token="[PAD]",
-        eos_token="[EOS]",
-        unk_token="[UNK]",
-    )
-    
+    base_tokenizer.train_from_iterator(get_training_corpus(), BpeTrainer(special_tokens=["[UNK]", "[PAD]", "[EOS]"], vocab_size=config.vocab_size))
+
+    tokenizer = PreTrainedTokenizerFast(tokenizer_object=base_tokenizer, pad_token="[PAD]", eos_token="[EOS]", unk_token="[UNK]")
     config.vocab_size = base_tokenizer.get_vocab_size()
 
     model = TinyOnnModel(config).to(DEVICE)
     optimizer = AdamW(model.parameters(), lr=config.learning_rate)
+    dataset = ChatDataset(tokenizer, config.max_seq_len, data)
 
-    dataset = ChatDataset("data/dummy_chat_data.jsonl", tokenizer, config.max_seq_len, data)
-    data_loader = DataLoader(dataset, batch_size=config.batch_size, shuffle=True, drop_last=True)
-    
+    global_step = 0
+    start_time = time.time()
     for epoch in range(config.epochs):
-        totals = {
-            "main_loss": torch.tensor(0.0, device=DEVICE), "gating_loss": torch.tensor(0.0, device=DEVICE),
-            "main_acc": torch.tensor(0.0, device=DEVICE), "avg_k": torch.tensor(0.0, device=DEVICE),
-            "gate_acc": torch.tensor(0.0, device=DEVICE),
-        }
-        
-        print(f"--- Starting Epoch {epoch+1}/{config.epochs} ---")
-        for i, (input_ids, labels) in enumerate(data_loader):
-            input_ids, labels = input_ids.to(DEVICE), labels.to(DEVICE)
+        print(f"\n--- Starting Epoch {epoch+1}/{config.epochs} ---")
+
+        expert_activation_counts: dict[tuple[int, int, int], int] = {}
+        expert_true_activation_counts: dict[tuple[int, int, int], int] = {}
+
+        for layer_idx in range(config.num_hidden_layers):
+            for expert_type in [1, 2]:
+                num_experts = config.max_attention_experts if expert_type == 1 else config.max_moe_experts
+                for expert_sub_idx in range(num_experts):
+                    expert_id = (expert_type, expert_sub_idx, layer_idx)
+                    expert_activation_counts[expert_id] = 0
+                    expert_true_activation_counts[expert_id] = 0
+
+
+        for i in range(len(dataset)):
+            step_start_time = time.time()
+            input_ids, labels = dataset[i]
+            input_ids, labels = input_ids.unsqueeze(0).to(DEVICE), labels.unsqueeze(0).to(DEVICE)
+
             optimizer.zero_grad(set_to_none=True)
 
-            final_logits, _, forward_cache = model(input_ids)
+            final_logits, forward_cache = model(input_ids)
 
-            main_loss = F.cross_entropy(
-                rearrange(final_logits, 'b t d -> (b t) d'),
-                rearrange(labels, 'b t -> (b t)'),
-                ignore_index=-100
-            )
+            shift_logits = final_logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+            main_loss = F.cross_entropy(rearrange(shift_logits, 'b t d -> (b t) d'), rearrange(shift_labels, 'b t -> (b t)'), ignore_index=-100)
+            if torch.isnan(main_loss) or main_loss.isinf(): continue
 
-            if torch.isnan(main_loss): continue
+            total_gating_loss = torch.tensor(0.0, device=DEVICE)
+            metrics = { "smha_surprise": [], "moe_surprise": [], "smha_gate_acc": [], "moe_gate_acc": [], "smha_avg_k": [], "moe_avg_k": [] }
 
-            gating_loss, gating_acc = get_hybrid_gating_loss(main_loss, forward_cache, config)
-            total_loss = main_loss + config.w_aux * gating_loss
-            total_loss.backward()
+            outputs_to_grad = [cache['final_output'] for cache in forward_cache.values()]
+            if outputs_to_grad:
+                grads_for_surprise = torch.autograd.grad(main_loss, outputs_to_grad, create_graph=False, retain_graph=True)
+
+                grad_idx = 0
+                for expert_id, layer_cache in forward_cache.items():
+                    expert_type, _, layer_index = expert_id
+                    if expert_type == 1:
+                        layer_type_str ="smha"
+                    elif expert_type == 2:
+                        layer_type_str = "moe"
+                    else:
+                        continue
+
+                    B, T = layer_cache['B'], layer_cache['T']
+                    grad_norm_shape = (B * T, -1)
+                    grad_norm = torch.linalg.norm(grads_for_surprise[grad_idx].view(grad_norm_shape), dim=-1)
+
+                    routing_weights = layer_cache['routing_weights']
+                    surprise_matrix_shape = (B * T, -1)
+                    surprise_matrix = grad_norm.unsqueeze(-1) * routing_weights.view(surprise_matrix_shape)
+
+                    logits = layer_cache['gate_cache']['logits'].view(surprise_matrix_shape)
+
+                    with torch.no_grad():
+                        targets = torch.argmin(surprise_matrix, dim=-1)
+                        acc = (logits.argmax(dim=-1) == targets).float().mean()
+
+                    log_targ = F.log_softmax(-surprise_matrix.detach(), dim=-1)
+                    log_gate = F.log_softmax(logits, dim=-1)
+
+                    if expert_type == 1:
+                        w_ce, w_kl, w_aux = config.w_ce_smha, config.w_kl_smha, config.w_aux_smha
+                    elif expert_type == 2:
+                        w_ce, w_kl, w_aux = config.w_ce_moe, config.w_kl_moe, config.w_aux_moe
+                    else:
+                        continue
+                    
+                    gating_loss = w_ce * F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1)) + w_kl * F.kl_div(log_gate, log_targ, reduction='batchmean', log_target=True)
+                    total_gating_loss += w_aux * gating_loss
+                    
+                    activation_mask_flat = layer_cache['gate_cache']['activation_mask'].view(-1, logits.size(-1)) > 0
+                    active_surprise = surprise_matrix.view(-1, logits.size(-1))[activation_mask_flat]
+                    metrics[f"{layer_type_str}_surprise"].append(active_surprise.mean().item() if active_surprise.numel() > 0 else 0)
+                    metrics[f"{layer_type_str}_gate_acc"].append(acc.item())
+                    metrics[f"{layer_type_str}_avg_k"].append(layer_cache["num_active_tokens"] / (layer_cache['B'] * layer_cache['T']))
+                    
+                    # Update expert activation counts
+                    activation_mask_flat = layer_cache['gate_cache']['activation_mask'].view(-1, logits.size(-1))
+                    active_experts_in_batch = torch.where(activation_mask_flat.sum(dim=0) > 0)[0].tolist()
+                    for expert_sub_idx in active_experts_in_batch:
+                        expert_activation_counts[(expert_type, expert_sub_idx, layer_index)] += 1
+                    
+                    gated_logits_flat = layer_cache['gate_cache']['gated_logits'].view(-1, logits.size(-1))
+                    true_active_experts_in_batch = torch.where((gated_logits_flat > 0).sum(dim=0) > 0)[0].tolist()
+                    for expert_sub_idx in true_active_experts_in_batch:
+                        expert_true_activation_counts[(expert_type, expert_sub_idx, layer_index)] += 1
+
+                    grad_idx += 1
+
+            total_loss = main_loss + total_gating_loss
+            if not (torch.isnan(total_loss) or total_loss.isinf()):
+                total_loss.backward()
+
             optimizer.step()
 
-            with torch.no_grad():
-                totals["main_loss"] += main_loss
-                totals["gating_loss"] += gating_loss
-                totals["main_acc"] += (final_logits.argmax(-1) == labels).float().mean()
-                totals["avg_k"] += forward_cache["num_active_experts"]
-                totals["gate_acc"] += gating_acc
+            global_step += 1
+            if global_step % 20 == 0:
+                with torch.no_grad():
+                    mask = (shift_labels != -100)
+                    main_acc = ((shift_logits.argmax(-1) == shift_labels) & mask).float().sum() / mask.sum() if mask.sum() > 0 else 0.0
 
-            current_step = i + 1
-            if current_step % 20 == 0 or current_step == len(data_loader):
-                avg_main_loss_step = (totals['main_loss'] / current_step).item()
-                avg_gate_loss_step = (totals['gating_loss'] / current_step).item()
-                avg_main_acc_step = (totals['main_acc'] / current_step).item()
-                avg_gate_acc_step = (totals['gate_acc'] / current_step).item()
-                avg_k_step = (totals['avg_k'] / current_step).item()
-                print(f"  Step {current_step}/{len(data_loader)}: "
-                      f"Main Loss: {avg_main_loss_step:.3f}, Gate Loss: {avg_gate_loss_step:.3f}, "
-                      f"Main Acc: {avg_main_acc_step:.2f}, Gate Acc: {avg_gate_acc_step:.2f}, Avg K: {avg_k_step:.2f}")
+                    tau = Categorical(logits=final_logits).entropy().mean().item()
+                    all_surprises = metrics["smha_surprise"] + metrics["moe_surprise"]
+                    surprise = sum(all_surprises) / len(all_surprises) if all_surprises else 0
+                    pi_score = torch.exp(-torch.tensor(config.pi_alpha * ((1 - config.pi_gamma) * (main_loss.item() / (tau + 1e-6)) + config.pi_gamma * surprise))).item()
 
-        avg_metrics = {k: (v / len(data_loader)).item() for k, v in totals.items()}
-        print(f"Epoch Summary: Avg Main Loss: {avg_metrics['main_loss']:.3f}, Avg Gate Loss: {avg_metrics['gating_loss']:.3f}, "
-              f"Avg Main Acc: {avg_metrics['main_acc']:.2f}, Avg Gate Acc: {avg_metrics['gate_acc']:.2f}, Avg K: {avg_metrics['avg_k']:.2f}")
+                    num_smha_layers = config.num_hidden_layers
+                    num_moe_layers = config.num_hidden_layers
+                    
+                    avg_smha_loss = total_gating_loss.item() / num_smha_layers if num_smha_layers > 0 and metrics["smha_surprise"] else 0
+                    avg_moe_loss = total_gating_loss.item() / num_moe_layers if num_moe_layers > 0 and metrics["moe_surprise"] else 0
+                    
+                    avg_smha_acc = sum(metrics["smha_gate_acc"]) / len(metrics["smha_gate_acc"]) if metrics["smha_gate_acc"] else 0
+                    avg_moe_acc = sum(metrics["moe_gate_acc"]) / len(metrics["moe_gate_acc"]) if metrics["moe_gate_acc"] else 0
+
+                    avg_smha_k = sum(metrics["smha_avg_k"]) / len(metrics["smha_avg_k"]) if metrics["smha_avg_k"] else 0
+                    avg_moe_k = sum(metrics["moe_avg_k"]) / len(metrics["moe_avg_k"]) if metrics["moe_avg_k"] else 0
+
+                    it_per_sec = 1.0 / (time.time() - step_start_time)
+                    log_str = (
+                        f"  Step {global_step}: PI: {pi_score:.2f} | "
+                        f"Loss(M/S/M): {main_loss.item():.2f}/{avg_smha_loss:.2f}/{avg_moe_loss:.2f} | "
+                        f"Acc(M/S/M): {main_acc.item():.2f}/{avg_smha_acc:.2f}/{avg_moe_acc:.2f} | "
+                        f"K(S/M): {avg_smha_k:.2f}/{avg_moe_k:.2f} | "
+                        f"Speed: {it_per_sec:.2f} it/s"
+                    )
+                    print(log_str)
+
+        dead_experts_count = sum(1 for count in expert_activation_counts.values() if count == 0)
+        true_dead_experts_count = sum(1 for count in expert_true_activation_counts.values() if count == 0)
         
-        sample_item = random.choice(dataset.data)
+        print(f"--- Epoch {epoch+1} Summary ---")
+        print(f"Total Dead Experts (Post-Fallback): {dead_experts_count}")
+        print(f"Total Dead Experts (Pre-Fallback): {true_dead_experts_count}")
+
+        dead_expert_ids = [eid for eid, count in expert_true_activation_counts.items() if count == 0]
+        
+        experts_to_revive = dead_expert_ids
+        if config.k_reborn_experts != -1 and len(dead_expert_ids) > config.k_reborn_experts:
+            experts_to_revive = random.sample(dead_expert_ids, config.k_reborn_experts)
+
+        if experts_to_revive:
+            with torch.no_grad():
+                for expert_type, expert_sub_idx, layer_idx in experts_to_revive:
+                    if expert_type == 1: # SMHA
+                        gating_network = model.layers[layer_idx].smha_layer.gating_network
+                    else: # MoE
+                        gating_network = model.layers[layer_idx].moe_layer.gating_network
+
+                    new_weights = torch.randn_like(gating_network.sim_matrix[:, expert_sub_idx])
+                    gating_network.sim_matrix[:, expert_sub_idx] = F.normalize(new_weights, dim=0)
+                    gating_network.gates.data[expert_sub_idx] = 0.0
+            print(f"Reborn {len(experts_to_revive)} experts.")
+
+
+        sample_item = random.choice(data)
         prompt = f"user: {sample_item['messages'][0]['content']}\nassistant: "
         generated_text = generate_text(model, tokenizer, prompt)
-        print(f"--- Sample Generation ---\n{prompt}{generated_text}\n-------------------------")
+        print(f"--- Sample Generation (Epoch {epoch+1}) ---\nuser: {sample_item['messages'][0]['content']}\nassistant:{generated_text}\n-------------------------")
+
 
 if __name__ == "__main__":
     main()
