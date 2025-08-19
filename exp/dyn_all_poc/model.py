@@ -48,31 +48,6 @@ class GatingNetwork(nn.Module):
         return active_expert_probs, {"logits": logits, "activation_mask": activation_mask, "gated_logits": gated_logits, "inactive_mask": inactive_mask}
 
 
-@torch.jit.script
-def sparse_weighted_sum(routing_weights: torch.Tensor, activation_mask: torch.Tensor, expert_weights: torch.Tensor) -> torch.Tensor:
-    num_tokens, num_experts = routing_weights.shape
-
-    if expert_weights.dim() == 3:
-        d1, d2 = expert_weights.shape[1], expert_weights.shape[2]
-        shape_list = [num_tokens, d1, d2]
-
-        token_indices, expert_indices = torch.where(activation_mask > 0)
-
-        if token_indices.numel() == 0:
-            return torch.zeros(shape_list, device=expert_weights.device, dtype=expert_weights.dtype)
-
-        weights_for_active = routing_weights[token_indices, expert_indices]
-        selected_expert_weights = expert_weights[expert_indices]
-
-        weighted_expert_params = weights_for_active.view(-1, 1, 1) * selected_expert_weights
-
-        combined_weights = torch.zeros(shape_list, device=expert_weights.device, dtype=expert_weights.dtype)
-        combined_weights.index_add_(0, token_indices, weighted_expert_params)
-        return combined_weights
-    else:
-        raise ValueError("Unsupported expert_weights dimension. Supported dimensions: 3.")
-
-
 class DynSMHALayer(nn.Module):
     def __init__(self, config: UnifiedConfig, layer_index: int):
         super().__init__()
@@ -98,19 +73,45 @@ class DynSMHALayer(nn.Module):
         flat_hidden_states = hidden_states.view(B * T, C)
         activation_mask = gate_cache["activation_mask"]
 
-        q_projs = sparse_weighted_sum(routing_weights, activation_mask, self.q_proj)
-        k_projs = sparse_weighted_sum(routing_weights, activation_mask, self.k_proj)
-        v_projs = sparse_weighted_sum(routing_weights, activation_mask, self.v_proj)
+        token_indices, expert_indices = torch.where(activation_mask > 0)
 
-        q = torch.einsum('ac,ach->ah', flat_hidden_states, q_projs).view(B, T, -1)
-        k = torch.einsum('ac,ach->ah', flat_hidden_states, k_projs).view(B, T, -1)
-        v = torch.einsum('ac,ach->ah', flat_hidden_states, v_projs).view(B, T, -1)
+        if token_indices.numel() == 0:
+            final_output = torch.zeros_like(hidden_states)
+        else:
+            selected_hidden_states = flat_hidden_states[token_indices]
+            weights_for_active = routing_weights[token_indices, expert_indices].unsqueeze(-1)
 
-        attn_output = F.scaled_dot_product_attention(q.unsqueeze(1), k.unsqueeze(1), v.unsqueeze(1), is_causal=True).squeeze(1)
+            q_parts = torch.bmm(selected_hidden_states.unsqueeze(1), self.q_proj[expert_indices]).squeeze(1)
+            k_parts = torch.bmm(selected_hidden_states.unsqueeze(1), self.k_proj[expert_indices]).squeeze(1)
+            v_parts = torch.bmm(selected_hidden_states.unsqueeze(1), self.v_proj[expert_indices]).squeeze(1)
 
-        o_projs = sparse_weighted_sum(routing_weights, activation_mask, self.o_proj)
-        final_output_flat = torch.einsum('ah,ahc->ac', attn_output.view(B * T, -1), o_projs)
-        final_output = final_output_flat.view(B, T, C)
+            weighted_q_parts = q_parts * weights_for_active
+            weighted_k_parts = k_parts * weights_for_active
+            weighted_v_parts = v_parts * weights_for_active
+
+            q_flat = torch.zeros(B * T, self.config.head_dim, device=hidden_states.device, dtype=hidden_states.dtype)
+            k_flat = torch.zeros(B * T, self.config.head_dim, device=hidden_states.device, dtype=hidden_states.dtype)
+            v_flat = torch.zeros(B * T, self.config.head_dim, device=hidden_states.device, dtype=hidden_states.dtype)
+
+            q_flat.scatter_add_(0, token_indices.unsqueeze(-1).expand_as(weighted_q_parts), weighted_q_parts)
+            k_flat.scatter_add_(0, token_indices.unsqueeze(-1).expand_as(weighted_k_parts), weighted_k_parts)
+            v_flat.scatter_add_(0, token_indices.unsqueeze(-1).expand_as(weighted_v_parts), weighted_v_parts)
+
+            q = q_flat.view(B, T, -1)
+            k = k_flat.view(B, T, -1)
+            v = v_flat.view(B, T, -1)
+
+            attn_output = F.scaled_dot_product_attention(q.unsqueeze(1), k.unsqueeze(1), v.unsqueeze(1), is_causal=True).squeeze(1)
+
+            attn_output_flat = attn_output.view(B * T, -1)
+            selected_attn_output = attn_output_flat[token_indices]
+
+            o_parts = torch.bmm(selected_attn_output.unsqueeze(1), self.o_proj[expert_indices]).squeeze(1)
+            weighted_o_parts = o_parts * weights_for_active
+
+            final_output_flat = torch.zeros_like(flat_hidden_states)
+            final_output_flat.scatter_add_(0, token_indices.unsqueeze(-1).expand_as(weighted_o_parts), weighted_o_parts)
+            final_output = final_output_flat.view(B, T, C)
 
         cache = {
             "gate_cache": gate_cache,
@@ -147,12 +148,25 @@ class DynamicMoELayer(nn.Module):
         flat_hidden_states = hidden_states.view(B * T, C)
         activation_mask = gate_cache["activation_mask"]
 
-        w1_projs = sparse_weighted_sum(routing_weights, activation_mask, self.w1)
-        w2_projs = sparse_weighted_sum(routing_weights, activation_mask, self.w2)
+        token_indices, expert_indices = torch.where(activation_mask > 0)
 
-        intermediate_activated = F.gelu(torch.einsum('ac,aci->ai', flat_hidden_states, w1_projs))
-        final_output_flat = torch.einsum('ai,aic->ac', intermediate_activated, w2_projs)
-        final_output = final_output_flat.view(B, T, C)
+        if token_indices.numel() == 0:
+            final_output = torch.zeros_like(hidden_states)
+        else:
+            selected_hidden_states = flat_hidden_states[token_indices]
+
+            selected_w1 = self.w1[expert_indices]
+            selected_w2 = self.w2[expert_indices]
+
+            intermediate_activated = F.gelu(torch.bmm(selected_hidden_states.unsqueeze(1), selected_w1))
+            output_flat = torch.bmm(intermediate_activated, selected_w2).squeeze(1)
+
+            weights_for_active = routing_weights[token_indices, expert_indices]
+            weighted_output = output_flat * weights_for_active.unsqueeze(-1)
+
+            final_output_flat = torch.zeros_like(flat_hidden_states)
+            final_output_flat.scatter_add_(0, token_indices.unsqueeze(-1).expand_as(weighted_output), weighted_output)
+            final_output = final_output_flat.view(B, T, C)
 
         cache = {
             "gate_cache": gate_cache,

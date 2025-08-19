@@ -1,8 +1,11 @@
 from dataclasses import dataclass, is_dataclass
 from pathlib import Path
 from typing import Any
+
 import yaml
+
 from tiny_onn.config import TinyOnnConfig
+
 
 def _from_dict(data_class, data):
     if data is None:

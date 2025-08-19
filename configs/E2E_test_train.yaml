@@ -3,30 +3,32 @@ data:
   train_path: "data/dummy_chat_data.jsonl"
 
 model:
-  vocab_size: 50257
-  num_hidden_layers: 2
-  num_attention_heads: 4
-  hidden_size: 32
-  head_dim: 8
+  tokenizer: "Qwen/Qwen3-0.6B"
+  max_seq_len: 256
+  hidden_size: 512
+  num_hidden_layers: 3
+  bias: False
+  max_attention_experts: 32
+  min_attention_experts: 8
+  head_dim: 32
+  max_moe_experts: 32
+  min_moe_experts: 8
   intermediate_size: 32
-  moe_intermediate_size: 32
-  num_experts_per_layer: 32
-  selection_block_size: 16
-  max_selected_blocks: 16
-  w_ce: 1.0
-  w_kl: 0.5
-  w_entropy: 1.0
-  w_sparse: 1.0
-  pi_alpha: 1.0
+  k_reborn_experts: -1
+  w_ce_smha: 1.0
+  w_kl_smha: 1.0
+  w_aux_smha: 1.0
+  w_ce_moe: 1.0
+  w_kl_moe: 1.0
+  w_aux_moe: 1.0
+  pi_alpha: 32
   pi_gamma: 0.5
 
 train:
   learning_rate: 1e-4
-  num_epochs: 30
+  epochs: 30
+  batch_size: 1
   log_interval: 10
-  surprise_threshold_sigma: 2.0
 
 observer:
   output_dir: "output/E2E_test_train"
-  pi_gamma: 0.5
-  pi_alpha: 1.0
