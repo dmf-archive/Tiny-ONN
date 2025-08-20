@@ -1,6 +1,5 @@
-import math
 from dataclasses import dataclass
-from typing import Any, cast
+from typing import Any
 
 import torch
 import torch.nn as nn
@@ -144,18 +143,18 @@ class DynSMHALayer(nn.Module):
     def forward_gating(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, tuple, int]:
         B, T, C = hidden_states.shape
         W = self.config.block_size
-        
+
         original_T = T
         if T % W != 0:
             pad_len = W - (T % W)
             hidden_states = F.pad(hidden_states, (0, 0, 0, pad_len))
-        
+
         padded_T = hidden_states.shape[1]
         N = padded_T // W
 
         blocks = rearrange(hidden_states, "b (n w) c -> b n (w c)", w=W)
         compressed_blocks = self.compress_mlp(blocks)
-        
+
         global_routing_weights, _ = self.global_router(compressed_blocks)
         importance_scores = global_routing_weights.max(dim=-1).values.view(B, N)
         block_activation_mask = STEFunction.apply(importance_scores - self.importance_threshold).bool()
@@ -166,10 +165,10 @@ class DynSMHALayer(nn.Module):
                 gate_caches.append(None)
                 routing_weights_list.append(None)
                 continue
-            
+
             active_batch_indices = torch.where(block_activation_mask[:, i])[0]
             block_hs = hidden_states[active_batch_indices, i * W : (i + 1) * W, :]
-            
+
             routing_weights, gate_cache = self.fine_grained_router(block_hs)
             gate_caches.append(gate_cache)
             routing_weights_list.append(routing_weights)
@@ -179,7 +178,7 @@ class DynSMHALayer(nn.Module):
     def forward_main(self, hidden_states: torch.Tensor, position_ids: torch.Tensor, block_activation_mask: torch.Tensor, gating_results: tuple, original_T: int) -> tuple[torch.Tensor, dict[str, Any]]:
         B, T, C = hidden_states.shape
         W = self.config.block_size
-        
+
         padded_T = T
         if T % W != 0:
             pad_len = W - (T % W)
@@ -191,7 +190,7 @@ class DynSMHALayer(nn.Module):
         gate_caches, routing_weights_list = gating_results
 
         final_output = torch.zeros_like(hidden_states)
-        
+
         # Buffers to store per-token routing info for the entire sequence
         full_logits = torch.zeros(B, padded_T, self.max_experts, device=hidden_states.device, dtype=hidden_states.dtype)
         full_routing_weights = torch.zeros(B, padded_T, self.max_experts, device=hidden_states.device, dtype=hidden_states.dtype)
@@ -202,13 +201,13 @@ class DynSMHALayer(nn.Module):
         for i in range(N):
             if not block_activation_mask[:, i].any():
                 continue
-            
+
             active_batch_indices = torch.where(block_activation_mask[:, i])[0]
-            
+
             # Since we pad hidden_states at the start of forward_main, we select all batch indices here
             block_hs = hidden_states[:, i * W : (i + 1) * W, :]
             block_pos_ids = position_ids[:, i * W : (i + 1) * W]
-            
+
             routing_weights = routing_weights_list[i]
             gate_cache = gate_caches[i]
 
@@ -222,7 +221,7 @@ class DynSMHALayer(nn.Module):
             temp_logits = torch.zeros(B, W, self.max_experts, device=hidden_states.device, dtype=hidden_states.dtype)
             temp_routing_weights = torch.zeros(B, W, self.max_experts, device=hidden_states.device, dtype=hidden_states.dtype)
             temp_activation_mask = torch.zeros(B, W, self.max_experts, device=hidden_states.device, dtype=torch.bool)
-            
+
             if gate_cache is not None and routing_weights is not None:
                 temp_logits[active_batch_indices] = gate_cache["logits"].view(-1, W, self.max_experts)
                 temp_routing_weights[active_batch_indices] = routing_weights.view(-1, W, self.max_experts)
@@ -231,7 +230,7 @@ class DynSMHALayer(nn.Module):
 
             block_output, fine_cache = self.forward_fine(block_hs, temp_routing_weights.view(-1, self.max_experts), {"activation_mask": temp_activation_mask.view(-1, self.max_experts)}, block_pos_ids)
             final_output[:, i * W : (i + 1) * W, :] = block_output
-            
+
             full_logits[:, i * W : (i + 1) * W, :] = temp_logits
             full_routing_weights[:, i * W : (i + 1) * W, :] = temp_routing_weights
             full_activation_mask[:, i * W : (i + 1) * W, :] = temp_activation_mask
@@ -377,7 +376,7 @@ class Block(nn.Module):
     def forward(self, hidden_states: torch.Tensor, position_ids: torch.Tensor) -> tuple[torch.Tensor, dict[ExpertID, Any]]:
         residual = hidden_states
         normed_hs_smha = self.ln1(hidden_states)
-        
+
         block_activation_mask, gating_results, original_T = self.smha_layer.forward_gating(normed_hs_smha)
 
         def smha_checkpointed_fn(hs_norm: torch.Tensor, pos_ids: torch.Tensor, mask: torch.Tensor, results: tuple, og_T: int) -> tuple[torch.Tensor, dict[str, Any]]:

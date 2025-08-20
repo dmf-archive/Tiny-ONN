@@ -141,7 +141,7 @@ def main():
                     logits = layer_cache['gate_cache']['logits'].view(surprise_matrix_shape)
 
                     with torch.no_grad():
-                        targets = torch.argmin(surprise_matrix, dim=-1)
+                        targets = torch.argmin(surprise_matrix, dim=-1).detach()
                         acc = (logits.argmax(dim=-1) == targets).float().mean()
 
                     log_targ = F.log_softmax(-surprise_matrix.detach(), dim=-1)
@@ -154,7 +154,7 @@ def main():
                     else:
                         continue
                     
-                    gating_loss = w_ce * F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1)) + w_kl * F.kl_div(log_gate, log_targ, reduction='batchmean', log_target=True)
+                    gating_loss = w_ce * F.cross_entropy(logits, targets.view(-1)) + w_kl * F.kl_div(log_gate, log_targ.detach(), reduction='batchmean', log_target=True)
                     total_gating_loss += w_aux * gating_loss
                     
                     activation_mask_flat = layer_cache['gate_cache']['activation_mask'].view(-1, logits.size(-1)) > 0

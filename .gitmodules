@@ -7,3 +7,9 @@
 [submodule "ref/DCFormer"]
 	path = ref/DCFormer
 	url = https://github.com/Caiyun-AI/DCFormer.git
+[submodule "data/ARC-AGI"]
+	path = data/ARC-AGI
+	url = https://github.com/fchollet/ARC-AGI.git
+[submodule "data/ARC-AGI-2"]
+	path = data/ARC-AGI-2
+	url = https://github.com/arcprize/ARC-AGI-2.git
