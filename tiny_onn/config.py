@@ -10,7 +10,7 @@ class TinyOnnConfig(PretrainedConfig):
         hidden_size: int = 256,
         embedding_size: int = 128,
         num_hidden_layers: int = 3,
-        max_position_embeddings: int = 256,
+        max_position_embeddings: int = 1024,
         bias: bool = False,
         tie_word_embeddings: bool = False,
         # RoPE specific
@@ -20,6 +20,8 @@ class TinyOnnConfig(PretrainedConfig):
         max_attention_experts: int = 32,
         min_attention_experts: int = 16,
         head_dim: int = 32,
+        # DynNSA specific
+        block_size: int = 64,
         # DynMoE specific
         max_moe_experts: int = 32,
         min_moe_experts: int = 16,
@@ -45,6 +47,7 @@ class TinyOnnConfig(PretrainedConfig):
         self.num_hidden_layers = num_hidden_layers
         self.max_position_embeddings = max_position_embeddings
         self.head_dim = head_dim
+        self.block_size = block_size
         self.bias = bias
         self.tie_word_embeddings = tie_word_embeddings
         self.rope_theta = rope_theta
