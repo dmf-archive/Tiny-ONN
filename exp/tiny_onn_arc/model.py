@@ -6,6 +6,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 from torch.utils.checkpoint import checkpoint
+from typing import Optional, Tuple
 
 from .config import TinyOnnArcConfig
 
@@ -87,7 +88,12 @@ class DynSMHALayer(nn.Module):
     def forward_gating(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         return self.gating_network(hidden_states)
 
-    def forward_main(self, hidden_states: torch.Tensor, routing_weights: torch.Tensor) -> tuple[torch.Tensor, dict[str, Any]]:
+    def forward_main(
+        self,
+        hidden_states: torch.Tensor,
+        routing_weights: torch.Tensor,
+        past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    ) -> Tuple[torch.Tensor, dict[str, Any], Optional[Tuple[torch.Tensor, torch.Tensor]]]:
         B, T, C = hidden_states.shape
         routing_weights_reshaped = rearrange(routing_weights, "(b t) e -> b t e", b=B)
 
@@ -103,6 +109,13 @@ class DynSMHALayer(nn.Module):
         k = rearrange(k_agg, "b t h -> b 1 t h")
         v = rearrange(v_agg, "b t h -> b 1 t h")
 
+        if past_key_value is not None:
+            past_key, past_value = past_key_value
+            k = torch.cat((past_key, k), dim=2)
+            v = torch.cat((past_value, v), dim=2)
+
+        present_key_value = (k, v) if self.is_causal else None
+
         attn_output = F.scaled_dot_product_attention(q, k, v, is_causal=self.is_causal)
         attn_output = rearrange(attn_output, "b 1 t h -> b t h")
 
@@ -110,7 +123,7 @@ class DynSMHALayer(nn.Module):
         final_output = torch.einsum("btec,bte->btc", output_experts, routing_weights_reshaped)
 
         cache = {"final_output": final_output, "routing_weights": routing_weights, "B": B, "T": T}
-        return final_output, cache
+        return final_output, cache, present_key_value
 
 
 class DynamicMoELayer(nn.Module):
@@ -150,17 +163,21 @@ class Block(nn.Module):
         self.ln2 = nn.LayerNorm(config.hidden_size)
         self.moe_layer = DynamicMoELayer(config)
 
-    def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, dict[ExpertID, Any]]:
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        use_cache: bool = False,
+    ) -> Tuple[torch.Tensor, dict[ExpertID, Any], Optional[Tuple[torch.Tensor, torch.Tensor]]]:
         residual = hidden_states
         normed_hs_smha = self.ln1(hidden_states)
         smha_routing_weights, smha_gate_cache = self.smha_layer.forward_gating(normed_hs_smha)
         B, T, C = hidden_states.shape
         smha_routing_weights_flat = smha_routing_weights.view(B * T, -1)
 
-        def smha_checkpointed_fn(hs_norm: torch.Tensor) -> tuple[torch.Tensor, dict[str, Any]]:
-            return self.smha_layer.forward_main(hs_norm, smha_routing_weights_flat)
-
-        attn_output, smha_cache = checkpoint(smha_checkpointed_fn, normed_hs_smha, use_reentrant=False)
+        attn_output, smha_cache, present_key_value = self.smha_layer.forward_main(
+            normed_hs_smha, smha_routing_weights_flat, past_key_value
+        )
         smha_cache["gate_cache"] = smha_gate_cache
         smha_cache["normed_hs"] = normed_hs_smha
         smha_cache["layer"] = self.smha_layer
@@ -171,15 +188,12 @@ class Block(nn.Module):
         moe_routing_weights, moe_gate_cache = self.moe_layer.forward_gating(normed_hs_moe)
         moe_routing_weights_flat = moe_routing_weights.view(B * T, -1)
 
-        def moe_checkpointed_fn(hs_norm: torch.Tensor) -> tuple[torch.Tensor, dict[str, Any]]:
-            return self.moe_layer.forward_main(hs_norm, moe_routing_weights_flat, moe_gate_cache)
-
-        moe_output, moe_cache = checkpoint(moe_checkpointed_fn, normed_hs_moe, use_reentrant=False)
+        moe_output, moe_cache = self.moe_layer.forward_main(normed_hs_moe, moe_routing_weights_flat, moe_gate_cache)
         moe_cache["normed_hs"] = normed_hs_moe
         hidden_states = residual + moe_output
 
         block_cache = {("smha", self.layer_index, 0): smha_cache, ("moe", self.layer_index, 0): moe_cache}
-        return hidden_states, block_cache
+        return hidden_states, block_cache, present_key_value if use_cache else None
 
 
 class AutoregressiveEmbedding(nn.Module):
@@ -207,16 +221,31 @@ class TinyOnnModel(nn.Module):
         self.layers = nn.ModuleList([Block(config, i) for i in range(config.num_hidden_layers)])
         self.final_ln = nn.LayerNorm(config.hidden_size)
 
-    def forward(self, input_ids: torch.Tensor, **kwargs: Any) -> tuple[torch.Tensor, dict[ExpertID, Any]]:
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        past_key_values: Optional[Tuple[Tuple[torch.Tensor, torch.Tensor], ...]] = None,
+        use_cache: Optional[bool] = False,
+        **kwargs: Any,
+    ) -> Tuple[torch.Tensor, dict[ExpertID, Any], Optional[Tuple[Tuple[torch.Tensor, torch.Tensor], ...]]]:
+        if past_key_values is None:
+            past_key_values = tuple([None] * len(self.layers))
+
         hidden_states = self.embeddings(input_ids)
 
         flat_forward_cache: dict[ExpertID, Any] = {}
-        for layer in self.layers:
-            hidden_states, block_cache = layer(hidden_states)
+        present_key_values: Tuple[Tuple[torch.Tensor, torch.Tensor], ...] = ()
+
+        for i, layer in enumerate(self.layers):
+            hidden_states, block_cache, layer_present_key_value = layer(
+                hidden_states, past_key_values[i], use_cache
+            )
             flat_forward_cache.update(block_cache)
-            
+            if use_cache:
+                present_key_values += (layer_present_key_value,)
+
         hidden_states = self.final_ln(hidden_states)
-        return hidden_states, flat_forward_cache
+        return hidden_states, flat_forward_cache, present_key_values if use_cache else None
 
 
 class TinyOnnForArcReconstruction(nn.Module):
@@ -225,7 +254,15 @@ class TinyOnnForArcReconstruction(nn.Module):
         self.model = TinyOnnModel(config)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
-    def forward(self, input_ids: torch.Tensor, **kwargs: Any) -> tuple[torch.Tensor, dict[ExpertID, Any]]:
-        hidden_states, flat_forward_cache = self.model(input_ids=input_ids, **kwargs)
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        past_key_values: Optional[Tuple[Tuple[torch.Tensor, torch.Tensor], ...]] = None,
+        use_cache: Optional[bool] = False,
+        **kwargs: Any,
+    ) -> Tuple[torch.Tensor, dict[ExpertID, Any], Optional[Tuple[Tuple[torch.Tensor, torch.Tensor], ...]]]:
+        hidden_states, flat_forward_cache, present_key_values = self.model(
+            input_ids=input_ids, past_key_values=past_key_values, use_cache=use_cache, **kwargs
+        )
         final_logits = self.lm_head(hidden_states)
-        return final_logits, flat_forward_cache
+        return final_logits, flat_forward_cache, present_key_values
