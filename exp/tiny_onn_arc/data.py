@@ -1,97 +1,107 @@
 import json
 import random
 from pathlib import Path
+from typing import List, Tuple
 
 import torch
 import torch.nn.functional as F
-from torch.utils.data import Dataset, default_collate
+from torch.utils.data import Dataset
 
-from .config import TinyOnnArcConfig
+# --- JIT-Compilable Augmentation Function ---
+@torch.jit.script
+def process_batch(
+    inputs: torch.Tensor, 
+    outputs: torch.Tensor, 
+    indices: List[int], 
+    device: torch.device
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    
+    batch_inputs = inputs[indices]
+    batch_outputs = outputs[indices]
+    
+    # Vectorized random augmentation parameters
+    batch_size = batch_inputs.shape[0]
+    flips_lr = torch.rand(batch_size, device=device) > 0.5
+    flips_ud = torch.rand(batch_size, device=device) > 0.5
+    rots_k = torch.randint(0, 4, (batch_size,), device=device)
 
+    # Vectorized augmentations
+    for i in range(batch_size):
+        if flips_lr[i]: batch_inputs[i] = torch.fliplr(batch_inputs[i])
+        if flips_ud[i]: batch_inputs[i] = torch.flipud(batch_inputs[i])
+        if rots_k[i] > 0: batch_inputs[i] = torch.rot90(batch_inputs[i], int(rots_k[i]), [0, 1])
+        
+        if flips_lr[i]: batch_outputs[i] = torch.fliplr(batch_outputs[i])
+        if flips_ud[i]: batch_outputs[i] = torch.flipud(batch_outputs[i])
+        if rots_k[i] > 0: batch_outputs[i] = torch.rot90(batch_outputs[i], int(rots_k[i]), [0, 1])
 
-def pad_grid(grid: list[list[int]], max_h: int, max_w: int) -> torch.Tensor:
-    grid_tensor = torch.tensor(grid, dtype=torch.long)
-    h, w = grid_tensor.shape
+    # Vectorized color permutation
+    color_map = torch.randperm(10, device=device)
+    batch_inputs = color_map[batch_inputs]
+    batch_outputs = color_map[batch_outputs]
+    
+    # Vectorized serialization
+    newline_token = torch.tensor([10], dtype=torch.long, device=device)
+    h, w = batch_inputs.shape[1], batch_inputs.shape[2]
+    
+    input_seqs = torch.cat((batch_inputs.flatten(1), newline_token.expand(batch_size, h).flatten(1)), dim=1).view(batch_size, h, w + 1)
+    output_seqs = torch.cat((batch_outputs.flatten(1), newline_token.expand(batch_size, h).flatten(1)), dim=1).view(batch_size, h, w + 1)
 
-    pad_h = max_h - h
-    pad_w = max_w - w
+    input_seq = input_seqs.flatten(1)
+    output_seq = output_seqs.flatten(1)
 
-    if pad_h > 0 or pad_w > 0:
-        grid_tensor = F.pad(grid_tensor, (0, pad_w, 0, pad_h), "constant", 0)
+    model_input = torch.cat([input_seq, output_seq], dim=1)
+    labels = model_input.clone()
+    labels[:, :input_seq.shape[1]] = -100
+    
+    return model_input, labels
 
-    return grid_tensor
-
-
-def augment_grid(grid: torch.Tensor, flip_lr: bool, flip_ud: bool, rot_k: int) -> torch.Tensor:
-    if flip_lr:
-        grid = torch.fliplr(grid)
-    if flip_ud:
-        grid = torch.flipud(grid)
-    if rot_k > 0:
-        grid = torch.rot90(grid, rot_k, [0, 1])
-    return grid
-
-
-class ArcDataset(Dataset):
-    def __init__(self, task_files: list[Path], config: TinyOnnArcConfig, use_test_pairs: bool = False):
-        self.config = config
-        self.max_h = 30
-        self.max_w = 30
-        self.use_test_pairs = use_test_pairs
-        self.samples = []
+# --- GPU-Cached Dataset ---
+class GpuArcDataset(Dataset):
+    def __init__(self, task_files: List[Path], use_test_pairs: bool = False, device: torch.device = torch.device("cpu")):
+        self.device = device
+        self.max_h, self.max_w = 30, 30
+        
+        all_inputs, all_outputs = [], []
         for task_file in task_files:
-            with open(task_file, "r") as f:
-                task = json.load(f)
-                pairs = task["test"] if self.use_test_pairs else task["train"]
-                for pair in pairs:
-                    self.samples.append(pair)
+            task = json.load(open(task_file))
+            pairs = task["test" if use_test_pairs else "train"]
+            for pair in pairs:
+                all_inputs.append(self.pad_grid(pair["input"]))
+                all_outputs.append(self.pad_grid(pair["output"]))
+
+        self.inputs = torch.stack(all_inputs).to(device)
+        self.outputs = torch.stack(all_outputs).to(device)
+
+    def pad_grid(self, grid: List[List[int]]) -> torch.Tensor:
+        grid_tensor = torch.tensor(grid, dtype=torch.long)
+        h, w = grid_tensor.shape
+        return F.pad(grid_tensor, (0, self.max_w - w, 0, self.max_h - h), "constant", 0)
 
     def __len__(self) -> int:
-        return len(self.samples)
+        return len(self.inputs)
 
-    def __getitem__(self, idx: int):
-        pair = self.samples[idx]
+    def __getitem__(self, idx: int) -> int:
+        return idx
 
-        input_tensor = pad_grid(pair["input"], self.max_h, self.max_w)
-        output_tensor = pad_grid(pair["output"], self.max_h, self.max_w)
+class JitCollator:
+    def __init__(self, dataset: GpuArcDataset):
+        self.inputs = dataset.inputs
+        self.outputs = dataset.outputs
+        self.device = dataset.device
+    
+    def __call__(self, indices: List[int]) -> Tuple[torch.Tensor, torch.Tensor]:
+        return process_batch(self.inputs, self.outputs, indices, self.device)
 
-        flip_lr = random.random() > 0.5
-        flip_ud = random.random() > 0.5
-        rot_k = random.randint(0, 3)
-
-        aug_input = augment_grid(input_tensor, flip_lr, flip_ud, rot_k)
-        aug_output = augment_grid(output_tensor, flip_lr, flip_ud, rot_k)
-
-        newline_token = 10
-        input_rows = [torch.cat((row, torch.tensor([newline_token], dtype=torch.long))) for row in aug_input]
-        output_rows = [torch.cat((row, torch.tensor([newline_token], dtype=torch.long))) for row in aug_output]
-
-        input_seq = torch.cat(input_rows)
-        output_seq = torch.cat(output_rows)
-        
-        # For "N+1 visible" training, input is the full sequence, labels are the same
-        model_input = torch.cat([input_seq, output_seq], dim=0)
-        
-        labels = model_input.clone()
-        # Mask out the input part from the loss calculation
-        labels[:len(input_seq)] = -100
-
-        return model_input, labels
-
-
-def collate_fn(batch):
-    batch = [b for b in batch if b is not None]
-    if not batch:
-        return None, None
-    return default_collate(batch)
-
-
-def get_arc_dataset(config: TinyOnnArcConfig, data_dir: str = "data/ARC-AGI-2/data") -> tuple[ArcDataset, ArcDataset]:
+def get_arc_dataset(data_dir: str = "data/ARC-AGI-2/data", device: torch.device = torch.device("cpu")) -> Tuple[GpuArcDataset, GpuArcDataset, JitCollator, JitCollator]:
     data_path = Path(data_dir)
-    train_files = list((data_path / "training").glob("*.json"))
-    eval_files = list((data_path / "evaluation").glob("*.json"))
-
-    train_dataset = ArcDataset(train_files, config, use_test_pairs=False)
-    eval_dataset = ArcDataset(eval_files, config, use_test_pairs=True)
-
-    return train_dataset, eval_dataset
+    train_files = list(data_path.glob("training/*.json"))
+    eval_files = list(data_path.glob("evaluation/*.json"))
+    
+    train_dataset = GpuArcDataset(train_files, use_test_pairs=False, device=device)
+    eval_dataset = GpuArcDataset(eval_files, use_test_pairs=True, device=device)
+    
+    train_collator = JitCollator(train_dataset)
+    eval_collator = JitCollator(eval_dataset)
+    
+    return train_dataset, eval_dataset, train_collator, eval_collator
