@@ -4,7 +4,7 @@ import torch
 class Config:
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-    TRAINING_MODE = 0
+    TRAINING_MODE = 1
 
     MAX_GRID_SIZE = 10
 
@@ -21,15 +21,15 @@ class Config:
     min_moe_experts: int = 24
     intermediate_size: int = 16
 
-    w_ce_smha: float = 1.0
+    w_ce_smha: float = 0.001
     w_kl_smha: float = 1.0
-    w_aux_smha: float = 1.5
-    w_ce_moe: float = 1.0
-    w_kl_moe: float = 1.0
-    w_aux_moe: float = 1.5
+    w_aux_smha: float = 2.0
+    w_ce_moe: float = 0.001
+    w_kl_moe: float = 2.0
+    w_aux_moe: float = 1.0
 
     pi_alpha: float = 32.0
-    pi_gamma: float = 0.5
+    pi_gamma: float = 0.05
 
     BATCH_SIZE = 32 if TRAINING_MODE == 0 else 16
     LEARNING_RATE = 1e-3
@@ -37,9 +37,9 @@ class Config:
     CLIP_GRAD_NORM = 1.0
     CHECKPOINT_DIR = "exp/tiny_onn_arc/checkpoints"
     EPOCHS = 1000
-    LOG_INTERVAL = 1
-    EVAL_INTERVAL = 100
-    EVAL_BATCHES = 4
+    LOG_INTERVAL = 10
+    EVAL_INTERVAL = 50
+    EVAL_BATCHES = 1
     MAX_CHECKPOINTS = 3
 
     def __init__(self, **kwargs):

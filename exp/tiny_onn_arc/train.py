@@ -1,9 +1,11 @@
+import math
 import os
 import time
 from collections import defaultdict
 from pathlib import Path
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from rich.console import Console
 from torch.optim import AdamW
@@ -15,12 +17,54 @@ from .model import ExpertID, TinyOnnForArcReconstruction
 from .observer import Observer, calculate_pi_score
 
 
+def track_and_remake_experts(model: TinyOnnForArcReconstruction, activation_tracker: dict, console: Console):
+    console.print("\n[bold cyan]Checking for inactive experts to remake...[/bold cyan]")
+    remake_count = 0
+    for layer_idx, layer in enumerate(model.model.layers):
+        # --- SMHA Experts ---
+        smha_layer = layer.smha_layer
+        smha_tracker = activation_tracker.get(("smha", layer_idx), torch.zeros(smha_layer.max_experts))
+        inactive_smha_experts = torch.where(smha_tracker == 0)[0]
+
+        for expert_idx in inactive_smha_experts:
+            expert_idx = expert_idx.item()
+            with torch.no_grad():
+                nn.init.xavier_uniform_(smha_layer.q_proj[expert_idx])
+                nn.init.xavier_uniform_(smha_layer.k_proj[expert_idx])
+                nn.init.xavier_uniform_(smha_layer.v_proj[expert_idx])
+                nn.init.xavier_uniform_(smha_layer.o_proj[expert_idx])
+                smha_layer.gating_network.sim_matrix.data[:, expert_idx].normal_()
+                smha_layer.gating_network.gates.data[expert_idx] = 0.0
+            remake_count += 1
+            console.print(f"  - Remade SMHA expert L{layer_idx}/E{expert_idx}")
+
+        # --- MoE Experts ---
+        moe_layer = layer.moe_layer
+        moe_tracker = activation_tracker.get(("moe", layer_idx), torch.zeros(moe_layer.max_experts))
+        inactive_moe_experts = torch.where(moe_tracker == 0)[0]
+
+        for expert_idx in inactive_moe_experts:
+            expert_idx = expert_idx.item()
+            with torch.no_grad():
+                nn.init.kaiming_uniform_(moe_layer.w1[expert_idx], a=math.sqrt(5))
+                nn.init.kaiming_uniform_(moe_layer.w2[expert_idx], a=math.sqrt(5))
+                moe_layer.gating_network.sim_matrix.data[:, expert_idx].normal_()
+                moe_layer.gating_network.gates.data[expert_idx] = 0.0
+            remake_count += 1
+            console.print(f"  - Remade MoE expert L{layer_idx}/E{expert_idx}")
+
+    if remake_count == 0:
+        console.print("  - All experts are active. No remakes needed.")
+    else:
+        console.print(f"[bold green]Total experts remade: {remake_count}[/bold green]")
+
+
 def get_latest_checkpoint(path: Path) -> Path | None:
     checkpoints = list(path.glob("*.pt"))
     return max(checkpoints, key=os.path.getctime) if checkpoints else None
 
 def calculate_gating_loss_and_metrics(
-    config: Config, main_loss: torch.Tensor, aux_outputs: dict[ExpertID, dict]
+    config: Config, loss_vector: torch.Tensor, aux_outputs: dict[ExpertID, dict]
 ) -> tuple[torch.Tensor, dict[str, float], float]:
     metrics = defaultdict(list)
     total_gating_loss = torch.tensor(0.0, device=config.DEVICE)
@@ -28,15 +72,21 @@ def calculate_gating_loss_and_metrics(
     if not expert_outputs:
         return total_gating_loss, {k: 0.0 for k in ["smha_gate_acc", "moe_gate_acc", "smha_avg_k", "moe_avg_k"]}, 0.0
 
-    grads = torch.autograd.grad(main_loss, expert_outputs, retain_graph=True)
     all_surprises = []
 
     for i, (expert_id, cache) in enumerate(aux_outputs.items()):
         type, _, _ = expert_id
         B, T = cache["B"], cache["T"]
+        E = cache["gate_cache"]["logits"].shape[-1]
         logits = cache["gate_cache"]["logits"].view(B * T, -1)
-        grad_norm = torch.linalg.norm(grads[i].view(B * T, -1), dim=-1).view(-1, 1)
-        surprise = grad_norm.expand(-1, logits.shape[-1])
+
+        grad_mask = torch.ones_like(loss_vector)
+
+        # We need to calculate gradients w.r.t. each token's loss contribution.
+        per_expert_grads = torch.autograd.grad(outputs=expert_outputs[i], inputs=cache["final_output"], grad_outputs=torch.ones_like(expert_outputs[i]), retain_graph=True)[0]
+
+        grad_norm = torch.linalg.norm(per_expert_grads.view(B*T,-1), dim=1).unsqueeze(1)
+        surprise = grad_norm.expand(-1, E)
         all_surprises.append(surprise.flatten())
 
         targets = torch.argmin(surprise, dim=-1)
@@ -126,6 +176,9 @@ def main():
     last_log_time = time.time()
     for epoch in range(start_epoch, config.EPOCHS):
         model.train()
+
+        expert_activation_tracker = {}
+
         for input_ids, labels, attention_mask in train_loader:
             optimizer.zero_grad()
 
@@ -141,14 +194,22 @@ def main():
                 logits, aux_outputs, _ = model(generated_ids.detach(), attention_mask=F.pad(attention_mask, (0, generated_ids.shape[1] - attention_mask.shape[1]), "constant", 1))
                 generated_ids_for_acc = generated_ids
 
-            main_loss = F.cross_entropy(logits.view(-1, config.vocab_size), labels.view(-1), ignore_index=-100)
+            loss_vector = F.cross_entropy(logits.view(-1, config.vocab_size), labels.view(-1), ignore_index=-100, reduction='none')
+            main_loss = loss_vector.mean()
 
             if torch.isnan(main_loss) or not aux_outputs:
                 global_step += 1
                 continue
 
-            gating_loss, gate_metrics, avg_surprise = calculate_gating_loss_and_metrics(config, main_loss, aux_outputs)
+            gating_loss, gate_metrics, avg_surprise = calculate_gating_loss_and_metrics(config, loss_vector, aux_outputs)
             total_loss = main_loss + gating_loss
+
+            for expert_id, cache in aux_outputs.items():
+                type, layer_idx, _ = expert_id
+                key = (type, layer_idx)
+                if key not in expert_activation_tracker:
+                    expert_activation_tracker[key] = torch.zeros(cache["gate_cache"]["activation_mask"].shape[-1], device=device)
+                expert_activation_tracker[key] += cache["gate_cache"]["activation_mask"].sum(dim=0)
 
             if not torch.isnan(total_loss):
                 total_loss.backward()
@@ -179,6 +240,8 @@ def main():
                     os.remove(checkpoints[0])
 
             global_step += 1
+
+        track_and_remake_experts(model, expert_activation_tracker, console)
 
 if __name__ == "__main__":
     main()
