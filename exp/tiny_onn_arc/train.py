@@ -10,24 +10,24 @@ import torch.nn.functional as F
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
 from rich.console import Console
-from rich.table import Table
 
 from .config import TinyOnnArcConfig
 from .data import get_arc_dataset
 from .model import TinyOnnForArcReconstruction, ExpertID
 
 # --- HYPERPARAMETERS ---
-TRAINING_MODE = 0  # 0 for Teacher Forcing, 1 for Autoregressive Alignment
+TRAINING_MODE = 1
 BATCH_SIZE = 8 if TRAINING_MODE == 0 else 4
 LEARNING_RATE = 1e-3
 WEIGHT_DECAY = 0.01
 CLIP_GRAD_NORM = 1.0
 CHECKPOINT_DIR = "exp/tiny_onn_arc/checkpoints"
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+DEVICE = "cpu"
 EPOCHS = 1000
 LOG_INTERVAL = 1
-EVAL_INTERVAL = 20
+EVAL_INTERVAL = 100
 EVAL_BATCHES = 1
+MAX_CHECKPOINTS = 3
 
 ARC_COLORS = ["black", "blue", "red", "green", "yellow", "grey82", "magenta", "orange", "cyan", "white"]
 SPLIT_POINT = 30 * 31
@@ -91,38 +91,30 @@ def render_arc_grids(console: Console, input_ids: torch.Tensor, labels: torch.Te
         return seq.view(30, 31)[:, :-1].tolist()
 
     input_grid = to_grid(input_ids[batch_idx, :SPLIT_POINT].cpu())
-    
     target_seq = labels[batch_idx, SPLIT_POINT:].clone().cpu()
     target_seq[target_seq == -100] = 0
     target_grid = to_grid(target_seq)
-    
     pred_grid = to_grid(generated_ids[batch_idx, SPLIT_POINT:].cpu())
-    
+
+    def format_grid_rows(grid: list[list[int]]) -> list[str]:
+        rows = []
+        for r in grid[:15]:
+            row_str = ""
+            for p in r[:15]:
+                color = ARC_COLORS[p] if 0 <= p < len(ARC_COLORS) else "white"
+                row_str += f"[{color}]█[/]"
+            rows.append(row_str)
+        return rows
+
+    input_rows = format_grid_rows(input_grid)
+    target_rows = format_grid_rows(target_grid)
+    pred_rows = format_grid_rows(pred_grid)
+
     console.print(f"\n--- Sample {batch_idx} ---")
-    
-    header = f"{'Input (Numerical)':<45} | {'Target (Numerical)':<45} | {'Prediction (Numerical)':<45}"
-    console.print(header)
-    console.print("-" * len(header))
-    for i in range(30):
-        in_row = " ".join(f"{p:2}" for p in input_grid[i][:15])
-        tgt_row = " ".join(f"{p:2}" for p in target_grid[i][:15])
-        pred_row = " ".join(f"{p:2}" for p in pred_grid[i][:15])
-        console.print(f"{in_row:<45} | {tgt_row:<45} | {pred_row:<45}")
-    console.print("-" * len(header))
-
-    def format_color_grid(grid: list[list[int]], title: str) -> str:
-        text_content = f"[bold]{title}[/bold]\n"
-        for row in grid:
-            for pixel in row:
-                color = ARC_COLORS[pixel] if 0 <= pixel < len(ARC_COLORS) else "white"
-                text_content += f"[{color} on {color}]  [/]"
-            text_content += "\n"
-        return text_content.strip()
-
-    console.print(format_color_grid(input_grid, "\nInput (Visual)"))
-    console.print(format_color_grid(target_grid, "\nTarget (Visual)"))
-    console.print(format_color_grid(pred_grid, "\nPrediction (Visual)"))
-    console.print("-" * len(header))
+    title_width = 15 * 2
+    console.print(f"{'[bold]Input[/bold]':<{title_width}} {'[bold]Target[/bold]':<{title_width}} {'[bold]Prediction[/bold]':<{title_width}}")
+    for i in range(15):
+        console.print(f"{input_rows[i]:<{title_width}} {target_rows[i]:<{title_width}} {pred_rows[i]:<{title_width}}")
 
 def run_evaluation(model: TinyOnnForArcReconstruction, eval_loader: DataLoader, console: Console):
     model.eval()
@@ -163,16 +155,21 @@ def main():
     eval_loader = DataLoader(eval_dataset, batch_size=1, shuffle=False, collate_fn=eval_collator)
     
     model = TinyOnnForArcReconstruction(config).to(device)
-    optimizer = AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
     
-    start_epoch, global_step = 0, 0
     if ckpt_path := get_latest_checkpoint(checkpoint_dir):
         ckpt = torch.load(ckpt_path)
         model.load_state_dict(ckpt['model_state_dict'])
+        console.print(f"Resumed model from checkpoint {ckpt_path}")
+        
+    model = torch.compile(model)
+    optimizer = AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+
+    start_epoch, global_step = 0, 0
+    if ckpt_path and 'optimizer_state_dict' in ckpt:
         optimizer.load_state_dict(ckpt['optimizer_state_dict'])
-        start_epoch = ckpt['epoch']
-        global_step = ckpt['global_step']
-        console.print(f"Resumed from checkpoint {ckpt_path} at epoch {start_epoch}, step {global_step}")
+        start_epoch = ckpt.get('epoch', 0)
+        global_step = ckpt.get('global_step', 0)
+        console.print(f"Resumed optimizer and state from step {global_step}")
 
     last_log_time = time.time()
     for epoch in range(start_epoch, EPOCHS):
@@ -224,7 +221,16 @@ def main():
             if global_step > 0 and global_step % EVAL_INTERVAL == 0:
                 run_evaluation(model, eval_loader, console)
                 ckpt_path = checkpoint_dir / f"ckpt_step_{global_step}.pt"
-                torch.save({'epoch': epoch, 'global_step': global_step, 'model_state_dict': model.state_dict(),'optimizer_state_dict': optimizer.state_dict()}, ckpt_path)
+                torch.save({
+                    'epoch': epoch, 
+                    'global_step': global_step, 
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict()
+                }, ckpt_path)
+
+                checkpoints = sorted(checkpoint_dir.glob("*.pt"), key=os.path.getctime)
+                if len(checkpoints) > MAX_CHECKPOINTS:
+                    os.remove(checkpoints[0])
 
             global_step += 1
 

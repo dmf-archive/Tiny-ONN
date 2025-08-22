@@ -1,33 +1,45 @@
-class TinyOnnArcConfig:
-    model_type = "tiny_onn_arc"
 
+import torch
+
+class Config:
+    DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+    
+    TRAINING_MODE = 0 
+    
+    MAX_GRID_SIZE = 10
+    
     vocab_size: int = 11
     hidden_size: int = 128
     num_hidden_layers: int = 8
-    max_position_embeddings: int = 1861
+    max_position_embeddings: int = (MAX_GRID_SIZE * (MAX_GRID_SIZE + 1)) * 2 + 1
     
-    # DynSMHA specific
     max_attention_experts: int = 24
     min_attention_experts: int = 24
     head_dim: int = 16
-
-    # DynMoE specific
+    
     max_moe_experts: int = 24
     min_moe_experts: int = 24
     intermediate_size: int = 16
-
-    # Loss weights
+    
     w_ce_smha: float = 1.0
     w_kl_smha: float = 1.0
     w_aux_smha: float = 1.5
     w_ce_moe: float = 1.0
     w_kl_moe: float = 1.0
     w_aux_moe: float = 1.5
-
-    # Predictive Integrity Score specific
+    
     pi_alpha: float = 64.0
     pi_gamma: float = 0.5
     
+    BATCH_SIZE = 32 if TRAINING_MODE == 0 else 16
+    LEARNING_RATE = 1e-3
+    WEIGHT_DECAY = 0.01
+    CLIP_GRAD_NORM = 1.0
+    CHECKPOINT_DIR = "exp/tiny_onn_arc/checkpoints"
+    EPOCHS = 1000
+    LOG_INTERVAL = 1
+    EVAL_INTERVAL = 100
+    EVAL_BATCHES = 4
+    MAX_CHECKPOINTS = 3
+    
     def __init__(self, **kwargs):
-        for key, value in kwargs.items():
-            setattr(self, key, value)

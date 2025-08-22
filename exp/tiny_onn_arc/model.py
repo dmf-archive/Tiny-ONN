@@ -89,18 +89,31 @@ class DynSMHALayer(nn.Module):
         return self.gating_network(hidden_states)
 
     def forward_main(
-        self, hidden_states: torch.Tensor, routing_weights: torch.Tensor, past_key_values: Optional[KVCache] = None, use_cache: bool = False
+        self, hidden_states: torch.Tensor, routing_weights: torch.Tensor, gate_cache: dict[str, torch.Tensor], past_key_values: Optional[KVCache] = None, use_cache: bool = False
     ) -> Tuple[torch.Tensor, dict[str, Any], Optional[KVCache]]:
         B, T, C = hidden_states.shape
-        routing_weights_reshaped = rearrange(routing_weights, "(b t) e -> b t e", b=B, t=T)
+        flat_hidden_states = hidden_states.view(B * T, C)
+        activation_mask = gate_cache["activation_mask"]
 
-        q_experts = torch.einsum("btc,ech->bteh", hidden_states, self.q_proj)
-        k_experts = torch.einsum("btc,ech->bteh", hidden_states, self.k_proj)
-        v_experts = torch.einsum("btc,ech->bteh", hidden_states, self.v_proj)
+        q_acc = torch.zeros(B * T, self.config.head_dim, dtype=hidden_states.dtype, device=hidden_states.device)
+        k_acc = torch.zeros_like(q_acc)
+        v_acc = torch.zeros_like(q_acc)
 
-        q_agg = torch.einsum("bteh,bte->bth", q_experts, routing_weights_reshaped)
-        k_agg = torch.einsum("bteh,bte->bth", k_experts, routing_weights_reshaped)
-        v_agg = torch.einsum("bteh,bte->bth", v_experts, routing_weights_reshaped)
+        for i in range(self.max_experts):
+            token_indices = torch.where(activation_mask[:, i] > 0)[0]
+            if token_indices.shape[0] == 0:
+                continue
+
+            tokens_for_expert = flat_hidden_states[token_indices]
+            weights_for_expert = routing_weights[token_indices, i].unsqueeze(1)
+
+            q_acc.index_add_(0, token_indices, torch.matmul(tokens_for_expert, self.q_proj[i]) * weights_for_expert)
+            k_acc.index_add_(0, token_indices, torch.matmul(tokens_for_expert, self.k_proj[i]) * weights_for_expert)
+            v_acc.index_add_(0, token_indices, torch.matmul(tokens_for_expert, self.v_proj[i]) * weights_for_expert)
+
+        q_agg = q_acc.view(B, T, -1)
+        k_agg = k_acc.view(B, T, -1)
+        v_agg = v_acc.view(B, T, -1)
 
         if past_key_values is not None:
             past_k, past_v = past_key_values
@@ -114,14 +127,22 @@ class DynSMHALayer(nn.Module):
         v = rearrange(v_agg, "b t h -> b 1 t h")
 
         attn_output = F.scaled_dot_product_attention(q, k, v, is_causal=self.is_causal and T > 1)
-        attn_output = rearrange(attn_output, "b 1 t h -> b t h")
-
-        output_experts = torch.einsum("bth,ehc->btec", attn_output, self.o_proj)
-        final_output = torch.einsum("btec,bte->btc", output_experts, routing_weights_reshaped)
-
+        attn_output = rearrange(attn_output, "b 1 t h -> b t h").view(B * T, -1)
+        
+        final_output = torch.zeros_like(flat_hidden_states)
+        for i in range(self.max_experts):
+            token_indices = torch.where(activation_mask[:, i] > 0)[0]
+            if token_indices.shape[0] == 0:
+                continue
+            
+            attn_output_for_expert = attn_output[token_indices]
+            weights_for_expert = routing_weights[token_indices, i].unsqueeze(1)
+            
+            final_output.index_add_(0, token_indices, torch.matmul(attn_output_for_expert, self.o_proj[i]) * weights_for_expert)
+        
+        final_output = final_output.view(B, T, C)
         cache = {"final_output": final_output, "routing_weights": routing_weights, "B": B, "T": T}
         return final_output, cache, present_key_values
-
 
 class DynamicMoELayer(nn.Module):
     def __init__(self, config: TinyOnnArcConfig):
@@ -142,16 +163,27 @@ class DynamicMoELayer(nn.Module):
         self, hidden_states: torch.Tensor, routing_weights: torch.Tensor, gate_cache: dict[str, torch.Tensor]
     ) -> Tuple[torch.Tensor, dict[str, Any], Optional[KVCache]]:
         B, T, C = hidden_states.shape
-        routing_weights_reshaped = rearrange(routing_weights, "(b t) e -> b t e", b=B)
+        flat_hidden_states = hidden_states.view(B * T, C)
+        final_output = torch.zeros_like(flat_hidden_states)
+        
+        activation_mask = gate_cache["activation_mask"]
 
-        intermediate_experts = F.gelu(torch.einsum("btc,eci->btei", hidden_states, self.w1))
-        output_experts = torch.einsum("btei,eic->btec", intermediate_experts, self.w2)
-
-        final_output = torch.einsum("btec,bte->btc", output_experts, routing_weights_reshaped)
-
-        cache = {"final_output": final_output, "gate_cache": gate_cache, "routing_weights": routing_weights, "B": B, "T": T, "normed_hs": hidden_states, "layer": self}
+        for i in range(self.max_experts):
+            token_indices = torch.where(activation_mask[:, i] > 0)[0]
+            if token_indices.shape[0] == 0:
+                continue
+            
+            tokens_for_expert = flat_hidden_states[token_indices]
+            weights_for_expert = routing_weights[token_indices, i].unsqueeze(1)
+            
+            intermediate = F.gelu(torch.matmul(tokens_for_expert, self.w1[i]))
+            output = torch.matmul(intermediate, self.w2[i])
+            
+            final_output.index_add_(0, token_indices, output * weights_for_expert)
+            
+        final_output = final_output.view(B, T, C)
+        cache = {"final_output": final_output, "gate_cache": gate_cache, "routing_weights": routing_weights, "B": B, "T": T}
         return final_output, cache, None
-
 
 class Block(nn.Module):
     def __init__(self, config: TinyOnnArcConfig, layer_index: int):
@@ -168,26 +200,18 @@ class Block(nn.Module):
         residual = hidden_states
         normed_hs_smha = self.ln1(hidden_states)
         smha_routing_weights, smha_gate_cache = self.smha_layer.forward_gating(normed_hs_smha)
-        B, T, C = hidden_states.shape
-        smha_routing_weights_flat = smha_routing_weights.view(B * T, -1)
-
+        
         attn_output, smha_cache, present_key_values = self.smha_layer.forward_main(
-            normed_hs_smha, smha_routing_weights_flat, past_key_values, use_cache=use_cache
+            normed_hs_smha, smha_routing_weights, smha_gate_cache, past_key_values, use_cache=use_cache
         )
-
         smha_cache["gate_cache"] = smha_gate_cache
-        smha_cache["normed_hs"] = normed_hs_smha
-        smha_cache["layer"] = self.smha_layer
         hidden_states = residual + attn_output
 
         residual = hidden_states
         normed_hs_moe = self.ln2(hidden_states)
         moe_routing_weights, moe_gate_cache = self.moe_layer.forward_gating(normed_hs_moe)
-        moe_routing_weights_flat = moe_routing_weights.view(B * T, -1)
         
-        moe_output, moe_cache, _ = self.moe_layer.forward_main(normed_hs_moe, moe_routing_weights_flat, moe_gate_cache)
-
-        moe_cache["normed_hs"] = normed_hs_moe
+        moe_output, moe_cache, _ = self.moe_layer.forward_main(normed_hs_moe, moe_routing_weights, moe_gate_cache)
         hidden_states = residual + moe_output
 
         block_cache = {("smha", self.layer_index, 0): smha_cache, ("moe", self.layer_index, 0): moe_cache}
@@ -204,11 +228,7 @@ class AutoregressiveEmbedding(nn.Module):
     def forward(self, input_ids: torch.Tensor, past_seq_len: int = 0) -> torch.Tensor:
         seq_len = input_ids.size(1)
         pos_ids = self.position_ids[past_seq_len : past_seq_len + seq_len]
-        
-        tok_embeds = self.tok_embed(input_ids)
-        pos_embeds = self.pos_embed(pos_ids)
-        
-        return tok_embeds + pos_embeds
+        return self.tok_embed(input_ids) + self.pos_embed(pos_ids)
 
 
 class TinyOnnModel(nn.Module):
@@ -246,8 +266,7 @@ class TinyOnnForArcReconstruction(nn.Module):
 
     def forward(self, input_ids: torch.Tensor, past_key_values: Optional[PastKVCache] = None, use_cache: bool = False, **kwargs: Any) -> Tuple[torch.Tensor, dict[ExpertID, Any], Optional[PastKVCache]]:
         hidden_states, flat_forward_cache, present_key_values = self.model(input_ids=input_ids, past_key_values=past_key_values, use_cache=use_cache)
-        final_logits = self.lm_head(hidden_states)
-        return final_logits, flat_forward_cache, present_key_values
+        return self.lm_head(hidden_states), flat_forward_cache, present_key_values
 
     @torch.no_grad()
     def generate(self, input_ids: torch.Tensor, max_new_tokens: int) -> torch.Tensor:
@@ -255,13 +274,9 @@ class TinyOnnForArcReconstruction(nn.Module):
         generated_ids = input_ids
         past_key_values = None
         for _ in range(max_new_tokens):
-            if past_key_values:
-                input_ids = generated_ids[:, -1].unsqueeze(-1)
-            
-            logits, _, past_key_values = self.forward(input_ids=input_ids, past_key_values=past_key_values, use_cache=True)
-            
+            input_token = generated_ids[:, -1].unsqueeze(-1) if past_key_values else generated_ids
+            logits, _, past_key_values = self.forward(input_ids=input_token, past_key_values=past_key_values, use_cache=True)
             next_token = torch.argmax(logits[:, -1, :], dim=-1).unsqueeze(-1)
             generated_ids = torch.cat([generated_ids, next_token], dim=1)
-
         self.train()
         return generated_ids

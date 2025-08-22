@@ -58,17 +58,24 @@ def process_batch(
 
 # --- GPU-Cached Dataset ---
 class GpuArcDataset(Dataset):
-    def __init__(self, task_files: List[Path], use_test_pairs: bool = False, device: torch.device = torch.device("cpu")):
+    def __init__(self, task_files: List[Path], use_test_pairs: bool = False, device: torch.device = torch.device("cpu"), max_grid_size: int = 10):
         self.device = device
-        self.max_h, self.max_w = 30, 30
+        self.max_h, self.max_w = max_grid_size, max_grid_size
         
         all_inputs, all_outputs = [], []
         for task_file in task_files:
-            task = json.load(open(task_file))
-            pairs = task["test" if use_test_pairs else "train"]
-            for pair in pairs:
-                all_inputs.append(self.pad_grid(pair["input"]))
-                all_outputs.append(self.pad_grid(pair["output"]))
+            try:
+                task = json.load(open(task_file))
+                pairs = task["test" if use_test_pairs else "train"]
+                for pair in pairs:
+                    h_in, w_in = len(pair["input"]), len(pair["input"][0])
+                    h_out, w_out = len(pair["output"]), len(pair["output"][0])
+
+                    if h_in <= self.max_h and w_in <= self.max_w and h_out <= self.max_h and w_out <= self.max_w:
+                        all_inputs.append(self.pad_grid(pair["input"]))
+                        all_outputs.append(self.pad_grid(pair["output"]))
+            except (IOError, json.JSONDecodeError):
+                continue
 
         self.inputs = torch.stack(all_inputs).to(device)
         self.outputs = torch.stack(all_outputs).to(device)
@@ -94,12 +101,13 @@ class JitCollator:
         return process_batch(self.inputs, self.outputs, indices, self.device)
 
 def get_arc_dataset(data_dir: str = "data/ARC-AGI-2/data", device: torch.device = torch.device("cpu")) -> Tuple[GpuArcDataset, GpuArcDataset, JitCollator, JitCollator]:
+    device = torch.device("cpu")
     data_path = Path(data_dir)
     train_files = list(data_path.glob("training/*.json"))
     eval_files = list(data_path.glob("evaluation/*.json"))
     
-    train_dataset = GpuArcDataset(train_files, use_test_pairs=False, device=device)
-    eval_dataset = GpuArcDataset(eval_files, use_test_pairs=True, device=device)
+    train_dataset = GpuArcDataset(train_files, use_test_pairs=False, device=device, max_grid_size=10)
+    eval_dataset = GpuArcDataset(eval_files, use_test_pairs=True, device=device, max_grid_size=10)
     
     train_collator = JitCollator(train_dataset)
     eval_collator = JitCollator(eval_dataset)
