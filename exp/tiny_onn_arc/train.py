@@ -14,7 +14,7 @@ from torch.utils.data import DataLoader
 from .config import Config
 from .data import get_arc_dataloaders
 from .model import ExpertID, TinyOnnForArcReconstruction
-from .observer import Observer, calculate_pi_score
+from .observer import Observer
 
 
 def track_and_remake_experts(model: TinyOnnForArcReconstruction, activation_tracker: dict, console: Console):
@@ -64,7 +64,7 @@ def get_latest_checkpoint(path: Path) -> Path | None:
     return max(checkpoints, key=os.path.getctime) if checkpoints else None
 
 def calculate_gating_loss_and_metrics(
-    config: Config, loss_vector: torch.Tensor, aux_outputs: dict[ExpertID, dict]
+    config: Config, main_loss: torch.Tensor, aux_outputs: dict[ExpertID, dict]
 ) -> tuple[torch.Tensor, dict[str, float], float]:
     metrics = defaultdict(list)
     total_gating_loss = torch.tensor(0.0, device=config.DEVICE)
@@ -73,36 +73,61 @@ def calculate_gating_loss_and_metrics(
         return total_gating_loss, {k: 0.0 for k in ["smha_gate_acc", "moe_gate_acc", "smha_avg_k", "moe_avg_k"]}, 0.0
 
     all_surprises = []
+    all_logits = []
+    all_gating_nets = [] # To store references to GatingNetwork instances
+
+    for expert_id, cache in aux_outputs.items():
+        B, T = cache["B"], cache["T"]
+        logits = cache["gate_cache"]["logits"].view(B * T, -1)
+        all_logits.append(logits)
+        
+        # Retrieve the GatingNetwork instance from aux_outputs
+        gating_net = cache["gate_cache"]["gating_net"]
+        all_gating_nets.append(gating_net)
+
+        per_expert_grads = torch.autograd.grad(outputs=main_loss, inputs=cache["final_output"], retain_graph=True)[0]
+        grad_norm = torch.linalg.norm(per_expert_grads.view(B * T, -1), dim=1)
+        all_surprises.append(grad_norm)
+
+    surprise_tensor = torch.stack(all_surprises, dim=0).view(len(aux_outputs), -1)
+    surprise_mean = surprise_tensor.mean()
+
+    combined_logits = torch.cat(all_logits, dim=0)
+    mask = combined_logits.argmax(-1) != -100
+    tau = torch.distributions.Categorical(logits=combined_logits).entropy()[mask].mean()
+    pi_score = torch.exp(-config.pi_alpha * ((1 - config.pi_gamma) * (main_loss.item() / (tau + 1e-9)) + config.pi_gamma * surprise_mean))
+    temperature = torch.max(pi_score, torch.tensor(1e-6, device=pi_score.device))
+    
+    # Dynamic sparsity weight: (1.0 - PI)
+    dynamic_w_sparsity = (1.0 - pi_score.detach())
 
     for i, (expert_id, cache) in enumerate(aux_outputs.items()):
         type, _, _ = expert_id
         B, T = cache["B"], cache["T"]
-        E = cache["gate_cache"]["logits"].shape[-1]
-        logits = cache["gate_cache"]["logits"].view(B * T, -1)
+        num_tokens = B * T
+        
+        gating_net = all_gating_nets[i] # Retrieve the GatingNetwork instance
+        logits = all_logits[i]
+        surprise = surprise_tensor[i].view(num_tokens, 1).expand(-1, logits.shape[-1])
 
-        grad_mask = torch.ones_like(loss_vector)
-
-        # We need to calculate gradients w.r.t. each token's loss contribution.
-        per_expert_grads = torch.autograd.grad(outputs=expert_outputs[i], inputs=cache["final_output"], grad_outputs=torch.ones_like(expert_outputs[i]), retain_graph=True)[0]
-
-        grad_norm = torch.linalg.norm(per_expert_grads.view(B*T,-1), dim=1).unsqueeze(1)
-        surprise = grad_norm.expand(-1, E)
-        all_surprises.append(surprise.flatten())
-
-        targets = torch.argmin(surprise, dim=-1)
-        metrics[f"{type}_gate_acc"].append((logits.argmax(-1) == targets).float().mean().item())
-
-        w_ce, w_kl, w_aux = getattr(config, f"w_ce_{type}"), getattr(config, f"w_kl_{type}"), getattr(config, f"w_aux_{type}")
-        g_loss = w_ce * F.cross_entropy(logits, targets)
-        g_loss += w_kl * F.kl_div(F.log_softmax(logits, -1), F.log_softmax(-surprise, -1), log_target=True, reduction="batchmean")
-        total_gating_loss += w_aux * g_loss
-
+        target_p = F.softmax(-surprise / temperature.detach(), dim=-1)
+        log_pred_p = F.log_softmax(logits, dim=-1)
+        
+        soft_ce_loss = (-target_p * log_pred_p).sum(dim=-1).mean()
+        sparsity_loss = torch.norm(torch.sigmoid(gating_net.gates), p=1) # L1 norm of sigmoid(gates)
+        
+        # Combine soft_ce_loss with PI-driven sparsity_loss
+        g_loss = soft_ce_loss + dynamic_w_sparsity * sparsity_loss
+        
+        total_gating_loss += getattr(config, f"w_aux_{type}") * g_loss
+        
+        metrics[f"{type}_gate_acc"].append((logits.argmax(-1) == surprise.argmin(-1)).float().mean().item())
         mask = cache["gate_cache"]["activation_mask"].view(B * T, -1)
         metrics[f"{type}_avg_k"].append(mask.float().sum(1).mean().item())
 
-    avg_surprise = torch.cat(all_surprises).mean().item()
     processed_metrics = {k: sum(v) / len(v) for k, v in metrics.items()}
-    return total_gating_loss, processed_metrics, avg_surprise
+    processed_metrics["pi_score"] = pi_score.item()
+    return total_gating_loss, processed_metrics, surprise_mean.item()
 
 def calculate_accuracy_metrics(generated_ids: torch.Tensor, labels: torch.Tensor, logits: torch.Tensor) -> dict[str, float]:
     mask = labels != -100
@@ -148,6 +173,14 @@ def run_evaluation(model: TinyOnnForArcReconstruction, eval_loader: DataLoader, 
     avg_tok_acc = total_tok_acc / count if count > 0 else 0
     avg_grid_acc = total_grid_acc / count if count > 0 else 0
     observer.log_eval_results({"tok_acc": avg_tok_acc, "grid_acc": avg_grid_acc})
+    
+    if ckpt_path := get_latest_checkpoint(Path(config.CHECKPOINT_DIR)):
+        try:
+            step = int(ckpt_path.stem.split('_')[-1])
+            observer.visualize_expert_space(model, step)
+        except (ValueError, IndexError):
+            pass
+            
     model.train()
 
 def main():
@@ -194,14 +227,13 @@ def main():
                 logits, aux_outputs, _ = model(generated_ids.detach(), attention_mask=F.pad(attention_mask, (0, generated_ids.shape[1] - attention_mask.shape[1]), "constant", 1))
                 generated_ids_for_acc = generated_ids
 
-            loss_vector = F.cross_entropy(logits.view(-1, config.vocab_size), labels.view(-1), ignore_index=-100, reduction='none')
-            main_loss = loss_vector.mean()
+            main_loss = F.cross_entropy(logits.view(-1, config.vocab_size), labels.view(-1), ignore_index=-100)
 
             if torch.isnan(main_loss) or not aux_outputs:
                 global_step += 1
                 continue
 
-            gating_loss, gate_metrics, avg_surprise = calculate_gating_loss_and_metrics(config, loss_vector, aux_outputs)
+            gating_loss, gate_metrics, avg_surprise = calculate_gating_loss_and_metrics(config, main_loss, aux_outputs)
             total_loss = main_loss + gating_loss
 
             for expert_id, cache in aux_outputs.items():
@@ -218,12 +250,15 @@ def main():
 
             if global_step > 0 and global_step % config.LOG_INTERVAL == 0:
                 acc_metrics = calculate_accuracy_metrics(generated_ids_for_acc, labels, logits)
-                pi_score = calculate_pi_score(config, main_loss.item(), avg_surprise, logits)
-                gate_metrics["pi_score"] = pi_score
                 ips = config.LOG_INTERVAL / (time.time() - last_log_time)
                 last_log_time = time.time()
-
-                observer.log_step(epoch, global_step, {"main": main_loss.item(), "gating": gating_loss.item()}, {**acc_metrics, **gate_metrics}, ips)
+                observer.log_step(
+                    epoch,
+                    global_step,
+                    {"main": main_loss.item(), "gating": gating_loss.item()},
+                    {**acc_metrics, **gate_metrics},
+                    ips,
+                )
 
             if global_step > 0 and global_step % config.EVAL_INTERVAL == 0:
                 run_evaluation(model, eval_loader, observer, config)

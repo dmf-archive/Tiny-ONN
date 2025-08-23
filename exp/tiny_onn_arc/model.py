@@ -58,7 +58,7 @@ class GatingNetwork(nn.Module):
         routing_weights, logits, activation_mask, gated_logits = _gating_logic(
             hidden_states, self.sim_matrix, self.gates, self.max_experts, self.min_experts
         )
-        return routing_weights, {"logits": logits, "activation_mask": activation_mask, "gated_logits": gated_logits}
+        return routing_weights, {"logits": logits, "activation_mask": activation_mask, "gated_logits": gated_logits, "gating_net": self}
 
 class DynSMHALayer(nn.Module):
     def __init__(self, config: Config, is_causal: bool = False):
@@ -184,12 +184,36 @@ class TinyOnnModel(nn.Module):
         super().__init__()
         self.config = config
         self.embeddings = AutoregressiveEmbedding(config)
+        
+        if self.config.use_object_finder:
+            self.obj_finder_ln = nn.LayerNorm(config.hidden_size)
+            self.object_finder_layer = DynSMHALayer(config, is_causal=False)
+
         self.layers = nn.ModuleList([Block(config, i) for i in range(config.num_hidden_layers)])
         self.final_ln = nn.LayerNorm(config.hidden_size)
 
     def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor | None = None, past_key_values: PastKVCache | None = None, use_cache: bool = False) -> tuple[torch.Tensor, dict[ExpertID, Any], PastKVCache | None]:
         past_seq_len = past_key_values[0][0].shape[1] if past_key_values is not None else 0
         hidden_states = self.embeddings(input_ids, past_seq_len=past_seq_len)
+
+        if self.config.use_object_finder:
+            B, T, C = hidden_states.shape
+            normed_hs = self.obj_finder_ln(hidden_states)
+            routing_weights, gate_cache = self.object_finder_layer.forward_gating(normed_hs)
+
+            E, D_head = self.object_finder_layer.max_experts, self.config.head_dim
+            q_proj_w = torch.einsum("bte,ecd->btdc", routing_weights.view(B, T, E), self.object_finder_layer.q_proj)
+            k_proj_w = torch.einsum("bte,ecd->btdc", routing_weights.view(B, T, E), self.object_finder_layer.k_proj)
+
+            Q = torch.einsum("btc,btdc->btd", hidden_states, q_proj_w)
+            K = torch.einsum("btc,btdc->btd", hidden_states, k_proj_w)
+
+            affinity_scores = torch.einsum("btd,bsd->bts", Q, K) / math.sqrt(D_head)
+            affinity_matrix = F.softmax(affinity_scores, dim=-1)
+
+            object_ids = torch.argmax(affinity_matrix, dim=-1)
+            object_prototypes = torch.gather(hidden_states, 1, object_ids.unsqueeze(-1).expand_as(hidden_states))
+            hidden_states = hidden_states + object_prototypes
 
         if attention_mask is not None:
              attention_mask = attention_mask[:, None, None, :]

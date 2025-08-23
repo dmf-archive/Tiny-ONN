@@ -1,9 +1,13 @@
 import math
+from pathlib import Path
 
+import matplotlib.pyplot as plt
 import torch
 from rich.console import Console
+from sklearn.decomposition import PCA
 
 from .config import Config
+from .model import TinyOnnForArcReconstruction
 
 
 class Observer:
@@ -81,9 +85,38 @@ class Observer:
                 pr = pred_rows[j] if j < len(pred_rows) else ""
                 self.console.print(f"{ir:<{title_width}} {tr:<{title_width}} {pr:<{title_width}}")
 
-def calculate_pi_score(config: Config, main_loss: float, avg_surprise: float, logits: torch.Tensor) -> float:
-    mask = logits.argmax(-1) != -100
-    if not mask.any(): return 0.0
-    tau = torch.distributions.Categorical(logits=logits).entropy()[mask].mean().item()
-    pi_score = math.exp(-config.pi_alpha * ((1 - config.pi_gamma) * (main_loss / (tau + 1e-9)) + config.pi_gamma * avg_surprise))
-    return pi_score
+    def visualize_expert_space(self, model: TinyOnnForArcReconstruction, step: int):
+        Path("exp/tiny_onn_arc/expert_viz").mkdir(exist_ok=True)
+        num_layers = model.config.num_hidden_layers
+        fig, axes = plt.subplots(2, num_layers, figsize=(num_layers * 5, 10))
+        fig.suptitle(f"Expert Space Visualization @ Step {step}", fontsize=16)
+
+        for i in range(num_layers):
+            # SMHA
+            smha_gating = model.model.layers[i].smha_layer.gating_network
+            smha_sim = smha_gating.sim_matrix.data.T.cpu().numpy()
+            smha_gates = smha_gating.gates.data.cpu().numpy()
+            
+            pca_smha = PCA(n_components=2)
+            smha_2d = pca_smha.fit_transform(smha_sim)
+            
+            axes[0, i].set_title(f"Layer {i} SMHA")
+            sc_smha = axes[0, i].scatter(smha_2d[:, 0], smha_2d[:, 1], s=(-smha_gates + 1) * 20, c=smha_gates, cmap="viridis_r")
+            fig.colorbar(sc_smha, ax=axes[0, i], label="Gate Value (lower is easier)")
+
+            # MoE
+            moe_gating = model.model.layers[i].moe_layer.gating_network
+            moe_sim = moe_gating.sim_matrix.data.T.cpu().numpy()
+            moe_gates = moe_gating.gates.data.cpu().numpy()
+            
+            pca_moe = PCA(n_components=2)
+            moe_2d = pca_moe.fit_transform(moe_sim)
+            
+            axes[1, i].set_title(f"Layer {i} MoE")
+            sc_moe = axes[1, i].scatter(moe_2d[:, 0], moe_2d[:, 1], s=(-moe_gates + 1) * 20, c=moe_gates, cmap="viridis_r")
+            fig.colorbar(sc_moe, ax=axes[1, i], label="Gate Value (lower is easier)")
+
+        plt.tight_layout(rect=[0, 0, 1, 0.96])
+        plt.savefig(f"exp/tiny_onn_arc/expert_viz/expert_space_step_{step}.png")
+        plt.close(fig)
+
