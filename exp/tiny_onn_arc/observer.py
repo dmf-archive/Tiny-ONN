@@ -38,9 +38,9 @@ class Observer:
         log_str = (
             f"E:{epoch} S:{step} | L(M/G):{losses['main']:.2f}/{losses['gating']:.2f} | "
             f"Acc(Tok/Grid):{metrics.get('tok_acc', 0):.2f}/{metrics.get('grid_acc', 0):.2f} | "
-            f"GateAcc(S/M):{metrics.get('smha_gate_acc', 0):.2f}/{metrics.get('moe_gate_acc', 0):.2f} | "
+            f"GateAcc(M):{metrics.get('moe_gate_acc', 0):.2f} | "
             f"K(S/M):{metrics.get('smha_avg_k', 0):.2f}/{metrics.get('moe_avg_k', 0):.2f} | "
-            f"PI:{metrics.get('pi_score', 0):.2f} | {ips:.2f}it/s"
+            f"{ips:.2f}it/s"
         )
         self.console.print(log_str)
 
@@ -58,9 +58,9 @@ class Observer:
             pred_seq = generated_ids[i, input_len:]
 
             h_in = (input_seq == 10).sum().item() + 1
-            w_in = (input_len // h_in) - 1
+            w_in = (input_len // h_in) - 1 if h_in > 0 else 0
 
-            h_out = int((target_seq != -100).sum().item() // (w_in + 1)) if w_in > -1 else 0
+            h_out = (target_seq != -100).sum().item() // (w_in + 1) if w_in > 0 else 0
 
             try:
                 input_grid = self._to_grid(input_seq, h_in, w_in)
@@ -88,23 +88,30 @@ class Observer:
     def visualize_expert_space(self, model: TinyOnnForArcReconstruction, step: int):
         Path("exp/tiny_onn_arc/expert_viz").mkdir(exist_ok=True)
         num_layers = model.config.num_hidden_layers
-        fig, axes = plt.subplots(2, num_layers, figsize=(num_layers * 5, 10))
+        
+        # Create a 2-row plot. Row 0 for SMHA (OFL), Row 1 for MoEs
+        fig, axes = plt.subplots(2, num_layers, figsize=(num_layers * 5, 10), squeeze=False)
         fig.suptitle(f"Expert Space Visualization @ Step {step}", fontsize=16)
 
-        for i in range(num_layers):
-            # SMHA
-            smha_gating = model.model.layers[i].smha_layer.gating_network
-            smha_sim = smha_gating.sim_matrix.data.T.cpu().numpy()
-            smha_gates = smha_gating.gates.data.cpu().numpy()
+        # --- Plot OFL (SMHA) in the first slot of the first row ---
+        if self.config.use_object_finder:
+            ofl_gating = model.model.object_finder_layer.gating_network
+            smha_sim = ofl_gating.sim_matrix.data.T.cpu().numpy()
+            smha_gates = ofl_gating.gates.data.cpu().numpy()
             
             pca_smha = PCA(n_components=2)
             smha_2d = pca_smha.fit_transform(smha_sim)
             
-            axes[0, i].set_title(f"Layer {i} SMHA")
-            sc_smha = axes[0, i].scatter(smha_2d[:, 0], smha_2d[:, 1], s=(-smha_gates + 1) * 20, c=smha_gates, cmap="viridis_r")
-            fig.colorbar(sc_smha, ax=axes[0, i], label="Gate Value (lower is easier)")
+            axes[0, 0].set_title(f"OFL SMHA (L-1)")
+            sc_smha = axes[0, 0].scatter(smha_2d[:, 0], smha_2d[:, 1], s=(-smha_gates + 1) * 20, c=smha_gates, cmap="viridis_r")
+            fig.colorbar(sc_smha, ax=axes[0, 0], label="Gate Value")
+        
+        # Hide unused SMHA plots
+        for i in range(1, num_layers):
+            axes[0, i].axis('off')
 
-            # MoE
+        # --- Plot MoE layers in the second row ---
+        for i in range(num_layers):
             moe_gating = model.model.layers[i].moe_layer.gating_network
             moe_sim = moe_gating.sim_matrix.data.T.cpu().numpy()
             moe_gates = moe_gating.gates.data.cpu().numpy()
@@ -114,9 +121,8 @@ class Observer:
             
             axes[1, i].set_title(f"Layer {i} MoE")
             sc_moe = axes[1, i].scatter(moe_2d[:, 0], moe_2d[:, 1], s=(-moe_gates + 1) * 20, c=moe_gates, cmap="viridis_r")
-            fig.colorbar(sc_moe, ax=axes[1, i], label="Gate Value (lower is easier)")
+            fig.colorbar(sc_moe, ax=axes[1, i], label="Gate Value")
 
         plt.tight_layout(rect=[0, 0, 1, 0.96])
         plt.savefig(f"exp/tiny_onn_arc/expert_viz/expert_space_step_{step}.png")
         plt.close(fig)
-

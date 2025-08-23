@@ -123,7 +123,7 @@ class DynamicMoELayer(nn.Module):
     def forward_gating(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         return self.gating_network(hidden_states)
 
-    def forward_main(self, hidden_states: torch.Tensor, routing_weights: torch.Tensor, gate_cache: dict[str, torch.Tensor]) -> tuple[torch.Tensor, dict[str, Any], KVCache | None]:
+    def forward_main(self, hidden_states: torch.Tensor, routing_weights: torch.Tensor, gate_cache: dict[str, torch.Tensor]) -> tuple[torch.Tensor, dict[str, Any]]:
         B, T, C = hidden_states.shape
 
         w1_w = torch.einsum("bte,eci->btci", routing_weights.view(B, T, self.max_experts), self.w1)
@@ -133,39 +133,27 @@ class DynamicMoELayer(nn.Module):
         final_output = torch.einsum("bti,btic->btc", intermediate, w2_w)
 
         cache = {"final_output": final_output, "gate_cache": gate_cache, "routing_weights": routing_weights, "B": B, "T": T}
-        return final_output, cache, None
+        return final_output, cache
 
 class Block(nn.Module):
     def __init__(self, config: Config, layer_index: int):
         super().__init__()
         self.layer_index = layer_index
-        self.ln1 = nn.LayerNorm(config.hidden_size)
-        self.smha_layer = DynSMHALayer(config, is_causal=True)
-        self.ln2 = nn.LayerNorm(config.hidden_size)
+        self.ln = nn.LayerNorm(config.hidden_size)
         self.moe_layer = DynamicMoELayer(config)
 
-    def forward(
-        self, hidden_states: torch.Tensor, attention_mask: torch.Tensor | None = None, past_key_values: KVCache | None = None, use_cache: bool = False
-    ) -> tuple[torch.Tensor, dict[ExpertID, Any], KVCache | None]:
+    def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, dict[ExpertID, Any]]:
         residual = hidden_states
-        normed_hs_smha = self.ln1(hidden_states)
-        smha_routing_weights, smha_gate_cache = self.smha_layer.forward_gating(normed_hs_smha)
-
-        attn_output, smha_cache, present_key_values = self.smha_layer.forward_main(
-            normed_hs_smha, smha_routing_weights, attention_mask, past_key_values, use_cache=use_cache
-        )
-        smha_cache["gate_cache"] = smha_gate_cache
-        hidden_states = residual + attn_output
-
-        residual = hidden_states
-        normed_hs_moe = self.ln2(hidden_states)
-        moe_routing_weights, moe_gate_cache = self.moe_layer.forward_gating(normed_hs_moe)
-
-        moe_output, moe_cache, _ = self.moe_layer.forward_main(normed_hs_moe, moe_routing_weights, moe_gate_cache)
+        normed_hs = self.ln(hidden_states)
+        
+        moe_routing_weights, moe_gate_cache = self.moe_layer.forward_gating(normed_hs)
+        moe_output, moe_cache = self.moe_layer.forward_main(normed_hs, moe_routing_weights, moe_gate_cache)
+        
         hidden_states = residual + moe_output
-
-        block_cache = {("smha", self.layer_index, 0): smha_cache, ("moe", self.layer_index, 0): moe_cache}
-        return hidden_states, block_cache, present_key_values
+        
+        # No more SMHA in the block, only MoE
+        block_cache = {("moe", self.layer_index, 0): moe_cache}
+        return hidden_states, block_cache
 
 class AutoregressiveEmbedding(nn.Module):
     def __init__(self, config: Config):
@@ -192,9 +180,9 @@ class TinyOnnModel(nn.Module):
         self.layers = nn.ModuleList([Block(config, i) for i in range(config.num_hidden_layers)])
         self.final_ln = nn.LayerNorm(config.hidden_size)
 
-    def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor | None = None, past_key_values: PastKVCache | None = None, use_cache: bool = False) -> tuple[torch.Tensor, dict[ExpertID, Any], PastKVCache | None]:
-        past_seq_len = past_key_values[0][0].shape[1] if past_key_values is not None else 0
-        hidden_states = self.embeddings(input_ids, past_seq_len=past_seq_len)
+    def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor | None = None, use_cache: bool = False) -> tuple[torch.Tensor, dict[ExpertID, Any]]:
+        hidden_states = self.embeddings(input_ids, past_seq_len=0)
+        flat_forward_cache: dict[ExpertID, Any] = {}
 
         if self.config.use_object_finder:
             B, T, C = hidden_states.shape
@@ -214,30 +202,16 @@ class TinyOnnModel(nn.Module):
             object_ids = torch.argmax(affinity_matrix, dim=-1)
             object_prototypes = torch.gather(hidden_states, 1, object_ids.unsqueeze(-1).expand_as(hidden_states))
             hidden_states = hidden_states + object_prototypes
-
-        if attention_mask is not None:
-             attention_mask = attention_mask[:, None, None, :]
-             attention_mask = (1.0 - attention_mask) * -10000.0
-
-        flat_forward_cache: dict[ExpertID, Any] = {}
-        present_key_values_all: list[KVCache | None] | None = [] if use_cache else None
+            
+            # Use layer_idx = -1 to denote the Object Finder Layer for logging
+            flat_forward_cache[("smha", -1, 0)] = {"gate_cache": gate_cache, "B": B, "T": T}
 
         for i, layer in enumerate(self.layers):
-            layer_past = past_key_values[i] if past_key_values is not None else None
-            hidden_states, block_cache, present_key_values = layer(
-                hidden_states, attention_mask=attention_mask, past_key_values=layer_past, use_cache=use_cache
-            )
+            hidden_states, block_cache = layer(hidden_states)
             flat_forward_cache.update(block_cache)
-            if use_cache and present_key_values_all is not None:
-                present_key_values_all.append(present_key_values)
 
         hidden_states = self.final_ln(hidden_states)
-
-        final_present_key_values = None
-        if use_cache and present_key_values_all is not None:
-            final_present_key_values = tuple(present_key_values for present_key_values in present_key_values_all if present_key_values is not None)
-
-        return hidden_states, flat_forward_cache, final_present_key_values
+        return hidden_states, flat_forward_cache
 
 class TinyOnnForArcReconstruction(nn.Module):
     def __init__(self, config: Config):
@@ -246,22 +220,21 @@ class TinyOnnForArcReconstruction(nn.Module):
         self.model = TinyOnnModel(config)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
-    def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor | None = None, past_key_values: PastKVCache | None = None, use_cache: bool = False, **kwargs: Any) -> tuple[torch.Tensor, dict[ExpertID, Any], PastKVCache | None]:
-        hidden_states, flat_forward_cache, present_key_values = self.model(
-            input_ids=input_ids, attention_mask=attention_mask, past_key_values=past_key_values, use_cache=use_cache
+    def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor | None = None, **kwargs: Any) -> tuple[torch.Tensor, dict[ExpertID, Any]]:
+        hidden_states, flat_forward_cache = self.model(
+            input_ids=input_ids, attention_mask=attention_mask
         )
-        return self.lm_head(hidden_states), flat_forward_cache, present_key_values
+        return self.lm_head(hidden_states), flat_forward_cache
 
     @torch.no_grad()
     def generate(self, input_ids: torch.Tensor, attention_mask: torch.Tensor, max_new_tokens: int) -> torch.Tensor:
         self.eval()
+        # For simplicity, generation in the new model does not support KV caching
+        # as blocks are no longer causal.
         generated_ids = input_ids
-        past_key_values = None
         for _ in range(max_new_tokens):
-            input_token = generated_ids[:, -1].unsqueeze(-1) if past_key_values else generated_ids
-
-            logits, _, past_key_values = self.forward(
-                input_ids=input_token, attention_mask=attention_mask, past_key_values=past_key_values, use_cache=True
+            logits, _ = self.forward(
+                input_ids=generated_ids, attention_mask=attention_mask
             )
             next_token = torch.argmax(logits[:, -1, :], dim=-1).unsqueeze(-1)
             generated_ids = torch.cat([generated_ids, next_token], dim=1)

@@ -34,7 +34,7 @@ class Config:
     CLIP_GRAD_NORM = 1.0
     CHECKPOINT_DIR = "exp/tiny_onn_arc/checkpoints"
     EPOCHS = 1000
-    LOG_INTERVAL = 10
+    LOG_INTERVAL = 1
     EVAL_INTERVAL = 50
     EVAL_BATCHES = 1
     MAX_CHECKPOINTS = 3
