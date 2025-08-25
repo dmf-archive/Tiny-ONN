@@ -1,81 +1,98 @@
 import json
-import random
 from pathlib import Path
+from typing import Any
 
 import torch
-from torch.utils.data import DataLoader, Dataset
+from torch.nn.utils.rnn import pad_sequence
+from torch.utils.data import Dataset
 
-from .config import Config
-
-
-def apply_augmentations(grid: torch.Tensor) -> torch.Tensor:
-    if random.random() > 0.5:
-        grid = torch.fliplr(grid)
-    if random.random() > 0.5:
-        grid = torch.flipud(grid)
-    k = random.randint(0, 3)
-    if k > 0:
-        grid = torch.rot90(grid, k, [0, 1])
-    return grid
+from .tokenizer import ArcChatMLTokenizer
 
 
-class ArcViTDataset(Dataset):
-    def __init__(self, task_files: list[Path], config: Config, use_test_pairs: bool = False):
-        self.config = config
-        self.pairs = []
+class GridSerializer:
+    def __init__(self, tokenizer: ArcChatMLTokenizer):
+        self.tokenizer = tokenizer
 
-        for task_file in task_files:
-            try:
-                with open(task_file) as f:
-                    task_data = json.load(f)
-                
-                pair_set = task_data["test" if use_test_pairs else "train"]
-                for pair in pair_set:
-                    h_in, w_in = len(pair["input"]), len(pair["input"][0])
-                    h_out, w_out = len(pair["output"]), len(pair["output"][0])
+    def _serialize_grid(self, grid: list[list[int]]) -> str:
+        return " ".join([f"<row_start> {' '.join(map(str, row))} <row_end>" for row in grid])
 
-                    if h_in <= config.MAX_GRID_SIZE and w_in <= config.MAX_GRID_SIZE and \
-                       h_out <= config.MAX_GRID_SIZE and w_out <= config.MAX_GRID_SIZE:
-                        self.pairs.append({
-                            "input": torch.tensor(pair["input"], dtype=torch.long),
-                            "output": torch.tensor(pair["output"], dtype=torch.long)
-                        })
-            except (OSError, json.JSONDecodeError):
-                continue
+    def serialize_task(self, input_grid: list[list[int]], output_grid: list[list[int]]) -> tuple[list[int], list[int]]:
+        problem_str = f"problem <|im_start|> {self._serialize_grid(input_grid)} <|im_end|>"
+        solution_str = f"solution <|im_start|> {self._serialize_grid(output_grid)} <|im_end|>"
+        
+        full_sequence = f"{problem_str} {solution_str}"
+        
+        problem_ids = self.tokenizer.encode(problem_str)
+        full_ids = self.tokenizer.encode(full_sequence)
+        
+        labels = [-100] * len(problem_ids) + full_ids[len(problem_ids):]
+        
+        return full_ids, labels
+
+
+class ArcDataset(Dataset):
+    def __init__(self, data_path: str, split: str = "training"):
+        self.data_path = Path(data_path) / split
+        self.file_paths = sorted(list(self.data_path.glob("*.json")))
+        self.samples = []
+        for file_path in self.file_paths:
+            with open(file_path) as f:
+                task_data = json.load(f)
+                for sample in task_data['train']:
+                    self.samples.append(sample)
 
     def __len__(self) -> int:
-        return len(self.pairs)
+        return len(self.samples)
 
-    def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
-        pair = self.pairs[idx]
-        input_grid = pair["input"]
-        output_grid = pair["output"]
+    def __getitem__(self, idx: int) -> dict[str, Any]:
+        return self.samples[idx]
+
+
+class ArcCollator:
+    def __init__(self, tokenizer: ArcChatMLTokenizer):
+        self.tokenizer = tokenizer
+        self.serializer = GridSerializer(tokenizer)
+
+    def __call__(self, batch: list[dict[str, Any]]) -> dict[str, Any]:
+        input_ids_list, labels_list = [], []
+
+        for item in batch:
+            input_ids, labels = self.serializer.serialize_task(item['input'], item['output'])
+            input_ids_list.append(torch.tensor(input_ids, dtype=torch.long))
+            labels_list.append(torch.tensor(labels, dtype=torch.long))
+
+        return {
+            "input_ids": pad_sequence(input_ids_list, batch_first=True, padding_value=self.tokenizer.pad_token_id),
+            "labels": pad_sequence(labels_list, batch_first=True, padding_value=-100),
+            "input_grids": [item['input'] for item in batch],
+            "output_grids": [item['output'] for item in batch],
+        }
+
+
+class GridDeserializer:
+    def __init__(self, tokenizer: ArcChatMLTokenizer):
+        self.tokenizer = tokenizer
+
+    def deserialize(self, tokens: list[int]) -> torch.Tensor:
+        decoded_str = self.tokenizer.decode(tokens)
         
-        if random.random() > 0.5:
-            input_grid = apply_augmentations(input_grid)
-            output_grid = apply_augmentations(output_grid)
+        try:
+            solution_str = decoded_str.split("solution <|im_start|>")[1].split("<|im_end|>")[0].strip()
+        except IndexError:
+            return torch.zeros((1, 1), dtype=torch.long)
+
+        if not solution_str:
+            return torch.zeros((1, 1), dtype=torch.long)
         
-        color_map = torch.randperm(10)
-        input_grid = color_map[input_grid]
-        output_grid = color_map[output_grid]
-        
-        return {"input": input_grid, "output": output_grid}
+        rows_str = solution_str.split("<row_end>")
+        grid = []
+        for row_str in rows_str:
+            if "<row_start>" in row_str:
+                clean_row_str = row_str.split("<row_start>")[1].strip()
+                if clean_row_str:
+                    grid.append(list(map(int, clean_row_str.split())))
 
+        if not grid or not all(isinstance(cell, int) for row in grid for cell in row):
+            return torch.zeros((1, 1), dtype=torch.long)
 
-def get_arc_dataloaders(config: Config) -> tuple[DataLoader, DataLoader, int, int]:
-    data_path = Path("data/ARC-AGI-2/data")
-    train_files = list(data_path.glob("training/*.json"))
-    eval_files = list(data_path.glob("evaluation/*.json"))
-
-    train_dataset = ArcViTDataset(train_files, config, use_test_pairs=False)
-    eval_dataset = ArcViTDataset(eval_files, config, use_test_pairs=True)
-
-    # No collator for variable-sized inputs; handle in training loop.
-    train_loader = DataLoader(
-        train_dataset, batch_size=config.BATCH_SIZE, shuffle=True, drop_last=True
-    )
-    eval_loader = DataLoader(
-        eval_dataset, batch_size=config.BATCH_SIZE, shuffle=False, drop_last=True
-    )
-
-    return train_loader, eval_loader, len(train_dataset), len(eval_dataset)
+        return torch.tensor(grid, dtype=torch.long)

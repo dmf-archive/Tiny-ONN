@@ -15,6 +15,7 @@ dependencies = [
   "gradio>=5.35.0",
   "local-attention>=1.11.2",
   "matplotlib",
+  "native-sparse-attention-pytorch>=0.2.3",
   "pillow>=11.3.0",
   "pytest>=8.4.1",
   "pyyaml>=6.0.2",
