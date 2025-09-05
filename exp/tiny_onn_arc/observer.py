@@ -18,11 +18,10 @@ class Observer:
         self.console = console
         self.config = config
 
-    def log_step(self, epoch: int, step: int, metrics: dict[str, torch.Tensor], elapsed_time: float, eval_grid_acc: float = 0.0):
+    def log_step(self, epoch: int, step: int, metrics: dict[str, torch.Tensor], elapsed_time: float, eval_grid_acc: float = 0.0, aux_loss: float = 0.0):
         main_loss = metrics.get('main_loss', torch.tensor(0.0)).item()
         token_acc = metrics.get('token_acc', torch.tensor(0.0)).item()
         grid_acc = metrics.get('grid_acc', torch.tensor(0.0)).item()
-        sdl_loss = metrics.get('sdl_loss', torch.tensor(0.0)).item()
         moe_avg_k = metrics.get('moe_avg_k', 0.0)
 
         time_per_step = elapsed_time * self.config.gradient_accumulation_steps
@@ -30,7 +29,7 @@ class Observer:
 
         log_str = (
             f"E:{epoch:03d} S:{step:06d} | "
-            f"Loss(Main/SDL):{main_loss:.3f}/{sdl_loss:.3f} | "
+            f"Loss(Main/Aux):{main_loss:.3f}/{aux_loss:.3f} | "
             f"Train Acc(Tok/Grid):{token_acc:.3f}/{grid_acc:.3f} | "
             f"Eval Grid Acc:{eval_grid_acc:.3f} | "
             f"MoE Avg K:{moe_avg_k:.2f} | "

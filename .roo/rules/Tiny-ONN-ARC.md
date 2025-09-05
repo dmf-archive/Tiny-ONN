@@ -1,100 +1,73 @@
-# Tiny-ONN-ARC: 项目报告与实施计划 (v1.1)
+# Tiny-ONN-ARC: 项目报告与实施计划 (v2.0)
 
 ## 摘要
 
-`Tiny-ONN-ARC` 是一个为解决 `ARC-AGI-2` 抽象推理任务而设计的专用语言模型。作为 `Tiny-ONN` 项目的一个分支，它继承了**超稀疏混合专家 (Hyper-SMoE)** 的核心思想，并针对 ARC 任务的特性进行了深度特化。模型架构基于 **NSA (原生稀疏注意力)** 和 **SDL DynMoE (动态专家混合)**，并采用 **TF+EAVI 双阶段训练框架**，旨在通过模拟“快速学习”与“深度思考”两个阶段，最终实现对抽象规则的归纳与应用。
+`Tiny-ONN-ARC` 是一个为解决 `ARC-AGI-2` 抽象推理任务而设计的专用语言模型。作为 `Tiny-ONN` 项目的一个分支，它继承了**超稀疏混合专家 (Hyper-SMoE)** 的核心思想，并针对 ARC 任务的特性进行了深度特化。本项目并非传统的程序合成，而是通过构建一个通用的**可微计算基质 (Differentiable Computational Substrate)**，让解决问题的抽象程序在梯度下降中**自组织地涌现**。模型架构基于标准的 `Qwen3` 注意力机制和 **SDL DynMoE (动态专家混合)**，并采用 **TF+EAVI 双阶段训练框架**，旨在通过模拟“快速学习”与“深度思考”两个阶段，最终实现对抽象规则的归纳与应用。
 
 ---
 
-## 1. 系统架构
+## 1. 系统工作流程
 
-整个系统被解构成六个核心功能模块，它们协同工作，构成一个完整的数据处理、训练、推理和评估流水线。
+整个系统的工作流程遵循一个清晰的、顺序化的数据处理与学习管道：
 
-### 1.1. 架构总览
+1. **M1: 数据表征 (Data Representation)**
 
-```mermaid
-graph TD
-    subgraph M1: Data Representation
-        Tokenizer("Tokenizer (ARC-specific Vocab)")
-        Serializer("Grid-to-Sequence Serializer")
-    end
+   - **Tokenizer**: 使用一个极小的、针对 ARC 任务的专属词汇表，包含 0-9 的颜色 token 和必要的控制 token (`<|im_start|>`, `<|im_end|>`, `problem`, `solution` 等)。
+   - **Serializer**: 将 2D 网格及其坐标信息线性化为 1D token 序列。这是模型能够理解空间关系的基础。
 
-    subgraph M2: Model Architecture
-        DynONNBlock("DynONN Block (NSA + DynMoE)")
-        Transformer("Decoder-only Transformer Shell")
-        DynONNBlock -- "is a core component of" --> Transformer
-    end
+2. **M3: 数据加载与预处理 (Data Loading & Pre-processing)**
 
-    subgraph M3: Data Loading & Pre-processing
-        Dataset("ArcDataset (from JSON)")
-        Collator("ArcCollator (Augment, Serialize, Pad)")
-        Dataset --> Collator
-    end
+   - **ArcDataset**: 从 JSON 文件中读取并加载完整的任务数据，每个任务（包含其所有 `train` 和 `test` 对）作为一个样本。
+   - **ArcCollator**: 作为数据加载器的核心，它接收一批原始任务数据，并负责执行“多示例上下文”拼接、D8 对称数据增强、序列化以及最终的批次填充，直接产出可供模型计算的规整张量。
 
-    subgraph M4: Training Paradigms
-        TF("Teacher Forcing Loop")
-        EAVI("EAVI Loop")
-    end
+3. **M2: 模型架构 (Model Architecture)**
 
-    subgraph M5: Inference & Evaluation
-        Generator("Sequence Generator")
-        Decoder("Sequence-to-Grid Decoder")
-        AugScorer("AugScore Evaluator")
-    end
+   - **核心**: `ArcTransformer`，一个标准的 Decoder-only Transformer 骨架。
+   - **创新**: 其核心计算单元是 `DynONNBlock`，它用标准的 `Qwen3` 自注意力和我们定制的 **SDL DynMoE (动态专家混合)** 分别取代了标准的注意力和前馈网络层。
 
-    subgraph M6: System & Orchestration
-        Config("Config Management")
-        Trainer("Trainer (Orchestrator)")
-        Observer("Observer (Logging & Viz)")
-    end
+4. **M6 & M4: 训练编排与范式 (Orchestration & Paradigms)**
 
-    M1 -- defines primitives for --> M3
-    M3 -- provides batches to --> Trainer
-    M2 -- is instantiated by --> Trainer
-    Trainer -- executes --> M4 & M5
-    Config & Observer -- support --> Trainer
-```
+   - **Trainer**: 作为顶层协调器，负责驱动整个训练与评估循环。
+   - **StepRunners**: `Trainer` 根据配置，实例化具体的训练步骤执行器 (`TFStepRunner` 或 `EAVIStepRunner`)，将训练范式的具体逻辑解耦。
+   - **训练循环**: `Trainer` 从 `DataLoader` 获取批次，交由 `StepRunner` 执行，然后负责梯度累积和优化器步骤。
 
-### 1.2. 模块详解
+5. **M5: 推理与评估 (Inference & Evaluation)**
 
-- **M1: 数据表征**:
+   - **EvaluationStep**: 一个独立的评估逻辑单元，负责在 `torch.no_grad()` 上下文中执行完整的评估流程。
+   - **Sequence Generator**: 利用 `model.generate` 进行自回归推理，生成解答序列。
+   - **Grid Decoder**: `Serializer` 的逆过程，将 token 序列解码回 2D 网格。
+   - **AugScore Evaluator**: 实现多视角一致性评估，为模型的最终解答提供鲁棒性评分。
 
-  - **Tokenizer**: 使用一个极小的、针对 ARC 任务的专属词汇表，包含 0-9 的颜色 token 和必要的控制 token (`<|im_start|>`, `<|im_end|>`, `problem`, `solution` 等)。
-  - **Serializer**: 将 2D 网格及其坐标信息线性化为 1D token 序列。这是模型能够理解空间关系的基础。
-
-- **M2: 模型架构**:
-
-  - **核心**: `ArcTransformer`，一个标准的 Decoder-only Transformer 骨架。
-  - **创新**: 其核心计算单元是 `DynONNBlock`，它用 **NSA (原生稀疏注意力)** 和 **SDL DynMoE (动态专家混合)** 分别取代了标准的自注意力和前馈网络层。
-
-- **M3: 数据加载与预处理**:
-
-  - **职责**: 构建一个健壮、高效的数据管道。
-  - **流程**: 1. `ArcDataset` 从 JSON 文件中读取原始的、尺寸不一的网格对。 2. `DataLoader` 从 `Dataset` 中采样一批数据。 3. **`ArcCollator`** (可调用类) 作为 `collate_fn`，是整个流程的核心。它负责：
-    - 对批次中的每个网格应用 **D8 对称变换** 进行数据增强。
-    - 调用 `Serializer` 将增强后的网格转换为 token 序列。
-    - 使用 `pad_sequence` 将长度不一的序列填充为规整的批处理张量。
-  - **保证**: `DataLoader` 直接产出可供模型计算的、规整的批处理张量。
-
-- **M4: 训练范式**:
-
-  - 详见第 2 节。
-
-- **M5: 推理与评估**:
-
-  - `Sequence Generator`: 自回归生成器，用于在推理时生成解答序列。
-  - `Grid Decoder`: `Serializer` 的逆过程，将 token 序列解码回 2D 网格。
-  - `AugScore Evaluator`: 详见第 2 节。
-
-- **M6: 系统与编排**:
-  - `Trainer`: 作为顶层协调器，负责驱动训练、评估、检查点保存/加载等所有流程。
-  - `Config` & `Observer`: 提供配置管理和日志观测能力。
+6. **M6: 系统支持 (System Support)**
+   - **Config**: 提供统一的、结构化的配置管理。
+   - **Observer**: 负责所有训练过程中的日志记录与可视化。
 
 ---
 
-## 2. 核心范式
+## 2. 核心范式与理论基础
 
-### 2.1. TF+EAVI 双阶段训练框架
+### 2.1. 理论基石：感知即误差，行动即生成
+
+遵循预测编码/自由能原理 (PCT/FEP)，我们将模型的学习过程理解为一个认知循环：
+
+- **行动 (Action)**: 模型在推理 (Inference) 时的自回归生成过程，是其利用现有内部世界模型对外部输入做出的预测性**行动**。这仅仅是已有知识的应用，不涉及学习。
+
+- **感知 (Perception)**: 模型在训练 (Training) 时，其内在学习机制的核心是“感知”。
+  1. **感知不准确性**: 模型预测 (`logits`) 与外部现实 (`labels`) 的差异，被损失函数量化为**预测误差 (Prediction Error / Loss)**。这是模型对外部世界最直接的感知。
+  2. **感知不稳定性**: 为了降低预测误差，反向传播计算出的梯度范数，量化了模型内部信念需要被调整的成本。这被称为**惊奇 (Surprise)**，是模型对自身状态稳定性的内在感知。
+  3. **学习 (Learning)**: 通过梯度下降更新权重，就是模型吸收“预测误差”和“惊奇”这两种感知信号，并更新其内部世界模型的过程。
+
+### 2.2. 方法论：涌现式可微程序搜索
+
+我们将 ARC 视为一个“可微程序搜索”问题，但摒弃了传统的、基于预定义符号原语的显式搜索方法，因为该方法面临组合爆炸和泛化难题。
+
+取而代之，我们采用一种“自下而上”的**涌现式 (Emergent)** 方法：
+
+- **通用计算基质**: `ArcTransformer` (尤其是其 `DynMoE` 层) 本身被视为一个极其灵活和通用的、完全可微的计算图。注意力机制是通用的信息路由，而 `DynMoE` 则是通用的计算单元动态选择器。
+- **隐式程序涌现**: 我们不预设任何高层级的操作（如 `Copy`, `Resize`）。相反，我们相信，通过端到端的梯度下降，模型能够在其权重空间中，自组织地学习到实现这些功能所必需的底层计算模式。`DynMoE` 中的每个专家，在训练的驱动下，会自发地专门化为处理某种特定模式（如颜色替换、对称性识别）的“微型程序”。
+- **EAVI 的关键作用**: Teacher Forcing 可以让模型快速学会模仿局部模式，而 EAVI 范式通过强制模型独立生成完整解答，其产生的全局损失信号是驱动模型从简单的模式匹配，跃迁到真正的全局信息整合以**涌现出抽象推理程序**。
+
+### 2.3. TF+EAVI 双阶段训练框架
 
 为解决 ARC 任务对局部模式匹配和全局抽象推理的双重需求，我们设计了一个双阶段训练框架。
 
@@ -109,7 +82,7 @@ graph TD
   - **方法**: 1. **Excursion (执行)**: 在 `torch.no_grad()` 上下文中，让模型从问题开始，**独立地、自回归地**生成一个完整的解答序列。 2. **Alignment (对齐)**: 将“真实输入 + **生成**输出”与“真实输入 + **真实**输出”构成一个“超级批次”，同时送入模型进行一次前向传播，并计算一个全局的对齐损失 (CrossEntropy)。
   - **作用**: 这个全局损失信号直接惩罚模型在独立生成时犯的任何一个错误，迫使其从依赖局部上下文的“模仿者”转变为能够进行长程规划的“思考者”。
 
-### 2.2. AugScore 多视角一致性评估
+### 2.4. AugScore 多视角一致性评估
 
 - **动机**: 一个真正理解了抽象规则的模型，其对一个问题的解答不应因观察视角（如旋转或翻转）的改变而改变。
 - **方法**:
@@ -122,24 +95,19 @@ graph TD
 
 ## 3. 实施计划
 
-我们将清理 `exp/tiny_onn_arc` 目录，并遵循以下阶段从头开始构建。
+我们将清理 `exp/tiny_onn_arc` 目录，并遵循以下阶段从头开始构建一个逻辑正确、性能达标的最终版本。
 
-- **阶段一: 基础建设 (Foundation)**
+- **阶段一: 基础重构 (Foundation Refactoring)**
 
-  - [ ] **M3. 数据管道**: 实现 `ArcDataset` 和健壮的 `ArcCollator` 类。确保 `DataLoader` 能够稳定地产出经过增强和填充的规整批次。
-  - [ ] **M1. 数据表征**: 实现 `ArcChatMLTokenizer` 和 `ArcCollator` 中所需的 `Serializer` 逻辑。
-  - [ ] **M2. 模型架构**: 实现 `DynONNBlock` 和 `ArcTransformer` 的骨架。
-  - **验收标准**: 能够成功加载数据，并通过模型进行一次前向传播而无报错。
+  - [ ] **M0. 配置**: 更新 `config.py`，提升 `max_position_embeddings` 以适应长上下文，并移除废弃配置。
+  - [ ] **M3. 数据管道**: 重构 `ArcDataset` 和 `ArcCollator`，实现**多示例上下文**的数据加载范式，确保将每个任务的全部 `train` 对和 `test` 输入拼接为单一序列。
+  - [ ] **M5. 评估逻辑解耦**: 创建 `evaluation.py`，将评估逻辑从 `Trainer` 中分离至独立的 `EvaluationStep` 类。
 
-- **阶段二: 训练与评估框架 (Training & Evaluation Framework)**
+- **阶段二: 训练流程重构 (Training Flow Refactoring)**
 
-  - [ ] **M6. 系统**: 实现 `Trainer` 类的基本骨架，包括优化器、检查点管理。
-  - [ ] **M4. 训练范式**: 实现 `Teacher Forcing` 训练循环逻辑。
-  - [ ] **M5. 推理**: 实现 `generate_sequence` 和 `decode_grid` 函数。
-  - [ ] **M5. 评估**: 实现一个简化的、单视角的评估循环。
-  - **验收标准**: 能够以 `Teacher Forcing` 模式完整地运行一次训练和评估。
+  - [ ] **M4 & M6. 训练器与步进器**: 重构 `train.py`，引入 `StepRunner` 抽象基类，并实现 `TFStepRunner` (并行) 和 `EAVIStepRunner` (串行) 子类。`Trainer` 类将被极大简化，仅负责编排。
+  - [ ] **M2. 模型验证**: 确保 `ArcTransformer` 的 `forward` 签名与基类兼容，以修复 KV 缓存失效问题。
 
-- **阶段三: 高级范式实现 (Advanced Paradigms)**
-  - [ ] **M4. 训练范式**: 实现 `EAVI` 训练循环逻辑。
-  - [ ] **M5. 评估**: 完整实现 `AugScore Evaluator` 及其交叉评分逻辑。
-  - **验收标准**: 能够以 `EAVI` 模式运行，并使用 `AugScore` 进行评估，完成最终的冒烟测试。
+- **阶段三: 验证与冲刺 (Validation & Sprint)**
+  - [ ] **冒烟测试**: 运行重构后的 `train.py`，验证 EAVI 模式下的训练速度达到**秒级**，并能观察到**真实的学习曲线**（初始准确率远低于 1.0 并逐渐上升，SDL loss 非零）。
+  - [ ] **完整评估**: 在验证功能正确后，进行一次完整的 `AugScore` 评估。
