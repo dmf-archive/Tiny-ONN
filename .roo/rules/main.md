@@ -61,7 +61,8 @@
 
 - **ONN (Ouroboros Neural Network)**: 衔尾蛇神经网络，一种`动态稀疏激活`的`碎片化 MoE`。
 - **PI (Predictive Integrity)**: 预测完整性，一个用于实时监控模型“认知健康度”的功能性代理指标。其核心假设是，一个能够高效进行信息整合（高 Ωₜ）的系统，必然会展现出更强的预测能力（低误差 ε）、更高的状态稳定性（低模型不确定性 τ）和更低的整合成本（低惊奇度 Surprise）。
-- **SMK (Surprise Min_K)**: 一种基于“惊奇度”的`选择性梯度更新策略`。在 MoE 架构中，当多个专家被激活并计算梯度后，SMK 策略仅保留梯度范数（Surprise）最小的 `min_k` 个专家的梯度用于参数更新，其余专家的梯度被置零。SMK 的思想启发了 SML。
+- **SMK (Surprise Min_K)**: 一种基于“惊奇度”的`选择性梯度更新策略`。在 MoE 架构中，当多个专家被激活并计算梯度后，SMK 策略仅保留梯度范数（Surprise）最小的 `min_k` 个专家的梯度用于参数更新，其余专家的梯度被置零。SMK 已经被弃用，但其思想启发了 SML。
+- **EAVI (Excursion-Alignment Variational Inference)**: 一种曾被探索用于解决 Teacher Forcing 暴露偏差的`对齐微调`范式。其核心思想是通过对模型独立生成的完整序列进行全局对齐来提供更强的学习信号。后因其无法从根本上解决暴露偏差问题，且增加了训练流程的复杂性而被**弃用**。
 
 ### 机制：辅助损失函数
 
@@ -71,7 +72,9 @@
 ### 机制：动态专家混合
 
 - **DynSMHA (Dynamic Sparse Multi-Head Attention)**: `token` 级别的动态稀疏注意力机制。通过门控网络为每个 `token` 动态选择并激活最合适的“注意力头专家”，取代了标准的 `Multi-Head Attention`。
+- **DynSIHA (Dynamic Sparse Infinite-Head Attention)**: `MoIE` 范式在注意力机制中的应用。它将标准注意力中固定的 `Q, K, V` 投影矩阵替换为 `MoIE` 层，从而为每个 `token` 动态地、内容感知地“采样”出专用的投影子网络，旨在实现一种可编程的、表达力更强的注意力机制。
 - **DynMoE (Dynamic Mixture of Experts)**: `token` 级别的动态计算路由机制。与 `DynSMHA` 类似，它通过门控网络为每个 `token` 激活最合适的 `MLP` 专家，取代了标准的 `Feed-Forward` 层。值得注意的是，`Tiny-ONN` 项目探索使用 `SML` 作为其训练目标，而 `DynMoE` 的原始论文则主要采用 `SDL` 作为其辅助损失。
+- **MoIE (Mixture of Infinite Experts)**: 一种将稠密权重矩阵视为**连续专家空间**的`动态稀疏`范式。它通过一种“神经元注意力”机制，为每个输入动态地从该空间中“采样”出一个临时的、专用的稀疏子网络。其核心是实现了“前向稠密，反向稀疏”的特性，并由 `SML` 引导进行自组织学习。
 
 ### 机制：分块注意力
 

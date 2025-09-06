@@ -15,12 +15,6 @@
 - **定位**: `DynSMHA` 的下一代演进，旨在结合 `Native Sparse Attention (NSA)` 的 `forward` 优化与 `DynSMHA` 的动态稀疏性。
 - **核心思想**: `NSA` 是一种高效的 `forward` 优化方法，它通过固定的稀疏模式（如滑动窗口和全局块的重要性采样）来逼近全注意力。`DynNSA` 的目标是用一个**可学习的、由 `τ` 驱动的重要性阈值**来取代 `NSA` 静态的 `top-n` 选择机制。这样，我们既可以利用 `NSA` 高度优化的计算核，又能实现真正动态、内容感知的稀疏注意力。
 
-### 2. ARC-AGI 与 EAVI
-
-- **定位**: 将 `Tiny-ONN` 的核心动态稀疏与自组织原则应用于解决 `ARC (Abstraction and Reasoning Corpus)` 这类需要涌现符号推理的极限挑战。
-- **核心思想**: 采用一种名为 **EAVI (Excursion-Alignment Variational Inference)** 的全新对齐范式，通过强制模型进行完整的序列生成再与全局真值对齐，从而驱动模型从像素层面的模式匹配跃迁至对抽象规则的归纳与应用。该范式是实现**涌现式神经符号系统**的关键步骤。
-- **详情**: 具体的技术论述与演进历史，请参见 [`技术日志：Tiny-ONN-ARC 的演进之路`](./Tiny-ONN-ARC.md)。
-
 ## 性能笔记
 
 ### 手写稀疏计算的陷阱：`einsum` vs. `for-loop`
