@@ -4,11 +4,15 @@ from transformers.cache_utils import Cache
 import torch
 import torch.nn as nn
 from transformers import Qwen3Config, Qwen3ForCausalLM, Qwen3Model
-from transformers.models.qwen3.modeling_qwen3 import Qwen3DecoderLayer
+from transformers.models.qwen3.modeling_qwen3 import Qwen3DecoderLayer, Qwen3Attention
 from transformers.modeling_outputs import MoeCausalLMOutputWithPast, BaseModelOutputWithPast, MoeModelOutputWithPast
-from transformers.masking_utils import create_causal_mask
 import torch.nn.functional as F
+from transformers.utils import logging
 
+logger = logging.get_logger(__name__)
+
+# Note: GateSTE, GatingNetwork, and DynMoE remain the same as before.
+# To save space, their code is omitted here but will be in the final file.
 class GateSTE(torch.autograd.Function):
     @staticmethod
     def forward(ctx: Any, x: torch.Tensor) -> torch.Tensor:
@@ -82,9 +86,11 @@ class DynMoE(nn.Module):
         
         return final_output, router_logits, activation_mask
 
+
 class DynONNDecoderLayer(Qwen3DecoderLayer):
     def __init__(self, config: Qwen3Config, layer_idx: int):
         super().__init__(config, layer_idx)
+        # Qwen3DecoderLayer's self_attn is Qwen3Attention, which is what we want.
         self.mlp = DynMoE(config)
     
     def forward(
@@ -96,12 +102,15 @@ class DynONNDecoderLayer(Qwen3DecoderLayer):
         output_attentions: Optional[bool] = False,
         use_cache: Optional[bool] = False,
         cache_position: Optional[torch.LongTensor] = None,
-        output_router_logits: Optional[bool] = False,
-        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        **kwargs, # IMPORTANT: Correctly handle kwargs for flash attention etc.
     ) -> Tuple:
+        # We manually extract output_router_logits, as it's not a standard argument.
+        output_router_logits = kwargs.pop("output_router_logits", False)
+        
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
 
+        # Self Attention - Pass all relevant arguments, including **kwargs
         attn_outputs = self.self_attn(
             hidden_states,
             attention_mask=attention_mask,
@@ -110,12 +119,13 @@ class DynONNDecoderLayer(Qwen3DecoderLayer):
             output_attentions=output_attentions,
             use_cache=use_cache,
             cache_position=cache_position,
-            position_embeddings=position_embeddings,
+            **kwargs,
         )
         hidden_states = attn_outputs[0]
         
         hidden_states = residual + hidden_states
 
+        # MLP with DynMoE
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states, router_logits, activation_mask = self.mlp(hidden_states)
@@ -127,6 +137,7 @@ class DynONNDecoderLayer(Qwen3DecoderLayer):
             outputs += (router_logits, activation_mask)
             
         return outputs
+
 
 class ArcModel(Qwen3Model):
     def __init__(self, config: Qwen3Config):
@@ -146,15 +157,23 @@ class ArcModel(Qwen3Model):
         output_hidden_states: Optional[bool] = None,
         output_router_logits: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
+        **kwargs, # Pass kwargs down
     ) -> MoeModelOutputWithPast:
+        # This forward method now largely mirrors the original Qwen3Model's forward,
+        # but ensures our custom DynONNDecoderLayer is called with all necessary arguments.
+        
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
         use_cache = use_cache if use_cache is not None else self.config.use_cache
-        output_router_logits = (
-            output_router_logits if output_router_logits is not None else self.config.output_router_logits
-        )
+
+        if self.gradient_checkpointing and self.training:
+            if use_cache:
+                logger.warning_once(
+                    "`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`..."
+                )
+                use_cache = False
 
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
@@ -168,17 +187,11 @@ class ArcModel(Qwen3Model):
         if position_ids is None:
             position_ids = cache_position.unsqueeze(0)
 
-        causal_mask = create_causal_mask(
-            config=self.config,
-            input_embeds=inputs_embeds,
-            attention_mask=attention_mask,
-            cache_position=cache_position,
-            past_key_values=past_key_values,
-            position_ids=position_ids,
+        causal_mask = self._update_causal_mask(
+            attention_mask, inputs_embeds, cache_position, past_key_values
         )
 
         hidden_states = inputs_embeds
-        position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
@@ -198,7 +211,7 @@ class ArcModel(Qwen3Model):
                 use_cache=use_cache,
                 cache_position=cache_position,
                 output_router_logits=output_router_logits,
-                position_embeddings=position_embeddings,
+                **kwargs,
             )
             hidden_states = layer_outputs[0]
 
@@ -223,6 +236,7 @@ class ArcModel(Qwen3Model):
             router_logits=(all_router_logits, all_activation_masks),
         )
 
+
 class ArcTransformer(Qwen3ForCausalLM):
     _keys_to_ignore_on_load_missing = [r"model\.layers\.\d+\.mlp\.gating\.experts_mask"]
 
@@ -232,28 +246,25 @@ class ArcTransformer(Qwen3ForCausalLM):
         self.post_init()
 
     def get_diversity_loss(self, gating_network: GatingNetwork) -> torch.Tensor:
+        # ... (implementation remains the same)
         if gating_network.num_experts < 2: return torch.tensor(0.0, device=gating_network.gates.device)
-        
         expert_mask = gating_network.experts_mask
         gates = gating_network.gates
-        
         sims = torch.matmul(F.normalize(gates.unsqueeze(0), dim=1).T, F.normalize(gates.unsqueeze(0), dim=1))
         targets = torch.eye(sims.shape[0]).to(sims.device)
         sim_mask = torch.matmul(expert_mask.unsqueeze(0).T, expert_mask.unsqueeze(0))
         sim_loss = torch.norm(sims * sim_mask - targets * sim_mask)
-        
         simple_loss = torch.mean(torch.norm(gates, dim=0))
         return sim_loss + simple_loss
 
     def get_sparsity_loss(self, activation_masks: Tuple[torch.Tensor, ...]) -> torch.Tensor:
+        # ... (implementation remains the same)
         total_activated_experts = 0
         num_tokens = 0
         for mask in activation_masks:
             total_activated_experts += mask.sum()
             num_tokens += mask.shape[0]
-        
         if num_tokens == 0: return torch.tensor(0.0, device=activation_masks[0].device)
-        
         avg_activated_experts = total_activated_experts / num_tokens
         return F.l1_loss(avg_activated_experts, torch.tensor(self.config.moe.min_experts_per_tok, device=avg_activated_experts.device))
 
@@ -271,6 +282,7 @@ class ArcTransformer(Qwen3ForCausalLM):
         output_router_logits: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
+        **kwargs, # Pass kwargs down
     ) -> MoeCausalLMOutputWithPast:
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
         
@@ -285,6 +297,7 @@ class ArcTransformer(Qwen3ForCausalLM):
             output_hidden_states=output_hidden_states,
             output_router_logits=True,
             cache_position=cache_position,
+            **kwargs,
         )
         
         logits = self.lm_head(outputs.last_hidden_state)
@@ -297,14 +310,9 @@ class ArcTransformer(Qwen3ForCausalLM):
             
             all_router_logits, all_activation_masks = outputs.router_logits
             
-            total_diversity_loss = torch.tensor(0.0, device=logits.device)
-            total_sparsity_loss = torch.tensor(0.0, device=logits.device)
-
-            if all_router_logits:
+            if all_router_logits and any(r is not None for r in all_router_logits):
                 all_gating_networks = [layer.mlp.gating for layer in self.model.layers]
-                for gating_network in all_gating_networks:
-                    total_diversity_loss += self.get_diversity_loss(gating_network)
-                
+                total_diversity_loss = sum(self.get_diversity_loss(g) for g in all_gating_networks)
                 total_sparsity_loss = self.get_sparsity_loss(all_activation_masks)
                 
                 aux_loss = (total_diversity_loss / len(all_gating_networks)) + (total_sparsity_loss * 0.01)
