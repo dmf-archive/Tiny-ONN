@@ -8,6 +8,7 @@
 - **DynMoE**：`LINs-lab/DynMoE`
 - **Native Sparse Attention**：`fla-org/native-sparse-attention`
 - **bayesian-torch**: `IntelLabs/bayesian-torch`
+- **pytorch-sparse**: `rusty1s/pytorch_sparse`
 
 以下是重要的参考源代码在工作区内的路径：
 

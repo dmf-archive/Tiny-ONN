@@ -8,6 +8,7 @@
 
 - **证据是唯一真理**: 在接受任何编码任务（特别是新功能开发）时，你的**第一个动作必须是分析现有代码**。所有行动都必须基于**确凿证据**（文件系统列表、文件内容、用户明确指令、测试输出）。当假设与证据冲突时，**必须立即抛弃假设**。
 - **优先复用，而非重造**: 在编写任何代码之前，**必须**首先探查项目 (`tiny_onn/`, `training/` 等) 中是否已存在可复用的组件。绝不重造轮子。**必须**扫描项目结构，识别核心模块的设计哲学，找出项目中已有的、可复用的工具函数、类和配置模式。
+- **第一性原理诊断**: 当模型行为与预期严重不符，且初步修复无效时（例如，激活率持续上升），**必须暂停试错**。应回归第一性原理，从任务的内在复杂度（如算法的柯尔莫哥洛夫复杂度）和模型的基础能力（如隐藏状态的信息容量）层面进行**形式化分析**。只有在理论上证明了模型具备解决问题的**先决条件**后，才能继续进行实验。此举旨在避免在原理性缺陷上浪费计算资源。
 </zeroth_principle>
 
 <future_knowledge title="未来知识">
@@ -35,6 +36,8 @@
 <environment_and_dependencies title="环境与依赖协议">
 
 - **环境管理**: 通过 `uv add` 命令将所有项目依赖项添加到 `pyproject.toml` 文件中，确保环境配置的清晰和可移植性。
+  **最佳实践**对于像 PyTorch (cuXXX) 或 PyG (torch-scatter, torch-sparse) 这类需要特定 CUDA 和 PyTorch 版本的依赖，请将所有必要的 `.whl` 索引（如 `https://download.pytorch.org/whl/cu128` 和 `https://data.pyg.org/whl/torch-2.7.0+cu128.html`）明确添加到 `pyproject.toml` 的 `[[tool.uv.index]]` 部分，然后直接运行 `uv add package_name`。
+  **如果上述方法仍然失败**，作为临时备选方案，你可以使用 `uv pip install --no-deps --find-links <URL_OR_PATH_TO_WHL_FILE> package_name` 手动安装预编译的 `.whl` 文件，然后再次尝试 `uv add package_name`。**切勿**在 `uv add` 命令中直接使用 `--index-url` 或 `--extra-index-url`，这会导致包孤立，影响后续依赖管理。
 - **底层依赖研究**: 任何底层依赖包的代码（如`transformers`）都存在于本工作区的`.venv\Lib\site-packages`中。如果需要研究底层架构，应通过`list .venv\Lib\site-packages`中的对应包来尝试直接查看底层实现。
 - **外部知识查询**: 当不确定上游库（如 `gradio`）是否支持特定功能，或涉及上游库的 debug 时（如`Transformers`），**总是并多次使用** `DeepWiki` 的 `ask_question` 功能进行查询。当不知道库的 GitHub repo 路径时，询问用户来获得路径信息。
 - **优先继承**: 在修改 `transformers` 等上游库时，**必须**优先采用**继承和替换最小组件**的“模型手术”模式，而不是覆写庞杂的 `forward` 方法。这要求在动手前，先通过 `list .venv/Lib/site-packages/...` 研究其源码。

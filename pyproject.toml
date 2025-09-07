@@ -68,6 +68,11 @@ name = "pytorch-cu128"
 url = "https://download.pytorch.org/whl/cu128"
 explicit = true
 
+[[tool.uv.index]]
+name = "pyg-cu128"
+url = "https://data.pyg.org/whl/torch-2.7.0+cu128.html"
+explicit = true
+
 [tool.ruff]
 exclude = ["ref", "exp", ".venv"]
 
