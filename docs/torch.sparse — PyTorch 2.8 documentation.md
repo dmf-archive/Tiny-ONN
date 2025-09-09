@@ -1,802 +1,792 @@
 ---
-created: 2025-09-08T02:25:05 (UTC +00:00)
-tags: []
-source: https://docs.pytorch.org/docs/stable/sparse.html
-author: PyTorch Contributors
+创建时间：2025-09-08T02:25:05 (UTC +00:00)
+标签：[]
+来源：https://docs.pytorch.org/docs/stable/sparse.html
+作者：PyTorch Contributors
 ---
 
-# torch.sparse — PyTorch 2.8 documentation
+# torch.sparse — PyTorch 2.8 文档
 
-> ## Excerpt
-> PyTorch Documentation. Explore PyTorch, an open-source machine learning library that accelerates the path from research prototyping to production deployment. Discover tutorials, API references, and guides to help you build and deploy deep learning models efficiently.
+> ## 摘录
+>
+> PyTorch 文档。探索 PyTorch，一个开源机器学习库，可加速从研究原型到生产部署的路径。发现教程、API 参考和指南，以帮助您高效地构建和部署深度学习模型。
 
 ---
-Created On: Apr 26, 2017 | Last Updated On: Jun 18, 2025
 
-Warning
+创建于：2017 年 4 月 26 日 | 最后更新于：2025 年 6 月 18 日
 
-The PyTorch API of sparse tensors is in beta and may change in the near future. We highly welcome feature requests, bug reports and general suggestions as GitHub issues.
+警告
 
-## Why and when to use sparsity
+PyTorch 稀疏张量的 API 处于测试阶段，可能会在不久的将来发生变化。我们非常欢迎通过 GitHub issue 提出功能请求、错误报告和一般性建议。
 
-By default, PyTorch stores [`torch.Tensor`](https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor "torch.Tensor") elements contiguously in physical memory. This leads to efficient implementations of various array processing algorithms that require fast access to elements.
+## 为什么以及何时使用稀疏性
 
-Now, some users might decide to represent data such as graph adjacency matrices, pruned weights or points clouds by Tensors whose _elements are mostly zero valued_. We recognize these are important applications and aim to provide performance optimizations for these use cases via sparse storage formats.
+默认情况下，PyTorch 在物理内存中连续存储 [`torch.Tensor`](https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor "torch.Tensor") 元素。这导致了各种需要快速访问元素的数组处理算法的高效实现。
 
-Various sparse storage formats such as COO, CSR/CSC, semi-structured, LIL, etc. have been developed over the years. While they differ in exact layouts, they all compress data through efficient representation of zero valued elements. We call the uncompressed values _specified_ in contrast to _unspecified_, compressed elements.
+现在，一些用户可能会决定通过张量来表示数据，例如图邻接矩阵、剪枝权重或点云，而这些张量的*元素大部分为零值*。我们认识到这些是重要的应用，并旨在通过稀疏存储格式为这些用例提供性能优化。
 
-By compressing repeat zeros sparse storage formats aim to save memory and computational resources on various CPUs and GPUs. Especially for high degrees of sparsity or highly structured sparsity this can have significant performance implications. As such sparse storage formats can be seen as a performance optimization.
+多年来，已经开发了各种稀疏存储格式，如 COO、CSR/CSC、半结构化、LIL 等。虽然它们在确切布局上有所不同，但它们都通过对零值元素的有效表示来压缩数据。我们将未压缩的值称为*指定的*元素，与*未指定的*、压缩的元素相对。
 
-Like many other performance optimization sparse storage formats are not always advantageous. When trying sparse formats for your use case you might find your execution time to increase rather than decrease.
+通过压缩重复的零，稀疏存储格式旨在节省各种 CPU 和 GPU 上的内存和计算资源。特别是对于高度稀疏性或高度结构化的稀疏性，这可能对性能产生重大影响。因此，稀疏存储格式可以被视为一种性能优化。
 
-Please feel encouraged to open a GitHub issue if you analytically expected to see a stark increase in performance but measured a degradation instead. This helps us prioritize the implementation of efficient kernels and wider performance optimizations.
+像许多其他性能优化一样，稀疏存储格式并非总是占优。当为您的用例尝试稀疏格式时，您可能会发现执行时间增加而不是减少。
 
-We make it easy to try different sparsity layouts, and convert between them, without being opinionated on what’s best for your particular application.
+如果您在分析上预期性能会大幅提高但测量到性能下降，请随时在 GitHub issue 中提出。这有助于我们优先实现高效内核和更广泛的性能优化。
 
-## Functionality overview
+我们使尝试不同的稀疏布局以及在它们之间进行转换变得容易，而不会对您的特定应用程序的最佳选择持固执己见。
 
-We want it to be straightforward to construct a sparse Tensor from a given dense Tensor by providing conversion routines for each layout.
+## 功能概述
 
-In the next example we convert a 2D Tensor with default dense (strided) layout to a 2D Tensor backed by the COO memory layout. Only values and indices of non-zero elements are stored in this case.
+我们希望通过为每种布局提供转换例程，能够轻松地从给定的密集张量构建稀疏张量。
 
-```
-<span></span><span>&gt;&gt;&gt; </span><span>a</span> <span>=</span> <span>torch</span><span>.</span><span>tensor</span><span>([[</span><span>0</span><span>,</span> <span>2.</span><span>],</span> <span>[</span><span>3</span><span>,</span> <span>0</span><span>]])</span>
-<span>&gt;&gt;&gt; </span><span>a</span><span>.</span><span>to_sparse</span><span>()</span>
-<span>tensor(indices=tensor([[0, 1],</span>
-<span>                       [1, 0]]),</span>
-<span>       values=tensor([2., 3.]),</span>
-<span>       size=(2, 2), nnz=2, layout=torch.sparse_coo)</span>
-```
+在下一个示例中，我们将一个具有默认密集（跨步）布局的二维张量转换为一个由 COO 内存布局支持的二维张量。在这种情况下，仅存储非零元素的*值*和*索引*。
 
-PyTorch currently supports [COO](https://docs.pytorch.org/docs/stable/sparse.html#sparse-coo-docs), [CSR](https://docs.pytorch.org/docs/stable/sparse.html#sparse-csr-docs), [CSC](https://docs.pytorch.org/docs/stable/sparse.html#sparse-csc-docs), [BSR](https://docs.pytorch.org/docs/stable/sparse.html#sparse-bsr-docs), and [BSC](https://docs.pytorch.org/docs/stable/sparse.html#sparse-bsc-docs).
-
-We also have a prototype implementation to support :ref: semi-structured sparsity<sparse-semi-structured-docs>. Please see the references for more details.
-
-Note that we provide slight generalizations of these formats.
-
-Batching: Devices such as GPUs require batching for optimal performance and thus we support batch dimensions.
-
-We currently offer a very simple version of batching where each component of a sparse format itself is batched. This also requires the same number of specified elements per batch entry. In this example we construct a 3D (batched) CSR Tensor from a 3D dense Tensor.
-
-```
-<span></span><span>&gt;&gt;&gt; </span><span>t</span> <span>=</span> <span>torch</span><span>.</span><span>tensor</span><span>([[[</span><span>1.</span><span>,</span> <span>0</span><span>],</span> <span>[</span><span>2.</span><span>,</span> <span>3.</span><span>]],</span> <span>[[</span><span>4.</span><span>,</span> <span>0</span><span>],</span> <span>[</span><span>5.</span><span>,</span> <span>6.</span><span>]]])</span>
-<span>&gt;&gt;&gt; </span><span>t</span><span>.</span><span>dim</span><span>()</span>
-<span>3</span>
-<span>&gt;&gt;&gt; </span><span>t</span><span>.</span><span>to_sparse_csr</span><span>()</span>
-<span>tensor(crow_indices=tensor([[0, 1, 3],</span>
-<span>                            [0, 1, 3]]),</span>
-<span>       col_indices=tensor([[0, 0, 1],</span>
-<span>                           [0, 0, 1]]),</span>
-<span>       values=tensor([[1., 2., 3.],</span>
-<span>                      [4., 5., 6.]]), size=(2, 2, 2), nnz=3,</span>
-<span>       layout=torch.sparse_csr)</span>
+```python
+a = torch.tensor([[0, 2.], [3, 0]])
+a.to_sparse()
+tensor(indices=tensor([[0, 1],
+                       [1, 0]]),
+       values=tensor([2., 3.]),
+       size=(2, 2), nnz=2, layout=torch.sparse_coo)
 ```
 
-Dense dimensions: On the other hand, some data such as Graph embeddings might be better viewed as sparse collections of vectors instead of scalars.
+PyTorch 目前支持 [COO](https://docs.pytorch.org/docs/stable/sparse.html#sparse-coo-docs)、[CSR](https://docs.pytorch.org/docs/stable/sparse.html#sparse-csr-docs)、[CSC](https://docs.pytorch.org/docs/stable/sparse.html#sparse-csc-docs)、[BSR](https://docs.pytorch.org/docs/stable/sparse.html#sparse-bsr-docs) 和 [BSC](https://docs.pytorch.org/docs/stable/sparse.html#sparse-bsc-docs)。
 
-In this example we create a 3D Hybrid COO Tensor with 2 sparse and 1 dense dimension from a 3D strided Tensor. If an entire row in the 3D strided Tensor is zero, it is not stored. If however any of the values in the row are non-zero, they are stored entirely. This reduces the number of indices since we need one index one per row instead of one per element. But it also increases the amount of storage for the values. Since only rows that are _entirely_ zero can be emitted and the presence of any non-zero valued elements cause the entire row to be stored.
+我们还有一个原型实现来支持 :ref:`半结构化稀疏 <sparse-semi-structured-docs>`。请参阅参考文献以了解更多详细信息。
 
-```
-<span></span><span>&gt;&gt;&gt; </span><span>t</span> <span>=</span> <span>torch</span><span>.</span><span>tensor</span><span>([[[</span><span>0.</span><span>,</span> <span>0</span><span>],</span> <span>[</span><span>1.</span><span>,</span> <span>2.</span><span>]],</span> <span>[[</span><span>0.</span><span>,</span> <span>0</span><span>],</span> <span>[</span><span>3.</span><span>,</span> <span>4.</span><span>]]])</span>
-<span>&gt;&gt;&gt; </span><span>t</span><span>.</span><span>to_sparse</span><span>(</span><span>sparse_dim</span><span>=</span><span>2</span><span>)</span>
-<span>tensor(indices=tensor([[0, 1],</span>
-<span>                       [1, 1]]),</span>
-<span>       values=tensor([[1., 2.],</span>
-<span>                      [3., 4.]]),</span>
-<span>       size=(2, 2, 2), nnz=2, layout=torch.sparse_coo)</span>
-```
+请注意，我们提供了这些格式的轻微泛化。
 
-## Operator overview
+批处理：GPU 等设备需要批处理才能获得最佳性能，因此我们支持批处理维度。
 
-Fundamentally, operations on Tensor with sparse storage formats behave the same as operations on Tensor with strided (or other) storage formats. The particularities of storage, that is the physical layout of the data, influences the performance of an operation but should not influence the semantics.
-
-We are actively increasing operator coverage for sparse tensors. Users should not expect support same level of support as for dense Tensors yet. See our [operator](https://docs.pytorch.org/docs/stable/sparse.html#sparse-ops-docs) documentation for a list.
+我们目前提供一种非常简单的批处理形式，其中稀疏格式的每个组件本身都进行了批处理。这还需要每个批处理条目具有相同数量的指定元素。在此示例中，我们从一个 3D 密集张量构建一个 3D（批处理）CSR 张量。
 
 ```
-<span></span><span>&gt;&gt;&gt; </span><span>b</span> <span>=</span> <span>torch</span><span>.</span><span>tensor</span><span>([[</span><span>0</span><span>,</span> <span>0</span><span>,</span> <span>1</span><span>,</span> <span>2</span><span>,</span> <span>3</span><span>,</span> <span>0</span><span>],</span> <span>[</span><span>4</span><span>,</span> <span>5</span><span>,</span> <span>0</span><span>,</span> <span>6</span><span>,</span> <span>0</span><span>,</span> <span>0</span><span>]])</span>
-<span>&gt;&gt;&gt; </span><span>b_s</span> <span>=</span> <span>b</span><span>.</span><span>to_sparse_csr</span><span>()</span>
-<span>&gt;&gt;&gt; </span><span>b_s</span><span>.</span><span>cos</span><span>()</span>
-<span>Traceback (most recent call last):</span>
-  File <span>"&lt;stdin&gt;"</span>, line <span>1</span>, in <span>&lt;module&gt;</span>
-<span>RuntimeError</span>: <span>unsupported tensor layout: SparseCsr</span>
-<span>&gt;&gt;&gt; </span><span>b_s</span><span>.</span><span>sin</span><span>()</span>
-<span>tensor(crow_indices=tensor([0, 3, 6]),</span>
-<span>       col_indices=tensor([2, 3, 4, 0, 1, 3]),</span>
-<span>       values=tensor([ 0.8415,  0.9093,  0.1411, -0.7568, -0.9589, -0.2794]),</span>
-<span>       size=(2, 6), nnz=6, layout=torch.sparse_csr)</span>
+  t = torch.tensor([[[1., 0], [2., 3.]], [[4., 0], [5., 6.]]])
+  t.dim()
+3
+  t.to_sparse_csr()
+tensor(crow_indices=tensor([[0, 1, 3],
+                            [0, 1, 3]]),
+       col_indices=tensor([[0, 0, 1],
+                           [0, 0, 1]]),
+       values=tensor([[1., 2., 3.],
+                      [4., 5., 6.]]), size=(2, 2, 2), nnz=3,
+       layout=torch.sparse_csr)
 ```
 
-As shown in the example above, we don’t support non-zero preserving unary operators such as cos. The output of a non-zero preserving unary operation will not be able to take advantage of sparse storage formats to the same extent as the input and potentially result in a catastrophic increase in memory. We instead rely on the user to explicitly convert to a dense Tensor first and then run the operation.
+密集维度：另一方面，一些数据（如图嵌入）可能更适合视为稀疏向量集合，而不是标量。
+
+在此示例中，我们从一个 3D 跨步张量创建一个具有 2 个稀疏维度和 1 个密集维度的 3D 混合 COO 张量。如果 3D 跨步张量中的整行都为零，则不存储该行。但是，如果行中的任何值非零，则会存储整行。这减少了索引的数量，因为我们每行需要一个索引而不是每个元素一个索引。但这也增加了值的存储量。由于只能发出*完全*为零的行，并且任何非零值的存在都会导致存储整行。
 
 ```
-<span></span><span>&gt;&gt;&gt; </span><span>b_s</span><span>.</span><span>to_dense</span><span>()</span><span>.</span><span>cos</span><span>()</span>
-<span>tensor([[ 1.0000, -0.4161],</span>
-<span>        [-0.9900,  1.0000]])</span>
+  t = torch.tensor([[[0., 0], [1., 2.]], [[0., 0], [3., 4.]]])
+  t.to_sparse(sparse_dim=2)
+tensor(indices=tensor([[0, 1],
+                       [1, 1]]),
+       values=tensor([[1., 2.],
+                      [3., 4.]]),
+       size=(2, 2, 2), nnz=2, layout=torch.sparse_coo)
 ```
 
-We are aware that some users want to ignore compressed zeros for operations such as cos instead of preserving the exact semantics of the operation. For this we can point to torch.masked and its MaskedTensor, which is in turn also backed and powered by sparse storage formats and kernels.
+## 运算符概述
 
-Also note that, for now, the user doesn’t have a choice of the output layout. For example, adding a sparse Tensor to a regular strided Tensor results in a strided Tensor. Some users might prefer for this to stay a sparse layout, because they know the result will still be sufficiently sparse.
+从根本上讲，对具有稀疏存储格式的张量的操作与对具有跨步（或其他）存储格式的张量的操作行为相同。存储的特定性，即数据的物理布局，会影响操作的性能，但不应影响语义。
+
+我们正在积极增加稀疏张量的运算符覆盖范围。用户目前不应期望获得与密集张量相同的支持级别。请参阅我们的[运算符](https://docs.pytorch.org/docs/stable/sparse.html#sparse-ops-docs)文档以获取列表。
 
 ```
-<span></span><span>&gt;&gt;&gt; </span><span>a</span> <span>+</span> <span>b</span><span>.</span><span>to_sparse</span><span>()</span>
-<span>tensor([[0., 3.],</span>
-<span>        [3., 0.]])</span>
+  b = torch.tensor([[0, 0, 1, 2, 3, 0], [4, 5, 0, 6, 0, 0]])
+  b_s = b.to_sparse_csr()
+  b_s.cos()
+Traceback (most recent call last):
+  File "&lt;stdin", line 1, in &lt;module
+RuntimeError: unsupported tensor layout: SparseCsr
+  b_s.sin()
+tensor(crow_indices=tensor([0, 3, 6]),
+       col_indices=tensor([2, 3, 4, 0, 1, 3]),
+       values=tensor([ 0.8415,  0.9093,  0.1411, -0.7568, -0.9589, -0.2794]),
+       size=(2, 6), nnz=6, layout=torch.sparse_csr)
 ```
 
-We acknowledge that access to kernels that can efficiently produce different output layouts can be very useful. A subsequent operation might significantly benefit from receiving a particular layout. We are working on an API to control the result layout and recognize it is an important feature to plan a more optimal path of execution for any given model.
+如上例所示，我们不支持 cos 等非零保持的一元运算符。非零保持的一元运算的输出将无法像输入那样充分利用稀疏存储格式，并可能导致内存急剧增加。我们依赖用户先显式转换为密集张量，然后运行该运算。
 
-## Sparse Semi-Structured Tensors
+```
+  b_s.to_dense().cos()
+tensor([[ 1.0000, -0.4161],
+        [-0.9900,  1.0000]])
+```
 
-Warning
+我们知道有些用户希望忽略 cos 等运算的压缩零值，而不是保留运算的确切语义。为此，我们可以指向 torch.masked 及其 MaskedTensor，它又由稀疏存储格式和内核支持和驱动。
 
-Sparse semi-structured tensors are currently a prototype feature and subject to change. Please feel free to open an issue to report a bug or if you have feedback to share.
+另请注意，目前，用户没有输出布局的选择。例如，将稀疏张量添加到常规跨步张量会产生一个跨步张量。一些用户可能希望将其保留为稀疏布局，因为他们知道结果仍然足够稀疏。
 
-Semi-Structured sparsity is a sparse data layout that was first introduced in NVIDIA’s Ampere architecture. It is also referred to as **fine-grained structured sparsity** or **2:4 structured sparsity**.
+```
+  a + b.to_sparse()
+tensor([[0., 3.],
+        [3., 0.]])
+```
 
-This sparse layout stores n elements out of every 2n elements, with n being determined by the width of the Tensor’s data type (dtype). The most frequently used dtype is float16, where n=2, thus the term “2:4 structured sparsity.”
+我们承认，能够高效生成不同输出布局的内核的访问非常有用。后续操作可能会从接收特定布局中受益匪浅。我们正在开发一种 API 来控制结果布局，并认识到为任何给定模型规划更优执行路径是一项重要功能。
 
-Semi-structured sparsity is explained in greater detail in [this NVIDIA blog post](https://developer.nvidia.com/blog/exploiting-ampere-structured-sparsity-with-cusparselt).
+## 半结构化稀疏张量
 
-In PyTorch, semi-structured sparsity is implemented via a Tensor subclass. By subclassing, we can override `__torch_dispatch__` , allowing us to use faster sparse kernels when performing matrix multiplication. We can also store the tensor in it’s compressed form inside the subclass to reduce memory overhead.
+警告
 
-In this compressed form, the sparse tensor is stored by retaining only the _specified_ elements and some metadata, which encodes the mask.
+半结构化稀疏张量目前是一项原型功能，可能会发生变化。如果您想报告错误或分享反馈，请随时提出 issue。
 
-Note
+半结构化稀疏性是 NVIDIA Ampere 架构首次引入的稀疏数据布局。它也被称为**细粒度结构化稀疏性**或**2:4 结构化稀疏性**。
 
-The specified elements and metadata mask of a semi-structured sparse tensor are stored together in a single flat compressed tensor. They are appended to each other to form a contiguous chunk of memory.
+此稀疏布局存储每 2n 个元素中的 n 个元素，其中 n 由张量数据类型 (dtype) 的宽度决定。最常用的 dtype 是 float16，此时 n=2，因此称为“2:4 结构化稀疏性”。
 
-compressed tensor = \[ specified elements of original tensor | metadata\_mask \]
+[此 NVIDIA 博文](https://developer.nvidia.com/blog/exploiting-ampere-structured-sparsity-with-cusparselt)更详细地解释了半结构化稀疏性。
 
-For an original tensor of size (r, c) we expect the first m \* k // 2 elements to be the kept elements and the rest of the tensor is metadata.
+在 PyTorch 中，半结构化稀疏性是通过张量子类实现的。通过子类化，我们可以覆盖 `__torch_dispatch__`，这使我们能够在执行矩阵乘法时使用更快的稀疏内核。我们还可以在子类内部以压缩形式存储张量，以减少内存开销。
 
-In order to make it easier for the user to view the specified elements and mask, one can use `.indices()` and `.values()` to access the mask and specified elements respectively.
+在此压缩形式中，稀疏张量通过仅保留*指定的*元素和一些编码掩码的元数据来存储。
 
--   `.values()` returns the specified elements in a tensor of size (r, c//2) and with the same dtype as the dense matrix.
-    
--   `.indices()` returns the metadata\_mask in a tensor of size (r, c//2 ) and with element type `torch.int16` if dtype is torch.float16 or torch.bfloat16, and element type `torch.int32` if dtype is torch.int8.
-    
+注意
 
-For 2:4 sparse tensors, the metadata overhead is minor - just 2 bits per specified element.
+半结构化稀疏张量的指定元素和元数据掩码存储在单个扁平压缩张量中。它们相互追加以形成连续的内存块。
 
-Note
+压缩张量 = \[原始张量的指定元素 | 元数据掩码 \]
 
-It’s important to note that `torch.float32` is only supported for 1:2 sparsity. Therefore, it does not follow the same formula as above.
+对于大小为 (r, c) 的原始张量，我们期望前 m \* k // 2 个元素是保留的元素，其余张量是元数据。
 
-Here, we break down how to calculate the compression ratio ( size dense / size sparse) of a 2:4 sparse tensor.
+为了方便用户查看指定元素和掩码，可以使用 `.indices()` 和 `.values()` 分别访问掩码和指定元素。
 
-Let (r, c) = tensor.shape and e = bitwidth(tensor.dtype), so e = 16 for `torch.float16` and `torch.bfloat16` and e = 8 for `torch.int8`.
+- `.values()` 返回指定元素，大小为 (r, c//2)，数据类型与密集矩阵相同。
+
+- `.indices()` 返回元数据掩码，大小为 (r, c//2)，如果 dtype 是 torch.float16 或 torch.bfloat16，则元素类型为 `torch.int16`；如果 dtype 是 torch.int8，则元素类型为 `torch.int32`。
+
+对于 2:4 稀疏张量，元数据开销很小 - 每个指定元素仅 2 位。
+
+注意
+
+请注意，`torch.float32` 仅支持 1:2 稀疏性。因此，它不遵循上述相同公式。
+
+在这里，我们将分解计算 2:4 稀疏张量的压缩率（密集大小 / 稀疏大小）。
+
+设 (r, c) = tensor.shape，e = bitwidth(tensor.dtype)，则 e = 16 用于 `torch.float16` 和 `torch.bfloat16`，e = 8 用于 `torch.int8`。
 
 $M_{dense} = r \times c \times e \\ M_{sparse} = M_{specified} + M_{metadata} = r \times \frac{c}{2} \times e + r \times \frac{c}{2} \times 2 = \frac{rce}{2} + rc =rce(\frac{1}{2} +\frac{1}{e})$
 
-Using these calculations, we can determine the total memory footprint for both the original dense and the new sparse representation.
+使用这些计算，我们可以确定原始密集表示和新稀疏表示的总内存占用。
 
-This gives us a simple formula for the compression ratio, which is dependent only on the bitwidth of the tensor datatype.
+这为我们提供了一个简单的压缩率公式，该公式仅取决于张量数据类型的位宽。
 
 $C = \frac{M_{sparse}}{M_{dense}} =  \frac{1}{2} + \frac{1}{e}$
 
-By using this formula, we find that the compression ratio is 56.25% for `torch.float16` or `torch.bfloat16`, and 62.5% for `torch.int8`.
+使用此公式，我们发现 `torch.float16` 或 `torch.bfloat16` 的压缩率为 56.25%，`torch.int8` 的压缩率为 62.5%。
 
-### Constructing Sparse Semi-Structured Tensors
+### 构建半结构化稀疏张量
 
-You can transform a dense tensor into a sparse semi-structured tensor by simply using the `torch.to_sparse_semi_structured` function.
+您可以通过简单地使用 `torch.to_sparse_semi_structured` 函数将密集张量转换为半结构化稀疏张量。
 
-Please also note that we only support CUDA tensors since hardware compatibility for semi-structured sparsity is limited to NVIDIA GPUs.
+另请注意，我们仅支持 CUDA 张量，因为半结构化稀疏性的硬件兼容性仅限于 NVIDIA GPU。
 
-The following datatypes are supported for semi-structured sparsity. Note that each datatype has its own shape constraints and compression factor.
+以下数据类型支持半结构化稀疏性。请注意，每种数据类型都有其自己的形状约束和压缩因子。
 
-To construct a semi-structured sparse tensor, start by creating a regular dense tensor that adheres to a 2:4 (or semi-structured) sparse format. To do this we tile a small 1x4 strip to create a 16x16 dense float16 tensor. Afterwards, we can call `to_sparse_semi_structured` function to compress it for accelerated inference.
-
-```
-<span></span><span>&gt;&gt;&gt; </span><span>from</span> <span>torch.sparse</span> <span>import</span> <span>to_sparse_semi_structured</span>
-<span>&gt;&gt;&gt; </span><span>A</span> <span>=</span> <span>torch</span><span>.</span><span>Tensor</span><span>([</span><span>0</span><span>,</span> <span>0</span><span>,</span> <span>1</span><span>,</span> <span>1</span><span>])</span><span>.</span><span>tile</span><span>((</span><span>128</span><span>,</span> <span>32</span><span>))</span><span>.</span><span>half</span><span>()</span><span>.</span><span>cuda</span><span>()</span>
-<span>tensor([[0., 0., 1.,  ..., 0., 1., 1.],</span>
-<span>        [0., 0., 1.,  ..., 0., 1., 1.],</span>
-<span>        [0., 0., 1.,  ..., 0., 1., 1.],</span>
-<span>        ...,</span>
-<span>        [0., 0., 1.,  ..., 0., 1., 1.],</span>
-<span>        [0., 0., 1.,  ..., 0., 1., 1.],</span>
-<span>        [0., 0., 1.,  ..., 0., 1., 1.]], device='cuda:0', dtype=torch.float16)</span>
-<span>&gt;&gt;&gt; </span><span>A_sparse</span> <span>=</span> <span>to_sparse_semi_structured</span><span>(</span><span>A</span><span>)</span>
-<span>SparseSemiStructuredTensor(shape=torch.Size([128, 128]), transposed=False, values=tensor([[1., 1., 1.,  ..., 1., 1., 1.],</span>
-<span>        [1., 1., 1.,  ..., 1., 1., 1.],</span>
-<span>        [1., 1., 1.,  ..., 1., 1., 1.],</span>
-<span>        ...,</span>
-<span>        [1., 1., 1.,  ..., 1., 1., 1.],</span>
-<span>        [1., 1., 1.,  ..., 1., 1., 1.],</span>
-<span>        [1., 1., 1.,  ..., 1., 1., 1.]], device='cuda:0', dtype=torch.float16), metadata=tensor([[-4370, -4370, -4370,  ..., -4370, -4370, -4370],</span>
-<span>        [-4370, -4370, -4370,  ..., -4370, -4370, -4370],</span>
-<span>        [-4370, -4370, -4370,  ..., -4370, -4370, -4370],</span>
-<span>        ...,</span>
-<span>        [-4370, -4370, -4370,  ..., -4370, -4370, -4370],</span>
-<span>        [-4370, -4370, -4370,  ..., -4370, -4370, -4370],</span>
-<span>        [-4370, -4370, -4370,  ..., -4370, -4370, -4370]], device='cuda:0',</span>
-<span>dtype=torch.int16))</span>
-```
-
-### Sparse Semi-Structured Tensor Operations
-
-Currently, the following operations are supported for semi-structured sparse tensors:
-
--   torch.addmm(bias, dense, sparse.t())
-    
--   torch.mm(dense, sparse)
-    
--   torch.mm(sparse, dense)
-    
--   aten.linear.default(dense, sparse, bias)
-    
--   aten.t.default(sparse)
-    
--   aten.t.detach(sparse)
-    
-
-To use these ops, simply pass the output of `to_sparse_semi_structured(tensor)` instead of using `tensor` once your tensor has 0s in a semi-structured sparse format, like this:
+要构建半结构化稀疏张量，请首先创建一个符合 2:4（或半结构化）稀疏格式的常规密集张量。为此，我们通过平铺一个小的 1x4 条带来创建 16x16 密集 float16 张量。之后，我们可以调用 `to_sparse_semi_structured` 函数来压缩它以进行加速推理。
 
 ```
-<span></span><span>&gt;&gt;&gt; </span><span>a</span> <span>=</span> <span>torch</span><span>.</span><span>Tensor</span><span>([</span><span>0</span><span>,</span> <span>0</span><span>,</span> <span>1</span><span>,</span> <span>1</span><span>])</span><span>.</span><span>tile</span><span>((</span><span>64</span><span>,</span> <span>16</span><span>))</span><span>.</span><span>half</span><span>()</span><span>.</span><span>cuda</span><span>()</span>
-<span>&gt;&gt;&gt; </span><span>b</span> <span>=</span> <span>torch</span><span>.</span><span>rand</span><span>(</span><span>64</span><span>,</span> <span>64</span><span>)</span><span>.</span><span>half</span><span>()</span><span>.</span><span>cuda</span><span>()</span>
-<span>&gt;&gt;&gt; </span><span>c</span> <span>=</span> <span>torch</span><span>.</span><span>mm</span><span>(</span><span>a</span><span>,</span> <span>b</span><span>)</span>
-<span>&gt;&gt;&gt; </span><span>a_sparse</span> <span>=</span> <span>to_sparse_semi_structured</span><span>(</span><span>a</span><span>)</span>
-<span>&gt;&gt;&gt; </span><span>torch</span><span>.</span><span>allclose</span><span>(</span><span>c</span><span>,</span> <span>torch</span><span>.</span><span>mm</span><span>(</span><span>a_sparse</span><span>,</span> <span>b</span><span>))</span>
-<span>True</span>
+  from torch.sparse import to_sparse_semi_structured
+  A = torch.Tensor([0, 0, 1, 1]).tile((128, 32)).half().cuda()
+tensor([[0., 0., 1.,  ..., 0., 1., 1.],
+        [0., 0., 1.,  ..., 0., 1., 1.],
+        [0., 0., 1.,  ..., 0., 1., 1.],
+        ...,
+        [0., 0., 1.,  ..., 0., 1., 1.],
+        [0., 0., 1.,  ..., 0., 1., 1.],
+        [0., 0., 1.,  ..., 0., 1., 1.]], device='cuda:0', dtype=torch.float16)
+  A_sparse = to_sparse_semi_structured(A)
+SparseSemiStructuredTensor(shape=torch.Size([128, 128]), transposed=False, values=tensor([[1., 1., 1.,  ..., 1., 1., 1.],
+        [1., 1., 1.,  ..., 1., 1., 1.],
+        [1., 1., 1.,  ..., 1., 1., 1.],
+        ...,
+        [1., 1., 1.,  ..., 1., 1., 1.],
+        [1., 1., 1.,  ..., 1., 1., 1.],
+        [1., 1., 1.,  ..., 1., 1., 1.]], device='cuda:0', dtype=torch.float16), metadata=tensor([[-4370, -4370, -4370,  ..., -4370, -4370, -4370],
+        [-4370, -4370, -4370,  ..., -4370, -4370, -4370],
+        [-4370, -4370, -4370,  ..., -4370, -4370, -4370],
+        ...,
+        [-4370, -4370, -4370,  ..., -4370, -4370, -4370],
+        [-4370, -4370, -4370,  ..., -4370, -4370, -4370],
+        [-4370, -4370, -4370,  ..., -4370, -4370, -4370]], device='cuda:0',
+dtype=torch.int16))
 ```
 
-### Accelerating nn.Linear with semi-structured sparsity
+### 半结构化稀疏张量运算
 
-You can accelerate the linear layers in your model if the weights are already semi-structured sparse with just a few lines of code:
+目前，半结构化稀疏张量支持以下运算：
 
-```
-<span></span><span>&gt;&gt;&gt; </span><span>input</span> <span>=</span> <span>torch</span><span>.</span><span>rand</span><span>(</span><span>64</span><span>,</span> <span>64</span><span>)</span><span>.</span><span>half</span><span>()</span><span>.</span><span>cuda</span><span>()</span>
-<span>&gt;&gt;&gt; </span><span>mask</span> <span>=</span> <span>torch</span><span>.</span><span>Tensor</span><span>([</span><span>0</span><span>,</span> <span>0</span><span>,</span> <span>1</span><span>,</span> <span>1</span><span>])</span><span>.</span><span>tile</span><span>((</span><span>64</span><span>,</span> <span>16</span><span>))</span><span>.</span><span>cuda</span><span>()</span><span>.</span><span>bool</span><span>()</span>
-<span>&gt;&gt;&gt; </span><span>linear</span> <span>=</span> <span>nn</span><span>.</span><span>Linear</span><span>(</span><span>64</span><span>,</span> <span>64</span><span>)</span><span>.</span><span>half</span><span>()</span><span>.</span><span>cuda</span><span>()</span>
-<span>&gt;&gt;&gt; </span><span>linear</span><span>.</span><span>weight</span> <span>=</span> <span>nn</span><span>.</span><span>Parameter</span><span>(</span><span>to_sparse_semi_structured</span><span>(</span><span>linear</span><span>.</span><span>weight</span><span>.</span><span>masked_fill</span><span>(</span><span>~</span><span>mask</span><span>,</span> <span>0</span><span>)))</span>
-```
+- torch.addmm(bias, dense, sparse.t())
 
-## Sparse COO tensors
+- torch.mm(dense, sparse)
 
-PyTorch implements the so-called Coordinate format, or COO format, as one of the storage formats for implementing sparse tensors. In COO format, the specified elements are stored as tuples of element indices and the corresponding values. In particular,
+- torch.mm(sparse, dense)
 
-> -   the indices of specified elements are collected in `indices` tensor of size `(ndim, nse)` and with element type `torch.int64`,
->     
-> -   the corresponding values are collected in `values` tensor of size `(nse,)` and with an arbitrary integer or floating point number element type,
->     
+- aten.linear.default(dense, sparse, bias)
 
-where `ndim` is the dimensionality of the tensor and `nse` is the number of specified elements.
+- aten.t.default(sparse)
 
-Note
+- aten.t.detach(sparse)
 
-The memory consumption of a sparse COO tensor is at least `(ndim * 8 + <size of element type in bytes>) * nse` bytes (plus a constant overhead from storing other tensor data).
-
-The memory consumption of a strided tensor is at least `product(<tensor shape>) * <size of element type in bytes>`.
-
-For example, the memory consumption of a 10 000 x 10 000 tensor with 100 000 non-zero 32-bit floating point numbers is at least `(2 * 8 + 4) * 100 000 = 2 000 000` bytes when using COO tensor layout and `10 000 * 10 000 * 4 = 400 000 000` bytes when using the default strided tensor layout. Notice the 200 fold memory saving from using the COO storage format.
-
-### Construction
-
-A sparse COO tensor can be constructed by providing the two tensors of indices and values, as well as the size of the sparse tensor (when it cannot be inferred from the indices and values tensors) to a function [`torch.sparse_coo_tensor()`](https://docs.pytorch.org/docs/stable/generated/torch.sparse_coo_tensor.html#torch.sparse_coo_tensor "torch.sparse_coo_tensor").
-
-Suppose we want to define a sparse tensor with the entry 3 at location (0, 2), entry 4 at location (1, 0), and entry 5 at location (1, 2). Unspecified elements are assumed to have the same value, fill value, which is zero by default. We would then write:
+要使用这些运算，只需在张量处于半结构化稀疏格式（具有零值）后，将 `to_sparse_semi_structured(tensor)` 的输出传递进去，而不是使用 `tensor`，如下所示：
 
 ```
-<span></span><span>&gt;&gt;&gt; </span><span>i</span> <span>=</span> <span>[[</span><span>0</span><span>,</span> <span>1</span><span>,</span> <span>1</span><span>],</span> <span>[</span><span>2</span><span>,</span> <span>0</span><span>,</span> <span>2</span><span>]]</span>
-<span>&gt;&gt;&gt; </span><span>v</span> <span>=</span>  <span>[</span><span>3</span><span>,</span> <span>4</span><span>,</span> <span>5</span><span>]</span>
-<span>&gt;&gt;&gt; </span><span>s</span> <span>=</span> <span>torch</span><span>.</span><span>sparse_coo_tensor</span><span>(</span><span>i</span><span>,</span> <span>v</span><span>,</span> <span>(</span><span>2</span><span>,</span> <span>3</span><span>))</span>
-<span>&gt;&gt;&gt; </span><span>s</span>
-<span>tensor(indices=tensor([[0, 1, 1],</span>
-<span>                       [2, 0, 2]]),</span>
-<span>       values=tensor([3, 4, 5]),</span>
-<span>       size=(2, 3), nnz=3, layout=torch.sparse_coo)</span>
-<span>&gt;&gt;&gt; </span><span>s</span><span>.</span><span>to_dense</span><span>()</span>
-<span>tensor([[0, 0, 3],</span>
-<span>        [4, 0, 5]])</span>
+  a = torch.Tensor([0, 0, 1, 1]).tile((64, 16)).half().cuda()
+  b = torch.rand(64, 64).half().cuda()
+  c = torch.mm(a, b)
+  a_sparse = to_sparse_semi_structured(a)
+  torch.allclose(c, torch.mm(a_sparse, b))
+True
 ```
 
-Note that the input `i` is NOT a list of index tuples. If you want to write your indices this way, you should transpose before passing them to the sparse constructor:
+### 使用半结构化稀疏性加速 nn.Linear
+
+只需几行代码，即可加速模型中的线性层（如果权重已经是半结构化稀疏的）：
 
 ```
-<span></span><span>&gt;&gt;&gt; </span><span>i</span> <span>=</span> <span>[[</span><span>0</span><span>,</span> <span>2</span><span>],</span> <span>[</span><span>1</span><span>,</span> <span>0</span><span>],</span> <span>[</span><span>1</span><span>,</span> <span>2</span><span>]]</span>
-<span>&gt;&gt;&gt; </span><span>v</span> <span>=</span>  <span>[</span><span>3</span><span>,</span>      <span>4</span><span>,</span>      <span>5</span>    <span>]</span>
-<span>&gt;&gt;&gt; </span><span>s</span> <span>=</span> <span>torch</span><span>.</span><span>sparse_coo_tensor</span><span>(</span><span>list</span><span>(</span><span>zip</span><span>(</span><span>*</span><span>i</span><span>)),</span> <span>v</span><span>,</span> <span>(</span><span>2</span><span>,</span> <span>3</span><span>))</span>
-<span>&gt;&gt;&gt; </span><span># Or another equivalent formulation to get s</span>
-<span>&gt;&gt;&gt; </span><span>s</span> <span>=</span> <span>torch</span><span>.</span><span>sparse_coo_tensor</span><span>(</span><span>torch</span><span>.</span><span>tensor</span><span>(</span><span>i</span><span>)</span><span>.</span><span>t</span><span>(),</span> <span>v</span><span>,</span> <span>(</span><span>2</span><span>,</span> <span>3</span><span>))</span>
-<span>&gt;&gt;&gt; </span><span>torch</span><span>.</span><span>sparse_coo_tensor</span><span>(</span><span>i</span><span>.</span><span>t</span><span>(),</span> <span>v</span><span>,</span> <span>torch</span><span>.</span><span>Size</span><span>([</span><span>2</span><span>,</span><span>3</span><span>]))</span><span>.</span><span>to_dense</span><span>()</span>
-<span>tensor([[0, 0, 3],</span>
-<span>        [4, 0, 5]])</span>
+  input = torch.rand(64, 64).half().cuda()
+  mask = torch.Tensor([0, 0, 1, 1]).tile((64, 16)).cuda().bool()
+  linear = nn.Linear(64, 64).half().cuda()
+  linear.weight = nn.Parameter(to_sparse_semi_structured(linear.weight.masked_fill(~mask, 0)))
 ```
 
-An empty sparse COO tensor can be constructed by specifying its size only:
+## 稀疏 COO 张量
+
+PyTorch 以坐标格式（COO 格式）作为实现稀疏张量的存储格式之一。在 COO 格式中，指定元素存储为元素索引及其对应值的元组。具体来说：
+
+> - 指定元素的索引收集在大小为 `(ndim, nse)` 且元素类型为 `torch.int64` 的 `indices` 张量中。
+>
+> - 对应的*值*收集在大小为 `(nse,)` 且具有任意整数或浮点数元素类型的 `values` 张量中。
+
+其中 `ndim` 是张量的维数，`nse` 是指定元素的数量。
+
+注意
+
+稀疏 COO 张量的内存消耗至少为 `(ndim * 8 + <元素类型的字节大小>) * nse` 字节（加上存储其他张量数据的常量开销）。
+
+跨步张量的内存消耗至少为 `product(<张量形状>) * <元素类型的字节大小>`。
+
+例如，使用 COO 张量布局时，一个具有 100,000 个非零 32 位浮点数的 10,000 x 10,000 张量的内存消耗至少为 `(2 * 8 + 4) * 100,000 = 2,000,000` 字节，而使用默认的跨步张量布局时为 `10,000 * 10,000 * 4 = 400,000,000` 字节。请注意，使用 COO 存储格式可节省 200 倍的内存。
+
+### 构建
+
+可以通过向 [`torch.sparse_coo_tensor()`](https://docs.pytorch.org/docs/stable/generated/torch.sparse_coo_tensor.html#torch.sparse_coo_tensor "torch.sparse_coo_tensor") 函数提供索引和值这两个张量，以及稀疏张量的大小（如果无法从索引和值张量推断）来构造稀疏 COO 张量。
+
+假设我们要定义一个稀疏张量，其中位置 (0, 2) 的条目为 3，位置 (1, 0) 的条目为 4，位置 (1, 2) 的条目为 5。未指定的元素假定具有相同的值，即填充值，默认为零。然后，我们将编写：
 
 ```
-<span></span><span>&gt;&gt;&gt; </span><span>torch</span><span>.</span><span>sparse_coo_tensor</span><span>(</span><span>size</span><span>=</span><span>(</span><span>2</span><span>,</span> <span>3</span><span>))</span>
-<span>tensor(indices=tensor([], size=(2, 0)),</span>
-<span>       values=tensor([], size=(0,)),</span>
-<span>       size=(2, 3), nnz=0, layout=torch.sparse_coo)</span>
+  i = [[0, 1, 1], [2, 0, 2]]
+  v =  [3, 4, 5]
+  s = torch.sparse_coo_tensor(i, v, (2, 3))
+  s
+tensor(indices=tensor([[0, 1, 1],
+                       [2, 0, 2]]),
+       values=tensor([3, 4, 5]),
+       size=(2, 3), nnz=3, layout=torch.sparse_coo)
+  s.to_dense()
+tensor([[0, 0, 3],
+        [4, 0, 5]])
 ```
 
-### Sparse hybrid COO tensors
-
-PyTorch implements an extension of sparse tensors with scalar values to sparse tensors with (contiguous) tensor values. Such tensors are called hybrid tensors.
-
-PyTorch hybrid COO tensor extends the sparse COO tensor by allowing the `values` tensor to be a multi-dimensional tensor so that we have:
-
-> -   the indices of specified elements are collected in `indices` tensor of size `(sparse_dims, nse)` and with element type `torch.int64`,
->     
-> -   the corresponding (tensor) values are collected in `values` tensor of size `(nse, dense_dims)` and with an arbitrary integer or floating point number element type.
->     
-
-Note
-
-We use (M + K)-dimensional tensor to denote a N-dimensional sparse hybrid tensor, where M and K are the numbers of sparse and dense dimensions, respectively, such that M + K == N holds.
-
-Suppose we want to create a (2 + 1)-dimensional tensor with the entry \[3, 4\] at location (0, 2), entry \[5, 6\] at location (1, 0), and entry \[7, 8\] at location (1, 2). We would write
+请注意，输入 `i` **不是**索引元组列表。如果您想这样编写索引，则应在传递给稀疏构造函数之前进行转置：
 
 ```
-<span></span><span>&gt;&gt;&gt; </span><span>i</span> <span>=</span> <span>[[</span><span>0</span><span>,</span> <span>1</span><span>,</span> <span>1</span><span>],</span>
-<span>         [2, 0, 2]]</span>
-<span>&gt;&gt;&gt; </span><span>v</span> <span>=</span>  <span>[[</span><span>3</span><span>,</span> <span>4</span><span>],</span> <span>[</span><span>5</span><span>,</span> <span>6</span><span>],</span> <span>[</span><span>7</span><span>,</span> <span>8</span><span>]]</span>
-<span>&gt;&gt;&gt; </span><span>s</span> <span>=</span> <span>torch</span><span>.</span><span>sparse_coo_tensor</span><span>(</span><span>i</span><span>,</span> <span>v</span><span>,</span> <span>(</span><span>2</span><span>,</span> <span>3</span><span>,</span> <span>2</span><span>))</span>
-<span>&gt;&gt;&gt; </span><span>s</span>
-<span>tensor(indices=tensor([[0, 1, 1],</span>
-<span>                       [2, 0, 2]]),</span>
-<span>       values=tensor([[3, 4],</span>
-<span>                      [5, 6],</span>
-<span>                      [7, 8]]),</span>
-<span>       size=(2, 3, 2), nnz=3, layout=torch.sparse_coo)</span>
+  i = [[0, 2], [1, 0], [1, 2]]
+  v =  [3,      4,      5    ]
+  s = torch.sparse_coo_tensor(list(zip(*i)), v, (2, 3))
+  # Or another equivalent formulation to get s
+  s = torch.sparse_coo_tensor(torch.tensor(i).t(), v, (2, 3))
+  torch.sparse_coo_tensor(i.t(), v, torch.Size([2,3])).to_dense()
+tensor([[0, 0, 3],
+        [4, 0, 5]])
+```
+
+可以通过仅指定其大小来构造一个空的稀疏 COO 张量：
+
+```
+  torch.sparse_coo_tensor(size=(2, 3))
+tensor(indices=tensor([], size=(2, 0)),
+       values=tensor([], size=(0,)),
+       size=(2, 3), nnz=0, layout=torch.sparse_coo)
+```
+
+### 稀疏混合 COO 张量
+
+PyTorch 实现了一个稀疏张量的扩展，从标量值到稀疏张量（包含（连续）张量值）。这种张量称为混合张量。
+
+PyTorch 混合 COO 张量扩展了稀疏 COO 张量，允许 `values` 张量成为多维张量，因此我们有：
+
+> - 指定元素的索引收集在大小为 `(sparse_dims, nse)` 且元素类型为 `torch.int64` 的 `indices` 张量中。
+>
+> - 对应的（张量）值收集在大小为 `(nse, dense_dims)` 且具有任意整数或浮点数元素类型的 `values` 张量中。
+
+注意
+
+我们使用 (M + K) 维张量来表示 N 维稀疏混合张量，其中 M 和 K 分别是稀疏和密集维度的数量，使得 M + K == N。
+
+假设我们要创建一个 (2 + 1) 维张量，其中位置 (0, 2) 的条目为 \[3, 4]，位置 (1, 0) 的条目为 \[5, 6]，位置 (1, 2) 的条目为 \[7, 8]。我们将编写：
+
+```
+  i = [[0, 1, 1],
+         [2, 0, 2]]
+  v =  [[3, 4], [5, 6], [7, 8]]
+  s = torch.sparse_coo_tensor(i, v, (2, 3, 2))
+  s
+tensor(indices=tensor([[0, 1, 1],
+                       [2, 0, 2]]),
+       values=tensor([[3, 4],
+                      [5, 6],
+                      [7, 8]]),
+       size=(2, 3, 2), nnz=3, layout=torch.sparse_coo)
 ```
 
 ```
-<span></span><span>&gt;&gt;&gt; </span><span>s</span><span>.</span><span>to_dense</span><span>()</span>
-<span>tensor([[[0, 0],</span>
-<span>         [0, 0],</span>
-<span>         [3, 4]],</span>
-<span>        [[5, 6],</span>
-<span>         [0, 0],</span>
-<span>         [7, 8]]])</span>
+  s.to_dense()
+tensor([[[0, 0],
+         [0, 0],
+         [3, 4]],
+        [[5, 6],
+         [0, 0],
+         [7, 8]]])
 ```
 
-In general, if `s` is a sparse COO tensor and `M = s.sparse_dim()`, `K = s.dense_dim()`, then we have the following invariants:
+通常，如果 `s` 是稀疏 COO 张量，且 `M = s.sparse_dim()`，`K = s.dense_dim()`，则我们有以下不变性：
 
-> -   `M + K == len(s.shape) == s.ndim` - dimensionality of a tensor is the sum of the number of sparse and dense dimensions,
->     
-> -   `s.indices().shape == (M, nse)` - sparse indices are stored explicitly,
->     
-> -   `s.values().shape == (nse,) + s.shape[M : M + K]` - the values of a hybrid tensor are K-dimensional tensors,
->     
-> -   `s.values().layout == torch.strided` - values are stored as strided tensors.
->     
+> - `M + K == len(s.shape) == s.ndim` - 张量的维度是稀疏和密集维度数量的总和，
+>
+> - `s.indices().shape == (M, nse)` - 稀疏索引被显式存储，
+>
+> - `s.values().shape == (nse,) + s.shape[M : M + K]` - 混合张量的值是 K 维张量，
+>
+> - `s.values().layout == torch.strided` - 值存储为跨步张量。
 
-Note
+注意
 
-Dense dimensions always follow sparse dimensions, that is, mixing of dense and sparse dimensions is not supported.
+密集维度始终跟随稀疏维度，即不支持混合密集和稀疏维度。
 
-Note
+注意
 
-To be sure that a constructed sparse tensor has consistent indices, values, and size, the invariant checks can be enabled per tensor creation via `check_invariants=True` keyword argument, or globally using [`torch.sparse.check_sparse_tensor_invariants`](https://docs.pytorch.org/docs/stable/generated/torch.sparse.check_sparse_tensor_invariants.html#torch.sparse.check_sparse_tensor_invariants "torch.sparse.check_sparse_tensor_invariants") context manager instance. By default, the sparse tensor invariants checks are disabled.
+为了确保构造的稀疏张量具有一致的索引、值和大小，可以通过 `check_invariants=True` 关键字参数按张量创建启用不变性检查，或者使用 [`torch.sparse.check_sparse_tensor_invariants`](https://docs.pytorch.org/docs/stable/generated/torch.sparse.check_sparse_tensor_invariants.html#torch.sparse.check_sparse_tensor_invariants "torch.sparse.check_sparse_tensor_invariants") 上下文管理器实例全局启用。默认情况下，稀疏张量不变性检查是禁用的。
 
-### Uncoalesced sparse COO tensors
+### 未合并的稀疏 COO 张量
 
-PyTorch sparse COO tensor format permits sparse _uncoalesced_ tensors, where there may be duplicate coordinates in the indices; in this case, the interpretation is that the value at that index is the sum of all duplicate value entries. For example, one can specify multiple values, `3` and `4`, for the same index `1`, that leads to an 1-D uncoalesced tensor:
-
-```
-<span></span><span>&gt;&gt;&gt; </span><span>i</span> <span>=</span> <span>[[</span><span>1</span><span>,</span> <span>1</span><span>]]</span>
-<span>&gt;&gt;&gt; </span><span>v</span> <span>=</span>  <span>[</span><span>3</span><span>,</span> <span>4</span><span>]</span>
-<span>&gt;&gt;&gt; </span><span>s</span><span>=</span><span>torch</span><span>.</span><span>sparse_coo_tensor</span><span>(</span><span>i</span><span>,</span> <span>v</span><span>,</span> <span>(</span><span>3</span><span>,))</span>
-<span>&gt;&gt;&gt; </span><span>s</span>
-<span>tensor(indices=tensor([[1, 1]]),</span>
-<span>       values=tensor(  [3, 4]),</span>
-<span>       size=(3,), nnz=2, layout=torch.sparse_coo)</span>
-```
-
-while the coalescing process will accumulate the multi-valued elements into a single value using summation:
+PyTorch 稀疏 COO 张量格式允许稀疏*未合并*张量，其中索引可能存在重复坐标；在这种情况下，解释是该索引处的值是所有重复值条目的总和。例如，可以为同一个索引 `1` 指定多个值 `3` 和 `4`，这会导致一个一维未合并张量：
 
 ```
-<span></span><span>&gt;&gt;&gt; </span><span>s</span><span>.</span><span>coalesce</span><span>()</span>
-<span>tensor(indices=tensor([[1]]),</span>
-<span>       values=tensor([7]),</span>
-<span>       size=(3,), nnz=1, layout=torch.sparse_coo)</span>
+  i = [[1, 1]]
+  v =  [3, 4]
+  s=torch.sparse_coo_tensor(i, v, (3,))
+  s
+tensor(indices=tensor([[1, 1]]),
+       values=tensor(  [3, 4]),
+       size=(3,), nnz=2, layout=torch.sparse_coo)
 ```
 
-In general, the output of [`torch.Tensor.coalesce()`](https://docs.pytorch.org/docs/stable/generated/torch.Tensor.coalesce.html#torch.Tensor.coalesce "torch.Tensor.coalesce") method is a sparse tensor with the following properties:
-
--   the indices of specified tensor elements are unique,
-    
--   the indices are sorted in lexicographical order,
-    
--   [`torch.Tensor.is_coalesced()`](https://docs.pytorch.org/docs/stable/generated/torch.Tensor.is_coalesced.html#torch.Tensor.is_coalesced "torch.Tensor.is_coalesced") returns `True`.
-    
-
-Note
-
-For the most part, you shouldn’t have to care whether or not a sparse tensor is coalesced or not, as most operations will work identically given a sparse coalesced or uncoalesced tensor.
-
-However, some operations can be implemented more efficiently on uncoalesced tensors, and some on coalesced tensors.
-
-For instance, addition of sparse COO tensors is implemented by simply concatenating the indices and values tensors:
+而合并过程将使用求和将多值元素累积为单个值：
 
 ```
-<span></span><span>&gt;&gt;&gt; </span><span>a</span> <span>=</span> <span>torch</span><span>.</span><span>sparse_coo_tensor</span><span>([[</span><span>1</span><span>,</span> <span>1</span><span>]],</span> <span>[</span><span>5</span><span>,</span> <span>6</span><span>],</span> <span>(</span><span>2</span><span>,))</span>
-<span>&gt;&gt;&gt; </span><span>b</span> <span>=</span> <span>torch</span><span>.</span><span>sparse_coo_tensor</span><span>([[</span><span>0</span><span>,</span> <span>0</span><span>]],</span> <span>[</span><span>7</span><span>,</span> <span>8</span><span>],</span> <span>(</span><span>2</span><span>,))</span>
-<span>&gt;&gt;&gt; </span><span>a</span> <span>+</span> <span>b</span>
-<span>tensor(indices=tensor([[0, 0, 1, 1]]),</span>
-<span>       values=tensor([7, 8, 5, 6]),</span>
-<span>       size=(2,), nnz=4, layout=torch.sparse_coo)</span>
+  s.coalesce()
+tensor(indices=tensor([[1]]),
+       values=tensor([7]),
+       size=(3,), nnz=1, layout=torch.sparse_coo)
 ```
 
-If you repeatedly perform an operation that can produce duplicate entries (e.g., [`torch.Tensor.add()`](https://docs.pytorch.org/docs/stable/generated/torch.Tensor.add.html#torch.Tensor.add "torch.Tensor.add")), you should occasionally coalesce your sparse tensors to prevent them from growing too large.
+通常，[`torch.Tensor.coalesce()`](https://docs.pytorch.org/docs/stable/generated/torch.Tensor.coalesce.html#torch.Tensor.coalesce "torch.Tensor.coalesce") 方法的输出是一个稀疏张量，具有以下属性：
 
-On the other hand, the lexicographical ordering of indices can be advantageous for implementing algorithms that involve many element selection operations, such as slicing or matrix products.
+- 指定张量元素的索引是唯一的，
 
-### Working with sparse COO tensors
+- 索引按字典顺序排序，
 
-Let’s consider the following example:
+- [`torch.Tensor.is_coalesced()`](https://docs.pytorch.org/docs/stable/generated/torch.Tensor.is_coalesced.html#torch.Tensor.is_coalesced "torch.Tensor.is_coalesced") 返回 `True`。
 
-```
-<span></span><span>&gt;&gt;&gt; </span><span>i</span> <span>=</span> <span>[[</span><span>0</span><span>,</span> <span>1</span><span>,</span> <span>1</span><span>],</span>
-<span>         [2, 0, 2]]</span>
-<span>&gt;&gt;&gt; </span><span>v</span> <span>=</span>  <span>[[</span><span>3</span><span>,</span> <span>4</span><span>],</span> <span>[</span><span>5</span><span>,</span> <span>6</span><span>],</span> <span>[</span><span>7</span><span>,</span> <span>8</span><span>]]</span>
-<span>&gt;&gt;&gt; </span><span>s</span> <span>=</span> <span>torch</span><span>.</span><span>sparse_coo_tensor</span><span>(</span><span>i</span><span>,</span> <span>v</span><span>,</span> <span>(</span><span>2</span><span>,</span> <span>3</span><span>,</span> <span>2</span><span>))</span>
-```
+注意
 
-As mentioned above, a sparse COO tensor is a [`torch.Tensor`](https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor "torch.Tensor") instance and to distinguish it from the Tensor instances that use some other layout, one can use [`torch.Tensor.is_sparse`](https://docs.pytorch.org/docs/stable/generated/torch.Tensor.is_sparse.html#torch.Tensor.is_sparse "torch.Tensor.is_sparse") or `torch.Tensor.layout` properties:
+在大多数情况下，您不必关心稀疏张量是否已合并，因为大多数操作在给定合并或未合并的稀疏张量时行为相同。
 
-```
-<span></span><span>&gt;&gt;&gt; </span><span>isinstance</span><span>(</span><span>s</span><span>,</span> <span>torch</span><span>.</span><span>Tensor</span><span>)</span>
-<span>True</span>
-<span>&gt;&gt;&gt; </span><span>s</span><span>.</span><span>is_sparse</span>
-<span>True</span>
-<span>&gt;&gt;&gt; </span><span>s</span><span>.</span><span>layout</span> <span>==</span> <span>torch</span><span>.</span><span>sparse_coo</span>
-<span>True</span>
-```
+但是，某些操作可以在未合并张量上更高效地实现，而另一些操作可以在合并张量上更高效地实现。
 
-The number of sparse and dense dimensions can be acquired using methods [`torch.Tensor.sparse_dim()`](https://docs.pytorch.org/docs/stable/generated/torch.Tensor.sparse_dim.html#torch.Tensor.sparse_dim "torch.Tensor.sparse_dim") and [`torch.Tensor.dense_dim()`](https://docs.pytorch.org/docs/stable/generated/torch.Tensor.dense_dim.html#torch.Tensor.dense_dim "torch.Tensor.dense_dim"), respectively. For instance:
+例如，稀疏 COO 张量相加是通过简单地连接索引和值张量来实现的：
 
 ```
-<span></span><span>&gt;&gt;&gt; </span><span>s</span><span>.</span><span>sparse_dim</span><span>(),</span> <span>s</span><span>.</span><span>dense_dim</span><span>()</span>
-<span>(2, 1)</span>
+  a = torch.sparse_coo_tensor([[1, 1]], [5, 6], (2,))
+  b = torch.sparse_coo_tensor([[0, 0]], [7, 8], (2,))
+  a + b
+tensor(indices=tensor([[0, 0, 1, 1]]),
+       values=tensor([7, 8, 5, 6]),
+       size=(2,), nnz=4, layout=torch.sparse_coo)
 ```
 
-If `s` is a sparse COO tensor then its COO format data can be acquired using methods [`torch.Tensor.indices()`](https://docs.pytorch.org/docs/stable/generated/torch.Tensor.indices.html#torch.Tensor.indices "torch.Tensor.indices") and [`torch.Tensor.values()`](https://docs.pytorch.org/docs/stable/generated/torch.Tensor.values.html#torch.Tensor.values "torch.Tensor.values").
+如果您反复执行可能产生重复条目的操作（例如 [`torch.Tensor.add()`](https://docs.pytorch.org/docs/stable/generated/torch.Tensor.add.html#torch.Tensor.add "torch.Tensor.add")），您应该偶尔合并稀疏张量，以防止它们变得太大。
 
-Note
+另一方面，索引的字典序对于实现涉及许多元素选择操作（如切片或矩阵乘积）的算法可能是有利的。
 
-Currently, one can acquire the COO format data only when the tensor instance is coalesced:
+### 使用稀疏 COO 张量
 
-```
-<span></span><span>&gt;&gt;&gt; </span><span>s</span><span>.</span><span>indices</span><span>()</span>
-<span>RuntimeError: Cannot get indices on an uncoalesced tensor, please call .coalesce() first</span>
-```
-
-For acquiring the COO format data of an uncoalesced tensor, use `torch.Tensor._values()` and `torch.Tensor._indices()`:
+让我们考虑以下示例：
 
 ```
-<span></span><span>&gt;&gt;&gt; </span><span>s</span><span>.</span><span>_indices</span><span>()</span>
-<span>tensor([[0, 1, 1],</span>
-<span>        [2, 0, 2]])</span>
+  i = [[0, 1, 1],
+         [2, 0, 2]]
+  v =  [[3, 4], [5, 6], [7, 8]]
+  s = torch.sparse_coo_tensor(i, v, (2, 3, 2))
 ```
 
-Warning
-
-Calling `torch.Tensor._values()` will return a _detached_ tensor. To track gradients, `torch.Tensor.coalesce().values()` must be used instead.
-
-Constructing a new sparse COO tensor results a tensor that is not coalesced:
+如上所述，稀疏 COO 张量是 [`torch.Tensor`](https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor "torch.Tensor") 实例，为了将其与使用其他布局的张量实例区分开来，可以使用 [`torch.Tensor.is_sparse`](https://docs.pytorch.org/docs/stable/generated/torch.Tensor.is_sparse.html#torch.Tensor.is_sparse "torch.Tensor.is_sparse") 或 `torch.Tensor.layout` 属性：
 
 ```
-<span></span><span>&gt;&gt;&gt; </span><span>s</span><span>.</span><span>is_coalesced</span><span>()</span>
-<span>False</span>
+  isinstance(s, torch.Tensor)
+True
+  s.is_sparse
+True
+  s.layout == torch.sparse_coo
+True
 ```
 
-but one can construct a coalesced copy of a sparse COO tensor using the [`torch.Tensor.coalesce()`](https://docs.pytorch.org/docs/stable/generated/torch.Tensor.coalesce.html#torch.Tensor.coalesce "torch.Tensor.coalesce") method:
+稀疏和密集维度的数量可以使用方法 [`torch.Tensor.sparse_dim()`](https://docs.pytorch.org/docs/stable/generated/torch.Tensor.sparse_dim.html#torch.Tensor.sparse_dim "torch.Tensor.sparse_dim") 和 [`torch.Tensor.dense_dim()`](https://docs.pytorch.org/docs/stable/generated/torch.Tensor.dense_dim.html#torch.Tensor.dense_dim "torch.Tensor.dense_dim") 分别获取。例如：
 
 ```
-<span></span><span>&gt;&gt;&gt; </span><span>s2</span> <span>=</span> <span>s</span><span>.</span><span>coalesce</span><span>()</span>
-<span>&gt;&gt;&gt; </span><span>s2</span><span>.</span><span>indices</span><span>()</span>
-<span>tensor([[0, 1, 1],</span>
-<span>       [2, 0, 2]])</span>
+  s.sparse_dim(), s.dense_dim()
+(2, 1)
 ```
 
-When working with uncoalesced sparse COO tensors, one must take into an account the additive nature of uncoalesced data: the values of the same indices are the terms of a sum that evaluation gives the value of the corresponding tensor element. For example, the scalar multiplication on a sparse uncoalesced tensor could be implemented by multiplying all the uncoalesced values with the scalar because `c * (a + b) == c * a + c * b` holds. However, any nonlinear operation, say, a square root, cannot be implemented by applying the operation to uncoalesced data because `sqrt(a + b) == sqrt(a) + sqrt(b)` does not hold in general.
+如果 `s` 是稀疏 COO 张量，则可以使用方法 [`torch.Tensor.indices()`](https://docs.pytorch.org/docs/stable/generated/torch.Tensor.indices.html#torch.Tensor.indices "torch.Tensor.indices") 和 [`torch.Tensor.values()`](https://docs.pytorch.org/docs/stable/generated/torch.Tensor.values.html#torch.Tensor.values "torch.Tensor.values") 获取其 COO 格式数据。
 
-Slicing (with positive step) of a sparse COO tensor is supported only for dense dimensions. Indexing is supported for both sparse and dense dimensions:
+注意
 
-```
-<span></span><span>&gt;&gt;&gt; </span><span>s</span><span>[</span><span>1</span><span>]</span>
-<span>tensor(indices=tensor([[0, 2]]),</span>
-<span>       values=tensor([[5, 6],</span>
-<span>                      [7, 8]]),</span>
-<span>       size=(3, 2), nnz=2, layout=torch.sparse_coo)</span>
-<span>&gt;&gt;&gt; </span><span>s</span><span>[</span><span>1</span><span>,</span> <span>0</span><span>,</span> <span>1</span><span>]</span>
-<span>tensor(6)</span>
-<span>&gt;&gt;&gt; </span><span>s</span><span>[</span><span>1</span><span>,</span> <span>0</span><span>,</span> <span>1</span><span>:]</span>
-<span>tensor([6])</span>
-```
-
-In PyTorch, the fill value of a sparse tensor cannot be specified explicitly and is assumed to be zero in general. However, there exists operations that may interpret the fill value differently. For instance, [`torch.sparse.softmax()`](https://docs.pytorch.org/docs/stable/generated/torch.sparse.softmax.html#torch.sparse.softmax "torch.sparse.softmax") computes the softmax with the assumption that the fill value is negative infinity.
-
-## Sparse Compressed Tensors
-
-Sparse Compressed Tensors represents a class of sparse tensors that have a common feature of compressing the indices of a certain dimension using an encoding that enables certain optimizations on linear algebra kernels of sparse compressed tensors. This encoding is based on the [Compressed Sparse Row (CSR)](https://en.wikipedia.org/wiki/Sparse_matrix#Compressed_sparse_row_(CSR,_CRS_or_Yale_format)) format that PyTorch sparse compressed tensors extend with the support of sparse tensor batches, allowing multi-dimensional tensor values, and storing sparse tensor values in dense blocks.
-
-Note
-
-We use (B + M + K)-dimensional tensor to denote a N-dimensional sparse compressed hybrid tensor, where B, M, and K are the numbers of batch, sparse, and dense dimensions, respectively, such that `B + M + K == N` holds. The number of sparse dimensions for sparse compressed tensors is always two, `M == 2`.
-
-Note
-
-We say that an indices tensor `compressed_indices` uses CSR encoding if the following invariants are satisfied:
-
--   `compressed_indices` is a contiguous strided 32 or 64 bit integer tensor
-    
--   `compressed_indices` shape is `(*batchsize, compressed_dim_size + 1)` where `compressed_dim_size` is the number of compressed dimensions (e.g. rows or columns)
-    
--   `compressed_indices[..., 0] == 0` where `...` denotes batch indices
-    
--   `compressed_indices[..., compressed_dim_size] == nse` where `nse` is the number of specified elements
-    
--   `0 <= compressed_indices[..., i] - compressed_indices[..., i - 1] <= plain_dim_size` for `i=1, ..., compressed_dim_size`, where `plain_dim_size` is the number of plain dimensions (orthogonal to compressed dimensions, e.g. columns or rows).
-    
-
-To be sure that a constructed sparse tensor has consistent indices, values, and size, the invariant checks can be enabled per tensor creation via `check_invariants=True` keyword argument, or globally using [`torch.sparse.check_sparse_tensor_invariants`](https://docs.pytorch.org/docs/stable/generated/torch.sparse.check_sparse_tensor_invariants.html#torch.sparse.check_sparse_tensor_invariants "torch.sparse.check_sparse_tensor_invariants") context manager instance. By default, the sparse tensor invariants checks are disabled.
-
-Note
-
-The generalization of sparse compressed layouts to N-dimensional tensors can lead to some confusion regarding the count of specified elements. When a sparse compressed tensor contains batch dimensions the number of specified elements will correspond to the number of such elements per-batch. When a sparse compressed tensor has dense dimensions the element considered is now the K-dimensional array. Also for block sparse compressed layouts the 2-D block is considered as the element being specified. Take as an example a 3-dimensional block sparse tensor, with one batch dimension of length `b`, and a block shape of `p, q`. If this tensor has `n` specified elements, then in fact we have `n` blocks specified per batch. This tensor would have `values` with shape `(b, n, p, q)`. This interpretation of the number of specified elements comes from all sparse compressed layouts being derived from the compression of a 2-dimensional matrix. Batch dimensions are treated as stacking of sparse matrices, dense dimensions change the meaning of the element from a simple scalar value to an array with its own dimensions.
-
-### Sparse CSR Tensor
-
-The primary advantage of the CSR format over the COO format is better use of storage and much faster computation operations such as sparse matrix-vector multiplication using MKL and MAGMA backends.
-
-In the simplest case, a (0 + 2 + 0)-dimensional sparse CSR tensor consists of three 1-D tensors: `crow_indices`, `col_indices` and `values`:
-
-> -   The `crow_indices` tensor consists of compressed row indices. This is a 1-D tensor of size `nrows + 1` (the number of rows plus 1). The last element of `crow_indices` is the number of specified elements, `nse`. This tensor encodes the index in `values` and `col_indices` depending on where the given row starts. Each successive number in the tensor subtracted by the number before it denotes the number of elements in a given row.
->     
-> -   The `col_indices` tensor contains the column indices of each element. This is a 1-D tensor of size `nse`.
->     
-> -   The `values` tensor contains the values of the CSR tensor elements. This is a 1-D tensor of size `nse`.
->     
-
-Note
-
-The index tensors `crow_indices` and `col_indices` should have element type either `torch.int64` (default) or `torch.int32`. If you want to use MKL-enabled matrix operations, use `torch.int32`. This is as a result of the default linking of pytorch being with MKL LP64, which uses 32 bit integer indexing.
-
-In the general case, the (B + 2 + K)-dimensional sparse CSR tensor consists of two (B + 1)-dimensional index tensors `crow_indices` and `col_indices`, and of (1 + K)-dimensional `values` tensor such that
-
-> -   `crow_indices.shape == (*batchsize, nrows + 1)`
->     
-> -   `col_indices.shape == (*batchsize, nse)`
->     
-> -   `values.shape == (nse, *densesize)`
->     
-
-while the shape of the sparse CSR tensor is `(*batchsize, nrows, ncols, *densesize)` where `len(batchsize) == B` and `len(densesize) == K`.
-
-Note
-
-The batches of sparse CSR tensors are dependent: the number of specified elements in all batches must be the same. This somewhat artificial constraint allows efficient storage of the indices of different CSR batches.
-
-Note
-
-The number of sparse and dense dimensions can be acquired using [`torch.Tensor.sparse_dim()`](https://docs.pytorch.org/docs/stable/generated/torch.Tensor.sparse_dim.html#torch.Tensor.sparse_dim "torch.Tensor.sparse_dim") and [`torch.Tensor.dense_dim()`](https://docs.pytorch.org/docs/stable/generated/torch.Tensor.dense_dim.html#torch.Tensor.dense_dim "torch.Tensor.dense_dim") methods. The batch dimensions can be computed from the tensor shape: `batchsize = tensor.shape[:-tensor.sparse_dim() - tensor.dense_dim()]`.
-
-Note
-
-The memory consumption of a sparse CSR tensor is at least `(nrows * 8 + (8 + <size of element type in bytes> * prod(densesize)) * nse) * prod(batchsize)` bytes (plus a constant overhead from storing other tensor data).
-
-With the same example data of [the note in sparse COO format introduction](https://docs.pytorch.org/docs/stable/sparse.html#sparse-coo-docs), the memory consumption of a 10 000 x 10 000 tensor with 100 000 non-zero 32-bit floating point numbers is at least `(10000 * 8 + (8 + 4 * 1) * 100 000) * 1 = 1 280 000` bytes when using CSR tensor layout. Notice the 1.6 and 310 fold savings from using CSR storage format compared to using the COO and strided formats, respectively.
-
-#### Construction of CSR tensors
-
-Sparse CSR tensors can be directly constructed by using the [`torch.sparse_csr_tensor()`](https://docs.pytorch.org/docs/stable/generated/torch.sparse_csr_tensor.html#torch.sparse_csr_tensor "torch.sparse_csr_tensor") function. The user must supply the row and column indices and values tensors separately where the row indices must be specified using the CSR compression encoding. The `size` argument is optional and will be deduced from the `crow_indices` and `col_indices` if it is not present.
+当前，只有当张量实例已合并时，才能获取 COO 格式数据：
 
 ```
-<span></span><span>&gt;&gt;&gt; </span><span>crow_indices</span> <span>=</span> <span>torch</span><span>.</span><span>tensor</span><span>([</span><span>0</span><span>,</span> <span>2</span><span>,</span> <span>4</span><span>])</span>
-<span>&gt;&gt;&gt; </span><span>col_indices</span> <span>=</span> <span>torch</span><span>.</span><span>tensor</span><span>([</span><span>0</span><span>,</span> <span>1</span><span>,</span> <span>0</span><span>,</span> <span>1</span><span>])</span>
-<span>&gt;&gt;&gt; </span><span>values</span> <span>=</span> <span>torch</span><span>.</span><span>tensor</span><span>([</span><span>1</span><span>,</span> <span>2</span><span>,</span> <span>3</span><span>,</span> <span>4</span><span>])</span>
-<span>&gt;&gt;&gt; </span><span>csr</span> <span>=</span> <span>torch</span><span>.</span><span>sparse_csr_tensor</span><span>(</span><span>crow_indices</span><span>,</span> <span>col_indices</span><span>,</span> <span>values</span><span>,</span> <span>dtype</span><span>=</span><span>torch</span><span>.</span><span>float64</span><span>)</span>
-<span>&gt;&gt;&gt; </span><span>csr</span>
-<span>tensor(crow_indices=tensor([0, 2, 4]),</span>
-<span>       col_indices=tensor([0, 1, 0, 1]),</span>
-<span>       values=tensor([1., 2., 3., 4.]), size=(2, 2), nnz=4,</span>
-<span>       dtype=torch.float64)</span>
-<span>&gt;&gt;&gt; </span><span>csr</span><span>.</span><span>to_dense</span><span>()</span>
-<span>tensor([[1., 2.],</span>
-<span>        [3., 4.]], dtype=torch.float64)</span>
+  s.indices()
+RuntimeError: Cannot get indices on an uncoalesced tensor, please call .coalesce() first
 ```
 
-Note
-
-The values of sparse dimensions in deduced `size` is computed from the size of `crow_indices` and the maximal index value in `col_indices`. If the number of columns needs to be larger than in the deduced `size` then the `size` argument must be specified explicitly.
-
-The simplest way of constructing a 2-D sparse CSR tensor from a strided or sparse COO tensor is to use [`torch.Tensor.to_sparse_csr()`](https://docs.pytorch.org/docs/stable/generated/torch.Tensor.to_sparse_csr.html#torch.Tensor.to_sparse_csr "torch.Tensor.to_sparse_csr") method. Any zeros in the (strided) tensor will be interpreted as missing values in the sparse tensor:
+要获取未合并张量的 COO 格式数据，请使用 `torch.Tensor._values()` 和 `torch.Tensor._indices()`：
 
 ```
-<span></span><span>&gt;&gt;&gt; </span><span>a</span> <span>=</span> <span>torch</span><span>.</span><span>tensor</span><span>([[</span><span>0</span><span>,</span> <span>0</span><span>,</span> <span>1</span><span>,</span> <span>0</span><span>],</span> <span>[</span><span>1</span><span>,</span> <span>2</span><span>,</span> <span>0</span><span>,</span> <span>0</span><span>],</span> <span>[</span><span>0</span><span>,</span> <span>0</span><span>,</span> <span>0</span><span>,</span> <span>0</span><span>]],</span> <span>dtype</span><span>=</span><span>torch</span><span>.</span><span>float64</span><span>)</span>
-<span>&gt;&gt;&gt; </span><span>sp</span> <span>=</span> <span>a</span><span>.</span><span>to_sparse_csr</span><span>()</span>
-<span>&gt;&gt;&gt; </span><span>sp</span>
-<span>tensor(crow_indices=tensor([0, 1, 3, 3]),</span>
-<span>      col_indices=tensor([2, 0, 1]),</span>
-<span>      values=tensor([1., 1., 2.]), size=(3, 4), nnz=3, dtype=torch.float64)</span>
+  s._indices()
+tensor([[0, 1, 1],
+        [2, 0, 2]])
 ```
 
-#### CSR Tensor Operations
+警告
 
-The sparse matrix-vector multiplication can be performed with the `tensor.matmul()` method. This is currently the only math operation supported on CSR tensors.
+调用 `torch.Tensor._values()` 将返回一个*已分离*的张量。要跟踪梯度，必须改用 `torch.Tensor.coalesce().values()`。
 
-```
-<span></span><span>&gt;&gt;&gt; </span><span>vec</span> <span>=</span> <span>torch</span><span>.</span><span>randn</span><span>(</span><span>4</span><span>,</span> <span>1</span><span>,</span> <span>dtype</span><span>=</span><span>torch</span><span>.</span><span>float64</span><span>)</span>
-<span>&gt;&gt;&gt; </span><span>sp</span><span>.</span><span>matmul</span><span>(</span><span>vec</span><span>)</span>
-<span>tensor([[0.9078],</span>
-<span>        [1.3180],</span>
-<span>        [0.0000]], dtype=torch.float64)</span>
-```
-
-### Sparse CSC Tensor
-
-The sparse CSC (Compressed Sparse Column) tensor format implements the CSC format for storage of 2 dimensional tensors with an extension to supporting batches of sparse CSC tensors and values being multi-dimensional tensors.
-
-Note
-
-Sparse CSC tensor is essentially a transpose of the sparse CSR tensor when the transposition is about swapping the sparse dimensions.
-
-Similarly to [sparse CSR tensors](https://docs.pytorch.org/docs/stable/sparse.html#sparse-csr-docs), a sparse CSC tensor consists of three tensors: `ccol_indices`, `row_indices` and `values`:
-
-> -   The `ccol_indices` tensor consists of compressed column indices. This is a (B + 1)-D tensor of shape `(*batchsize, ncols + 1)`. The last element is the number of specified elements, `nse`. This tensor encodes the index in `values` and `row_indices` depending on where the given column starts. Each successive number in the tensor subtracted by the number before it denotes the number of elements in a given column.
->     
-> -   The `row_indices` tensor contains the row indices of each element. This is a (B + 1)-D tensor of shape `(*batchsize, nse)`.
->     
-> -   The `values` tensor contains the values of the CSC tensor elements. This is a (1 + K)-D tensor of shape `(nse, *densesize)`.
->     
-
-#### Construction of CSC tensors
-
-Sparse CSC tensors can be directly constructed by using the [`torch.sparse_csc_tensor()`](https://docs.pytorch.org/docs/stable/generated/torch.sparse_csc_tensor.html#torch.sparse_csc_tensor "torch.sparse_csc_tensor") function. The user must supply the row and column indices and values tensors separately where the column indices must be specified using the CSR compression encoding. The `size` argument is optional and will be deduced from the `row_indices` and `ccol_indices` tensors if it is not present.
+构造一个新的稀疏 COO 张量会得到一个未合并的张量：
 
 ```
-<span></span><span>&gt;&gt;&gt; </span><span>ccol_indices</span> <span>=</span> <span>torch</span><span>.</span><span>tensor</span><span>([</span><span>0</span><span>,</span> <span>2</span><span>,</span> <span>4</span><span>])</span>
-<span>&gt;&gt;&gt; </span><span>row_indices</span> <span>=</span> <span>torch</span><span>.</span><span>tensor</span><span>([</span><span>0</span><span>,</span> <span>1</span><span>,</span> <span>0</span><span>,</span> <span>1</span><span>])</span>
-<span>&gt;&gt;&gt; </span><span>values</span> <span>=</span> <span>torch</span><span>.</span><span>tensor</span><span>([</span><span>1</span><span>,</span> <span>2</span><span>,</span> <span>3</span><span>,</span> <span>4</span><span>])</span>
-<span>&gt;&gt;&gt; </span><span>csc</span> <span>=</span> <span>torch</span><span>.</span><span>sparse_csc_tensor</span><span>(</span><span>ccol_indices</span><span>,</span> <span>row_indices</span><span>,</span> <span>values</span><span>,</span> <span>dtype</span><span>=</span><span>torch</span><span>.</span><span>float64</span><span>)</span>
-<span>&gt;&gt;&gt; </span><span>csc</span>
-<span>tensor(ccol_indices=tensor([0, 2, 4]),</span>
-<span>       row_indices=tensor([0, 1, 0, 1]),</span>
-<span>       values=tensor([1., 2., 3., 4.]), size=(2, 2), nnz=4,</span>
-<span>       dtype=torch.float64, layout=torch.sparse_csc)</span>
-<span>&gt;&gt;&gt; </span><span>csc</span><span>.</span><span>to_dense</span><span>()</span>
-<span>tensor([[1., 3.],</span>
-<span>        [2., 4.]], dtype=torch.float64)</span>
+  s.is_coalesced()
+False
 ```
 
-Note
-
-The sparse CSC tensor constructor function has the compressed column indices argument before the row indices argument.
-
-The (0 + 2 + 0)-dimensional sparse CSC tensors can be constructed from any two-dimensional tensor using [`torch.Tensor.to_sparse_csc()`](https://docs.pytorch.org/docs/stable/generated/torch.Tensor.to_sparse_csc.html#torch.Tensor.to_sparse_csc "torch.Tensor.to_sparse_csc") method. Any zeros in the (strided) tensor will be interpreted as missing values in the sparse tensor:
+但是，可以使用 [`torch.Tensor.coalesce()`](https://docs.pytorch.org/docs/stable/generated/torch.Tensor.coalesce.html#torch.Tensor.coalesce "torch.Tensor.coalesce") 方法构造稀疏 COO 张量的合并副本：
 
 ```
-<span></span><span>&gt;&gt;&gt; </span><span>a</span> <span>=</span> <span>torch</span><span>.</span><span>tensor</span><span>([[</span><span>0</span><span>,</span> <span>0</span><span>,</span> <span>1</span><span>,</span> <span>0</span><span>],</span> <span>[</span><span>1</span><span>,</span> <span>2</span><span>,</span> <span>0</span><span>,</span> <span>0</span><span>],</span> <span>[</span><span>0</span><span>,</span> <span>0</span><span>,</span> <span>0</span><span>,</span> <span>0</span><span>]],</span> <span>dtype</span><span>=</span><span>torch</span><span>.</span><span>float64</span><span>)</span>
-<span>&gt;&gt;&gt; </span><span>sp</span> <span>=</span> <span>a</span><span>.</span><span>to_sparse_csc</span><span>()</span>
-<span>&gt;&gt;&gt; </span><span>sp</span>
-<span>tensor(ccol_indices=tensor([0, 1, 2, 3, 3]),</span>
-<span>       row_indices=tensor([1, 1, 0]),</span>
-<span>       values=tensor([1., 2., 1.]), size=(3, 4), nnz=3, dtype=torch.float64,</span>
-<span>       layout=torch.sparse_csc)</span>
+  s2 = s.coalesce()
+  s2.indices()
+tensor([[0, 1, 1],
+       [2, 0, 2]])
 ```
 
-### Sparse BSR Tensor
+在使用未合并稀疏 COO 张量时，必须考虑到未合并数据的加法性质：相同索引的值是求和的项，求和结果即为相应张量元素的值。例如，稀疏未合并张量上的标量乘法可以通过将所有未合并值乘以标量来实现，因为 `c * (a + b) == c * a + c * b` 成立。但是，任何非线性运算，例如平方根，都不能通过对未合并数据应用运算来实现，因为 `sqrt(a + b) == sqrt(a) + sqrt(b)` 通常不成立。
 
-The sparse BSR (Block compressed Sparse Row) tensor format implements the BSR format for storage of two-dimensional tensors with an extension to supporting batches of sparse BSR tensors and values being blocks of multi-dimensional tensors.
-
-A sparse BSR tensor consists of three tensors: `crow_indices`, `col_indices` and `values`:
-
-> -   The `crow_indices` tensor consists of compressed row indices. This is a (B + 1)-D tensor of shape `(*batchsize, nrowblocks + 1)`. The last element is the number of specified blocks, `nse`. This tensor encodes the index in `values` and `col_indices` depending on where the given column block starts. Each successive number in the tensor subtracted by the number before it denotes the number of blocks in a given row.
->     
-> -   The `col_indices` tensor contains the column block indices of each element. This is a (B + 1)-D tensor of shape `(*batchsize, nse)`.
->     
-> -   The `values` tensor contains the values of the sparse BSR tensor elements collected into two-dimensional blocks. This is a (1 + 2 + K)-D tensor of shape `(nse, nrowblocks, ncolblocks, *densesize)`.
->     
-
-#### Construction of BSR tensors
-
-Sparse BSR tensors can be directly constructed by using the [`torch.sparse_bsr_tensor()`](https://docs.pytorch.org/docs/stable/generated/torch.sparse_bsr_tensor.html#torch.sparse_bsr_tensor "torch.sparse_bsr_tensor") function. The user must supply the row and column block indices and values tensors separately where the row block indices must be specified using the CSR compression encoding. The `size` argument is optional and will be deduced from the `crow_indices` and `col_indices` tensors if it is not present.
+稀疏 COO 张量的切片（步长为正）仅支持密集维度。索引同时支持稀疏和密集维度：
 
 ```
-<span></span><span>&gt;&gt;&gt; </span><span>crow_indices</span> <span>=</span> <span>torch</span><span>.</span><span>tensor</span><span>([</span><span>0</span><span>,</span> <span>2</span><span>,</span> <span>4</span><span>])</span>
-<span>&gt;&gt;&gt; </span><span>col_indices</span> <span>=</span> <span>torch</span><span>.</span><span>tensor</span><span>([</span><span>0</span><span>,</span> <span>1</span><span>,</span> <span>0</span><span>,</span> <span>1</span><span>])</span>
-<span>&gt;&gt;&gt; </span><span>values</span> <span>=</span> <span>torch</span><span>.</span><span>tensor</span><span>([[[</span><span>0</span><span>,</span> <span>1</span><span>,</span> <span>2</span><span>],</span> <span>[</span><span>6</span><span>,</span> <span>7</span><span>,</span> <span>8</span><span>]],</span>
-<span>... </span>                       <span>[[</span><span>3</span><span>,</span> <span>4</span><span>,</span> <span>5</span><span>],</span> <span>[</span><span>9</span><span>,</span> <span>10</span><span>,</span> <span>11</span><span>]],</span>
-<span>... </span>                       <span>[[</span><span>12</span><span>,</span> <span>13</span><span>,</span> <span>14</span><span>],</span> <span>[</span><span>18</span><span>,</span> <span>19</span><span>,</span> <span>20</span><span>]],</span>
-<span>... </span>                       <span>[[</span><span>15</span><span>,</span> <span>16</span><span>,</span> <span>17</span><span>],</span> <span>[</span><span>21</span><span>,</span> <span>22</span><span>,</span> <span>23</span><span>]]])</span>
-<span>&gt;&gt;&gt; </span><span>bsr</span> <span>=</span> <span>torch</span><span>.</span><span>sparse_bsr_tensor</span><span>(</span><span>crow_indices</span><span>,</span> <span>col_indices</span><span>,</span> <span>values</span><span>,</span> <span>dtype</span><span>=</span><span>torch</span><span>.</span><span>float64</span><span>)</span>
-<span>&gt;&gt;&gt; </span><span>bsr</span>
-<span>tensor(crow_indices=tensor([0, 2, 4]),</span>
-<span>       col_indices=tensor([0, 1, 0, 1]),</span>
-<span>       values=tensor([[[ 0.,  1.,  2.],</span>
-<span>                       [ 6.,  7.,  8.]],</span>
-<span>                      [[ 3.,  4.,  5.],</span>
-<span>                       [ 9., 10., 11.]],</span>
-<span>                      [[12., 13., 14.],</span>
-<span>                       [18., 19., 20.]],</span>
-<span>                      [[15., 16., 17.],</span>
-<span>                       [21., 22., 23.]]]),</span>
-<span>       size=(4, 6), nnz=4, dtype=torch.float64, layout=torch.sparse_bsr)</span>
-<span>&gt;&gt;&gt; </span><span>bsr</span><span>.</span><span>to_dense</span><span>()</span>
-<span>tensor([[ 0.,  1.,  2.,  3.,  4.,  5.],</span>
-<span>        [ 6.,  7.,  8.,  9., 10., 11.],</span>
-<span>        [12., 13., 14., 15., 16., 17.],</span>
-<span>        [18., 19., 20., 21., 22., 23.]], dtype=torch.float64)</span>
+  s[1]
+tensor(indices=tensor([[0, 2]]),
+       values=tensor([[5, 6],
+                      [7, 8]]),
+       size=(3, 2), nnz=2, layout=torch.sparse_coo)
+  s[1, 0, 1]
+tensor(6)
+  s[1, 0, 1:]
+tensor([6])
 ```
 
-The (0 + 2 + 0)-dimensional sparse BSR tensors can be constructed from any two-dimensional tensor using [`torch.Tensor.to_sparse_bsr()`](https://docs.pytorch.org/docs/stable/generated/torch.Tensor.to_sparse_bsr.html#torch.Tensor.to_sparse_bsr "torch.Tensor.to_sparse_bsr") method that also requires the specification of the values block size:
+在 PyTorch 中，稀疏张量的填充值不能显式指定，通常假定为零。但是，存在一些运算可能以不同的方式解释填充值。例如，[`torch.sparse.softmax()`](https://docs.pytorch.org/docs/stable/generated/torch.sparse.softmax.html#torch.sparse.softmax "torch.sparse.softmax") 在填充值为负无穷大的假设下计算 softmax。
+
+## 稀疏压缩张量
+
+稀疏压缩张量是一类稀疏张量，它们具有一个共同的特征，即使用一种编码来压缩某个维度的索引，这种编码能够对稀疏压缩张量的线性代数内核进行某些优化。这种编码基于 [行压缩存储（CSR）](<https://en.wikipedia.org/wiki/Sparse_matrix#Compressed_sparse_row_(CSR,_CRS_or_Yale_format)>) 格式，PyTorch 稀疏压缩张量通过支持稀疏张量批次、允许多维张量值以及以密集块形式存储稀疏张量值来对其进行扩展。
+
+注意
+
+我们使用 (B + M + K) 维张量来表示 N 维稀疏压缩混合张量，其中 B、M 和 K 分别是批处理、稀疏和密集维度的数量，使得 B + M + K == N。稀疏压缩张量的稀疏维度数量始终为两个，M == 2。
+
+注意
+
+我们说索引张量 `compressed_indices` 使用 CSR 编码，如果满足以下不变量：
+
+- `compressed_indices` 是一个连续的跨步 32 位或 64 位整数张量。
+
+- `compressed_indices` 的形状为 `(*batchsize, compressed_dim_size + 1)`，其中 `compressed_dim_size` 是压缩维度（例如行或列）的数量。
+
+- `compressed_indices[..., 0] == 0`，其中 `...` 表示批处理索引。
+
+- `compressed_indices[..., compressed_dim_size] == nse`，其中 `nse` 是指定元素的数量。
+
+- 对于 `i=1, ..., compressed_dim_size`，`0 <= compressed_indices[..., i] - compressed_indices[..., i - 1] <= plain_dim_size`，其中 `plain_dim_size` 是普通维度（与压缩维度正交，例如列或行）的数量。
+
+为了确保构造的稀疏张量具有一致的索引、值和大小，可以通过 `check_invariants=True` 关键字参数按张量创建启用不变性检查，或者使用 [`torch.sparse.check_sparse_tensor_invariants`](https://docs.pytorch.org/docs/stable/generated/torch.sparse.check_sparse_tensor_invariants.html#torch.sparse.check_sparse_tensor_invariants "torch.sparse.check_sparse_tensor_invariants") 上下文管理器实例全局启用。默认情况下，稀疏张量不变性检查是禁用的。
+
+注意
+
+将稀疏压缩布局泛化到 N 维张量可能会导致对指定元素数量的一些混淆。当稀疏压缩张量包含批处理维度时，指定元素的数量将对应于每个批处理的此类元素的数量。当稀疏压缩张量具有密集维度时，所考虑的元素现在是具有自身维度的 K 维数组。对于块稀疏压缩布局，2D 块被视为指定的元素。以一个三维块稀疏张量为例，它有一个长度为 `b` 的批处理维度，以及一个 `p, q` 的块形状。如果此张量有 `n` 个指定元素，则实际上我们每个批处理有 `n` 个指定块。此指定元素数量的解释源于所有稀疏压缩布局都源自二维矩阵的压缩。批处理维度被视为稀疏矩阵的堆叠，密集维度将元素的意思从简单的标量值更改为具有自身维度的数组。
+
+### 稀疏 CSR 张量
+
+CSR 格式相对于 COO 格式的主要优点是更好地利用存储空间，并且使用 MKL 和 MAGMA 后端进行稀疏矩阵向量乘法等计算操作速度更快。
+
+在最简单的情况下，(0 + 2 + 0) 维稀疏 CSR 张量由三个一维张量组成：`crow_indices`、`col_indices` 和 `values`：
+
+> - `crow_indices` 张量由压缩的行索引组成。这是一个大小为 `nrows + 1`（行数加 1）的一维张量。`crow_indices` 的最后一个元素是指定元素的数量，即 `nse`。此张量根据给定行开始的位置编码 `values` 和 `col_indices` 中的索引。张量中的每个连续数字减去其前面的数字表示给定行中的元素数量。
+>
+> - `col_indices` 张量包含每个元素的列索引。这是一个大小为 `nse` 的一维张量。
+>
+> - `values` 张量包含 CSR 张量元素的*值*。这是一个大小为 `nse` 的一维张量。
+
+注意
+
+索引张量 `crow_indices` 和 `col_indices` 的元素类型应为 `torch.int64`（默认）或 `torch.int32`。如果要使用启用 MKL 的矩阵运算，请使用 `torch.int32`。这是因为 PyTorch 的默认链接是 MKL LP64，它使用 32 位整数索引。
+
+在一般情况下，(B + 2 + K) 维稀疏 CSR 张量由两个 (B + 1) 维索引张量 `crow_indices` 和 `col_indices`，以及 (1 + K) 维 `values` 张量组成，使得
+
+> - `crow_indices.shape == (*batchsize, nrows + 1)`
+>
+> - `col_indices.shape == (*batchsize, nse)`
+>
+> - `values.shape == (nse, *densesize)`
+
+而稀疏 CSR 张量的形状为 `(*batchsize, nrows, ncols, *densesize)`，其中 `len(batchsize) == B` 且 `len(densesize) == K`。
+
+注意
+
+稀疏 CSR 张量的批次是依赖的：所有批次中的指定元素数量必须相同。这个有些人为的约束允许高效存储不同 CSR 批次的索引。
+
+注意
+
+稀疏和密集维度的数量可以使用 [`torch.Tensor.sparse_dim()`](https://docs.pytorch.org/docs/stable/generated/torch.Tensor.sparse_dim.html#torch.Tensor.sparse_dim "torch.Tensor.sparse_dim") 和 [`torch.Tensor.dense_dim()`](https://docs.pytorch.org/docs/stable/generated/torch.Tensor.dense_dim.html#torch.Tensor.dense_dim "torch.Tensor.dense_dim") 方法获取。批处理维度可以从张量形状计算得出：`batchsize = tensor.shape[:-tensor.sparse_dim() - tensor.dense_dim()]`。
+
+注意
+
+稀疏 CSR 张量的内存消耗至少为 `(nrows * 8 + (8 + <元素类型的字节大小> * prod(densesize)) * nse) * prod(batchsize)` 字节（加上存储其他张量数据的常量开销）。
+
+使用[稀疏 COO 格式介绍中的注释](https://docs.pytorch.org/docs/stable/sparse.html#sparse-coo-docs)中的相同示例数据，使用 CSR 张量布局时，一个具有 100,000 个非零 32 位浮点数的 10,000 x 10,000 张量的内存消耗至少为 `(10000 * 8 + (8 + 4 * 1) * 100 000) * 1 = 1,280,000` 字节。与使用 COO 和跨步格式相比，使用 CSR 存储格式分别节省了 1.6 倍和 310 倍的内存。
+
+#### CSR 张量构造
+
+可以使用 [`torch.sparse_csr_tensor()`](https://docs.pytorch.org/docs/stable/generated/torch.sparse_csr_tensor.html#torch.sparse_csr_tensor "torch.sparse_csr_tensor") 函数直接构造稀疏 CSR 张量。用户必须分别提供行和列索引以及值张量，其中行索引必须使用 CSR 压缩编码指定。`size` 参数是可选的，如果不存在，则将从 `crow_indices` 和 `col_indices` 中推断出来。
 
 ```
-<span></span><span>&gt;&gt;&gt; </span><span>dense</span> <span>=</span> <span>torch</span><span>.</span><span>tensor</span><span>([[</span><span>0</span><span>,</span> <span>1</span><span>,</span> <span>2</span><span>,</span> <span>3</span><span>,</span> <span>4</span><span>,</span> <span>5</span><span>],</span>
-<span>... </span>                      <span>[</span><span>6</span><span>,</span> <span>7</span><span>,</span> <span>8</span><span>,</span> <span>9</span><span>,</span> <span>10</span><span>,</span> <span>11</span><span>],</span>
-<span>... </span>                      <span>[</span><span>12</span><span>,</span> <span>13</span><span>,</span> <span>14</span><span>,</span> <span>15</span><span>,</span> <span>16</span><span>,</span> <span>17</span><span>],</span>
-<span>... </span>                      <span>[</span><span>18</span><span>,</span> <span>19</span><span>,</span> <span>20</span><span>,</span> <span>21</span><span>,</span> <span>22</span><span>,</span> <span>23</span><span>]])</span>
-<span>&gt;&gt;&gt; </span><span>bsr</span> <span>=</span> <span>dense</span><span>.</span><span>to_sparse_bsr</span><span>(</span><span>blocksize</span><span>=</span><span>(</span><span>2</span><span>,</span> <span>3</span><span>))</span>
-<span>&gt;&gt;&gt; </span><span>bsr</span>
-<span>tensor(crow_indices=tensor([0, 2, 4]),</span>
-<span>       col_indices=tensor([0, 1, 0, 1]),</span>
-<span>       values=tensor([[[ 0,  1,  2],</span>
-<span>                       [ 6,  7,  8]],</span>
-<span>                      [[ 3,  4,  5],</span>
-<span>                       [ 9, 10, 11]],</span>
-<span>                      [[12, 13, 14],</span>
-<span>                       [18, 19, 20]],</span>
-<span>                      [[15, 16, 17],</span>
-<span>                       [21, 22, 23]]]), size=(4, 6), nnz=4,</span>
-<span>       layout=torch.sparse_bsr)</span>
+  crow_indices = torch.tensor([0, 2, 4])
+  col_indices = torch.tensor([0, 1, 0, 1])
+  values = torch.tensor([1, 2, 3, 4])
+  csr = torch.sparse_csr_tensor(crow_indices, col_indices, values, dtype=torch.float64)
+  csr
+tensor(crow_indices=tensor([0, 2, 4]),
+       col_indices=tensor([0, 1, 0, 1]),
+       values=tensor([1., 2., 3., 4.]), size=(2, 2), nnz=4,
+       dtype=torch.float64)
+  csr.to_dense()
+tensor([[1., 2.],
+        [3., 4.]], dtype=torch.float64)
 ```
 
-### Sparse BSC Tensor
+注意
 
-The sparse BSC (Block compressed Sparse Column) tensor format implements the BSC format for storage of two-dimensional tensors with an extension to supporting batches of sparse BSC tensors and values being blocks of multi-dimensional tensors.
+从推断出的 `size` 中计算稀疏维度的值，该值由 `crow_indices` 的大小和 `col_indices` 中的最大索引值计算得出。如果列数需要大于推断出的 `size`，则必须显式指定 `size` 参数。
 
-A sparse BSC tensor consists of three tensors: `ccol_indices`, `row_indices` and `values`:
-
-> -   The `ccol_indices` tensor consists of compressed column indices. This is a (B + 1)-D tensor of shape `(*batchsize, ncolblocks + 1)`. The last element is the number of specified blocks, `nse`. This tensor encodes the index in `values` and `row_indices` depending on where the given row block starts. Each successive number in the tensor subtracted by the number before it denotes the number of blocks in a given column.
->     
-> -   The `row_indices` tensor contains the row block indices of each element. This is a (B + 1)-D tensor of shape `(*batchsize, nse)`.
->     
-> -   The `values` tensor contains the values of the sparse BSC tensor elements collected into two-dimensional blocks. This is a (1 + 2 + K)-D tensor of shape `(nse, nrowblocks, ncolblocks, *densesize)`.
->     
-
-#### Construction of BSC tensors
-
-Sparse BSC tensors can be directly constructed by using the [`torch.sparse_bsc_tensor()`](https://docs.pytorch.org/docs/stable/generated/torch.sparse_bsc_tensor.html#torch.sparse_bsc_tensor "torch.sparse_bsc_tensor") function. The user must supply the row and column block indices and values tensors separately where the column block indices must be specified using the CSR compression encoding. The `size` argument is optional and will be deduced from the `ccol_indices` and `row_indices` tensors if it is not present.
+从跨步张量或稀疏 COO 张量构造 2D 稀疏 CSR 张量的最简单方法是使用 [`torch.Tensor.to_sparse_csr()`](https://docs.pytorch.org/docs/stable/generated/torch.Tensor.to_sparse_csr.html#torch.Tensor.to_sparse_csr "torch.Tensor.to_sparse_csr") 方法。（跨步）张量中的任何零值都将被解释为稀疏张量中的缺失值：
 
 ```
-<span></span><span>&gt;&gt;&gt; </span><span>ccol_indices</span> <span>=</span> <span>torch</span><span>.</span><span>tensor</span><span>([</span><span>0</span><span>,</span> <span>2</span><span>,</span> <span>4</span><span>])</span>
-<span>&gt;&gt;&gt; </span><span>row_indices</span> <span>=</span> <span>torch</span><span>.</span><span>tensor</span><span>([</span><span>0</span><span>,</span> <span>1</span><span>,</span> <span>0</span><span>,</span> <span>1</span><span>])</span>
-<span>&gt;&gt;&gt; </span><span>values</span> <span>=</span> <span>torch</span><span>.</span><span>tensor</span><span>([[[</span><span>0</span><span>,</span> <span>1</span><span>,</span> <span>2</span><span>],</span> <span>[</span><span>6</span><span>,</span> <span>7</span><span>,</span> <span>8</span><span>]],</span>
-<span>... </span>                       <span>[[</span><span>3</span><span>,</span> <span>4</span><span>,</span> <span>5</span><span>],</span> <span>[</span><span>9</span><span>,</span> <span>10</span><span>,</span> <span>11</span><span>]],</span>
-<span>... </span>                       <span>[[</span><span>12</span><span>,</span> <span>13</span><span>,</span> <span>14</span><span>],</span> <span>[</span><span>18</span><span>,</span> <span>19</span><span>,</span> <span>20</span><span>]],</span>
-<span>... </span>                       <span>[[</span><span>15</span><span>,</span> <span>16</span><span>,</span> <span>17</span><span>],</span> <span>[</span><span>21</span><span>,</span> <span>22</span><span>,</span> <span>23</span><span>]]])</span>
-<span>&gt;&gt;&gt; </span><span>bsc</span> <span>=</span> <span>torch</span><span>.</span><span>sparse_bsc_tensor</span><span>(</span><span>ccol_indices</span><span>,</span> <span>row_indices</span><span>,</span> <span>values</span><span>,</span> <span>dtype</span><span>=</span><span>torch</span><span>.</span><span>float64</span><span>)</span>
-<span>&gt;&gt;&gt; </span><span>bsc</span>
-<span>tensor(ccol_indices=tensor([0, 2, 4]),</span>
-<span>       row_indices=tensor([0, 1, 0, 1]),</span>
-<span>       values=tensor([[[ 0.,  1.,  2.],</span>
-<span>                       [ 6.,  7.,  8.]],</span>
-<span>                      [[ 3.,  4.,  5.],</span>
-<span>                       [ 9., 10., 11.]],</span>
-<span>                      [[12., 13., 14.],</span>
-<span>                       [18., 19., 20.]],</span>
-<span>                      [[15., 16., 17.],</span>
-<span>                       [21., 22., 23.]]]), size=(4, 6), nnz=4,</span>
-<span>       dtype=torch.float64, layout=torch.sparse_bsc)</span>
+  a = torch.tensor([[0, 0, 1, 0], [1, 2, 0, 0], [0, 0, 0, 0]], dtype=torch.float64)
+  sp = a.to_sparse_csr()
+  sp
+tensor(crow_indices=tensor([0, 1, 3, 3]),
+      col_indices=tensor([2, 0, 1]),
+      values=tensor([1., 1., 2.]), size=(3, 4), nnz=3, dtype=torch.float64)
 ```
 
-## Supported operations
+#### CSR 张量运算
 
-### Linear Algebra operations
+可以使用 `tensor.matmul()` 方法执行稀疏矩阵向量乘法。这是目前 CSR 张量上唯一支持的数学运算。
 
-The following table summarizes supported Linear Algebra operations on sparse matrices where the operands layouts may vary. Here `T[layout]` denotes a tensor with a given layout. Similarly, `M[layout]` denotes a matrix (2-D PyTorch tensor), and `V[layout]` denotes a vector (1-D PyTorch tensor). In addition, `f` denotes a scalar (float or 0-D PyTorch tensor), `*` is element-wise multiplication, and `@` is matrix multiplication.
+```
+  vec = torch.randn(4, 1, dtype=torch.float64)
+  sp.matmul(vec)
+tensor([[0.9078],
+        [1.3180],
+        [0.0000]], dtype=torch.float64)
+```
 
-where “Sparse grad?” column indicates if the PyTorch operation supports backward with respect to sparse matrix argument. All PyTorch operations, except [`torch.smm()`](https://docs.pytorch.org/docs/stable/generated/torch.smm.html#torch.smm "torch.smm"), support backward with respect to strided matrix arguments.
+### 稀疏 CSC 张量
 
-Note
+稀疏 CSC（列压缩存储）张量格式实现了 CSC 格式来存储二维张量，并扩展支持稀疏 CSC 张量批次以及多维张量值。
 
-Currently, PyTorch does not support matrix multiplication with the layout signature `M[strided] @ M[sparse_coo]`. However, applications can still compute this using the matrix relation `D @ S == (S.t() @ D.t()).t()`.
+注意
 
-### Torch functions specific to sparse Tensors
+稀疏 CSC 张量本质上是稀疏 CSR 张量的转置，当转置是交换稀疏维度时。
+
+与[稀疏 CSR 张量](https://docs.pytorch.org/docs/stable/sparse.html#sparse-csr-docs)类似，稀疏 CSC 张量由三个张量组成：`ccol_indices`、`row_indices` 和 `values`：
+
+> - `ccol_indices` 张量由压缩的列索引组成。这是一个形状为 `(*batchsize, ncols + 1)` 的 (B + 1) 维张量。最后一个元素是指定元素的数量，即 `nse`。此张量根据给定列开始的位置编码 `values` 和 `row_indices` 中的索引。张量中的每个连续数字减去其前面的数字表示给定列中的元素数量。
+>
+> - `row_indices` 张量包含每个元素的行索引。这是一个形状为 `(*batchsize, nse)` 的 (B + 1) 维张量。
+>
+> - `values` 张量包含 CSC 张量元素的*值*。这是一个形状为 `(nse, *densesize)` 的 (1 + K) 维张量。
+
+#### CSC 张量构造
+
+可以使用 [`torch.sparse_csc_tensor()`](https://docs.pytorch.org/docs/stable/generated/torch.sparse_csc_tensor.html#torch.sparse_csc_tensor "torch.sparse_csc_tensor") 函数直接构造稀疏 CSC 张量。用户必须分别提供行和列索引以及值张量，其中列索引必须使用 CSR 压缩编码指定。`size` 参数是可选的，如果不存在，则将从 `row_indices` 和 `ccol_indices` 张量中推断出来。
+
+```
+  ccol_indices = torch.tensor([0, 2, 4])
+  row_indices = torch.tensor([0, 1, 0, 1])
+  values = torch.tensor([1, 2, 3, 4])
+  csc = torch.sparse_csc_tensor(ccol_indices, row_indices, values, dtype=torch.float64)
+  csc
+tensor(ccol_indices=tensor([0, 2, 4]),
+       row_indices=tensor([0, 1, 0, 1]),
+       values=tensor([1., 2., 3., 4.]), size=(2, 2), nnz=4,
+       dtype=torch.float64, layout=torch.sparse_csc)
+  csc.to_dense()
+tensor([[1., 3.],
+        [2., 4.]], dtype=torch.float64)
+```
+
+注意
+
+稀疏 CSC 张量构造函数在行索引参数之前有压缩列索引参数。
+
+可以使用 [`torch.Tensor.to_sparse_csc()`](https://docs.pytorch.org/docs/stable/generated/torch.Tensor.to_sparse_csc.html#torch.Tensor.to_sparse_csc "torch.Tensor.to_sparse_csc") 方法从任何二维张量构造 (0 + 2 + 0) 维稀疏 CSC 张量。二维张量中的任何零值都将被解释为稀疏张量中的缺失值：
+
+```
+  a = torch.tensor([[0, 0, 1, 0], [1, 2, 0, 0], [0, 0, 0, 0]], dtype=torch.float64)
+  sp = a.to_sparse_csc()
+  sp
+tensor(ccol_indices=tensor([0, 1, 2, 3, 3]),
+       row_indices=tensor([1, 1, 0]),
+       values=tensor([1., 2., 1.]), size=(3, 4), nnz=3, dtype=torch.float64,
+       layout=torch.sparse_csc)
+```
+
+### 稀疏 BSR 张量
+
+稀疏 BSR（块压缩行存储）张量格式实现了 BSR 格式来存储二维张量，并扩展支持稀疏 BSR 张量批次以及多维张量值块。
+
+稀疏 BSR 张量由三个张量组成：`crow_indices`、`col_indices` 和 `values`：
+
+> - `crow_indices` 张量由压缩的行索引组成。这是一个形状为 `(*batchsize, nrowblocks + 1)` 的 (B + 1) 维张量。最后一个元素是指定块的数量，即 `nse`。此张量编码 `values` 和 `col_indices` 中取决于给定列块开始位置的索引。张量中的每个连续数字减去其前面的数字表示给定行中的块数量。
+>
+> - `col_indices` 张量包含每个元素的列块索引。这是一个形状为 `(*batchsize, nse)` 的 (B + 1) 维张量。
+>
+> - `values` 张量包含收集到二维块中的稀疏 BSR 张量元素的*值*。这是一个形状为 `(nse, nrowblocks, ncolblocks, *densesize)` 的 (1 + 2 + K) 维张量。
+
+#### BSR 张量构造
+
+可以使用 [`torch.sparse_bsr_tensor()`](https://docs.pytorch.org/docs/stable/generated/torch.sparse_bsr_tensor.html#torch.sparse_bsr_tensor "torch.sparse_bsr_tensor") 函数直接构造稀疏 BSR 张量。用户必须分别提供行和列块索引以及值张量，其中行块索引必须使用 CSR 压缩编码指定。`size` 参数是可选的，如果不存在，则将从 `crow_indices` 和 `col_indices` 张量中推断出来。
+
+```
+  crow_indices = torch.tensor([0, 2, 4])
+  col_indices = torch.tensor([0, 1, 0, 1])
+  values = torch.tensor([[[0, 1, 2], [6, 7, 8]],
+...                        [[3, 4, 5], [9, 10, 11]],
+...                        [[12, 13, 14], [18, 19, 20]],
+...                        [[15, 16, 17], [21, 22, 23]]])
+  bsr = torch.sparse_bsr_tensor(crow_indices, col_indices, values, dtype=torch.float64)
+  bsr
+tensor(crow_indices=tensor([0, 2, 4]),
+       col_indices=tensor([0, 1, 0, 1]),
+       values=tensor([[[ 0.,  1.,  2.],
+                       [ 6.,  7.,  8.]],
+                      [[ 3.,  4.,  5.],
+                       [ 9., 10., 11.]],
+                      [[12., 13., 14.],
+                       [18., 19., 20.]],
+                      [[15., 16., 17.],
+                       [21., 22., 23.]]]),
+       size=(4, 6), nnz=4, dtype=torch.float64, layout=torch.sparse_bsr)
+  bsr.to_dense()
+tensor([[ 0.,  1.,  2.,  3.,  4.,  5.],
+        [ 6.,  7.,  8.,  9., 10., 11.],
+        [12., 13., 14., 15., 16., 17.],
+        [18., 19., 20., 21., 22., 23.]], dtype=torch.float64)
+```
+
+可以使用 [`torch.Tensor.to_sparse_bsr()`](https://docs.pytorch.org/docs/stable/generated/torch.Tensor.to_sparse_bsr.html#torch.Tensor.to_sparse_bsr "torch.Tensor.to_sparse_bsr") 方法从任何二维张量构造 (0 + 2 + 0) 维稀疏 BSR 张量，该方法还需要指定值块大小：
+
+```
+  dense = torch.tensor([[0, 1, 2, 3, 4, 5],
+...                       [6, 7, 8, 9, 10, 11],
+...                       [12, 13, 14, 15, 16, 17],
+...                       [18, 19, 20, 21, 22, 23]])
+  bsr = dense.to_sparse_bsr(blocksize=(2, 3))
+  bsr
+tensor(crow_indices=tensor([0, 2, 4]),
+       col_indices=tensor([0, 1, 0, 1]),
+       values=tensor([[[ 0,  1,  2],
+                       [ 6,  7,  8]],
+                      [[ 3,  4,  5],
+                       [ 9, 10, 11]],
+                      [[12, 13, 14],
+                       [18, 19, 20]],
+                      [[15, 16, 17],
+                       [21, 22, 23]]]), size=(4, 6), nnz=4,
+       layout=torch.sparse_bsr)
+```
+
+### 稀疏 BSC 张量
+
+稀疏 BSC（块压缩列存储）张量格式实现了 BSC 格式来存储二维张量，并扩展支持稀疏 BSC 张量批次以及多维张量块。
+
+稀疏 BSC 张量由三个张量组成：`ccol_indices`、`row_indices` 和 `values`：
+
+> - `ccol_indices` 张量由压缩的列索引组成。这是一个形状为 `(*batchsize, ncolblocks + 1)` 的 (B + 1) 维张量。最后一个元素是指定块的数量，即 `nse`。此张量编码 `values` 和 `row_indices` 中取决于给定行块开始位置的索引。张量中的每个连续数字减去其前面的数字表示给定列中的块数量。
+>
+> - `row_indices` 张量包含每个元素的行块索引。这是一个形状为 `(*batchsize, nse)` 的 (B + 1) 维张量。
+>
+> - `values` 张量包含收集到二维块中的稀疏 BSC 张量元素的*值*。这是一个形状为 `(nse, nrowblocks, ncolblocks, *densesize)` 的 (1 + 2 + K) 维张量。
+
+#### BSC 张量构造
+
+可以使用 [`torch.sparse_bsc_tensor()`](https://docs.pytorch.org/docs/stable/generated/torch.sparse_bsc_tensor.html#torch.sparse_bsc_tensor "torch.sparse_bsc_tensor") 函数直接构造稀疏 BSC 张量。用户必须分别提供行和列块索引以及值张量，其中列块索引必须使用 CSR 压缩编码指定。`size` 参数是可选的，如果不存在，则将从 `ccol_indices` 和 `row_indices` 张量中推断出来。
+
+```
+  ccol_indices = torch.tensor([0, 2, 4])
+  row_indices = torch.tensor([0, 1, 0, 1])
+  values = torch.tensor([[[0, 1, 2], [6, 7, 8]],
+...                        [[3, 4, 5], [9, 10, 11]],
+...                        [[12, 13, 14], [18, 19, 20]],
+...                        [[15, 16, 17], [21, 22, 23]]])
+  bsc = torch.sparse_bsc_tensor(ccol_indices, row_indices, values, dtype=torch.float64)
+  bsc
+tensor(ccol_indices=tensor([0, 2, 4]),
+       row_indices=tensor([0, 1, 0, 1]),
+       values=tensor([[[ 0.,  1.,  2.],
+                       [ 6.,  7.,  8.]],
+                      [[ 3.,  4.,  5.],
+                       [ 9., 10., 11.]],
+                      [[12., 13., 14.],
+                       [18., 19., 20.]],
+                      [[15., 16., 17.],
+                       [21., 22., 23.]]]), size=(4, 6), nnz=4,
+       dtype=torch.float64, layout=torch.sparse_bsc)
+```
+
+## 支持的运算
+
+### 线性代数运算
+
+下表总结了稀疏矩阵支持的线性代数运算，其中操作数布局可能不同。此处 `T[layout]` 表示具有给定布局的张量。类似地，`M[layout]` 表示矩阵（2D PyTorch 张量），`V[layout]` 表示向量（1D PyTorch 张量）。此外，`f` 表示标量（浮点数或 0D PyTorch 张量），`*` 表示逐元素乘法，`@` 表示矩阵乘法。
+
+其中“稀疏梯度？”列指示 PyTorch 操作是否支持相对于稀疏矩阵参数的反向传播。除 [`torch.smm()`](https://docs.pytorch.org/docs/stable/generated/torch.smm.html#torch.smm "torch.smm") 外，所有 PyTorch 操作都支持相对于跨步矩阵参数的反向传播。
+
+注意
+
+当前，PyTorch 不支持布局签名 `M[strided] @ M[sparse_coo]` 的矩阵乘法。但是，应用程序仍可以使用矩阵关系 `D @ S == (S.t() @ D.t()).t()` 来计算此值。
+
+### 仅适用于稀疏张量的 Torch 函数

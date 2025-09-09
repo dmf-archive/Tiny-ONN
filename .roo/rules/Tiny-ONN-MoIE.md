@@ -1,4 +1,4 @@
-# Tiny-ONN MoIE: SBL, MoIEFFN, DynSIHA
+# MoIE: SBL, MoIE, DynSIHA
 
 ## 1. 核心构件: SBL (Sparse Bayesian Layer)
 
@@ -29,11 +29,11 @@ SBL 范式的核心实现是一种我们称之为 **“神经元注意力” (Ne
 
 在 `MoIE_PoC.py` 的最终实现中，我们确认了，对于当前 PyTorch 生态和模型激活率（在训练前期近乎稠密）的现状，直接使用优化的稠密计算 (`computation_output * raw_weights`) 是最高效的实现方式。
 
-## 2. 复合模块: MoIEFFN & DynSIHA
+## 2. 复合模块: MoIE & DynSIHA
 
 我们使用 `SBL` 作为核心构建块，来组装更高层次的、完全动态化的 Transformer 组件。
 
-### 2.1. MoIEFFN: 全动态前馈网络
+### 2.1. MoIE: 全动态前馈网络
 
 MoIEFFN 将标准的 `FFN` (通常由两层 `nn.Linear` 构成) 替换为两层 `SBL`。
 
