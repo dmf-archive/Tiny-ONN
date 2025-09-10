@@ -41,3 +41,4 @@ weights/
 
 *.pt
 smk_poc_checkpoint/
+exp/DynSIHA_MoIE_ARC/checkpoints/
