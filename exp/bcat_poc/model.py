@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
-from typing import List, Tuple
+from typing import Tuple
 
 from .config import CONFIG
 from .bcat import BCAT
@@ -34,27 +34,73 @@ class SparseBayesianLinear(nn.Module):
         scores = torch.matmul(x_reshaped, keys.t()) / math.sqrt(self.in_features)
         raw_weights = F.relu(scores - self.gate_param.unsqueeze(0))
 
-        bcat_obj = BCAT.cluster(
-            raw_weights, 
-            threshold=CONFIG["BCAT_CLUSTER_THRESHOLD"], 
-            min_block_size=CONFIG["BCAT_MIN_BLOCK_SIZE"]
-        )
-
-        output = torch.zeros_like(raw_weights)
-        for i, meta in enumerate(bcat_obj.block_meta):
-            r_start, c_start, r_len, c_len = meta
-            block_x = x_reshaped[r_start : r_start + r_len]
-            block_mu = self.mu_weight[c_start : c_start + c_len]
-            
-            block_out = F.linear(block_x, block_mu)
-            block_out *= bcat_obj.block_values[i]
-            
-            output[r_start : r_start + r_len, c_start : c_start + c_len] += block_out
-
-        output += self.mu_bias.unsqueeze(0)
+        activation_rate = (raw_weights > 0).float().mean()
         
-        final_output = output.view(*original_shape[:-1], self.out_features)
-        return final_output, scores, output
+        # Use BCAT only when sparse, otherwise fallback to dense
+        if self.training and activation_rate < 0.75 and activation_rate > 0.0:
+            bcat_obj = BCAT.cluster(raw_weights, grid_size=CONFIG["BCAT_GRID_SIZE"])
+            
+            if bcat_obj.block_meta.numel() > 0:
+                block_r_starts, block_c_starts, block_r_lens, block_c_lens = bcat_obj.block_meta.T.long()
+                
+                # Gather indices for x and mu_weight
+                x_indices = torch.cat([torch.arange(start, start + length, device=x.device) for start, length in zip(block_r_starts, block_r_lens)])
+                mu_indices = torch.cat([torch.arange(start, start + length, device=x.device) for start, length in zip(block_c_starts, block_c_lens)])
+                
+                gathered_x = x_reshaped.index_select(0, x_indices)
+                gathered_mu = self.mu_weight.index_select(0, mu_indices)
+                
+                # Pad for bmm
+                x_splits = torch.split(gathered_x, block_r_lens.tolist())
+                mu_splits = torch.split(gathered_mu, block_c_lens.tolist())
+                padded_x = torch.nn.utils.rnn.pad_sequence(x_splits, batch_first=True)
+                padded_mu = torch.nn.utils.rnn.pad_sequence(mu_splits, batch_first=True)
+                
+                # Batched matrix multiplication
+                bmm_output = torch.bmm(padded_x, padded_mu.transpose(1, 2))
+                
+                # Mask and weight the output
+                # Manually pad values to max_c_len
+                max_r_len = block_r_lens.max().item()
+                max_c_len = block_c_lens.max().item()
+                padded_values_list = []
+                value_offset = 0
+                for r_len, c_len in zip(block_r_lens, block_c_lens):
+                    num_block_values = r_len * c_len
+                    block_vals = bcat_obj.block_values[value_offset : value_offset + num_block_values].view(r_len, c_len)
+                    padded_block = F.pad(block_vals, (0, max_c_len - c_len, 0, 0))
+                    padded_values_list.append(padded_block)
+                    value_offset += num_block_values
+                
+                padded_values = torch.nn.utils.rnn.pad_sequence(padded_values_list, batch_first=True)
+                bmm_output *= padded_values
+                
+                # Scatter add back to output tensor
+                output = torch.zeros_like(raw_weights)
+                
+                # Create destination indices for scatter_add_
+                rows = torch.cat([torch.arange(r_start, r_start + r_len, device=x.device).repeat_interleave(c_len) for r_start, r_len, c_len in zip(block_r_starts, block_r_lens, block_c_lens)])
+                cols = torch.cat([torch.arange(c_start, c_start + c_len, device=x.device).repeat(r_len) for c_start, r_len, c_len in zip(block_c_starts, block_r_lens, block_c_lens)])
+                
+                # Flatten values to scatter
+                bmm_values = torch.cat([bmm_output[i, :r_len, :c_len].flatten() for i, (r_len, c_len) in enumerate(zip(block_r_lens, block_c_lens))])
+
+                # Use index_put_ for a more direct scatter operation
+                output.index_put_((rows, cols), bmm_values, accumulate=True)
+
+                masked_output = output + self.mu_bias.unsqueeze(0)
+            else:
+                 # Fallback if clustering yields no blocks
+                computation_output = F.linear(x_reshaped, self.mu_weight)
+                masked_output = computation_output * raw_weights
+                masked_output += self.mu_bias.unsqueeze(0)
+        else:
+            computation_output = F.linear(x_reshaped, self.mu_weight)
+            masked_output = computation_output * raw_weights
+            masked_output += self.mu_bias.unsqueeze(0)
+        
+        final_output = masked_output.view(*original_shape[:-1], self.out_features)
+        return final_output, scores, masked_output
 
 class DynamicInfiniteHeadAttention(nn.Module):
     def __init__(self, d_model: int, dtype: torch.dtype = torch.float32):

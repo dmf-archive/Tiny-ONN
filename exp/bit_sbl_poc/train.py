@@ -9,17 +9,17 @@ from .config import CONFIG
 from .data import generate_arithmetic_data, TOKENIZER, IGNORE_INDEX
 from .dynamic_infinite_head_attention import DynamicInfiniteHeadAttention
 from .dynamic_infinite_expert import DynamicInfiniteExpert
-from .sparse_bayesian_linear import SparseBayesianLinear
+from .sparse_bayesian_linear import BitSBL
 
 console = Console()
 
 class MoIETransformerBlock(nn.Module):
-    def __init__(self, d_model, d_ffn_factor, bcat_grid_size, dropout=0.1, dtype=torch.float32):
+    def __init__(self, d_model, d_ffn_factor, dropout=0.1, dtype=torch.float32):
         super().__init__()
         self.ln1 = nn.LayerNorm(d_model, dtype=dtype)
-        self.attn = DynamicInfiniteHeadAttention(d_model, bcat_grid_size=bcat_grid_size, dtype=dtype)
+        self.attn = DynamicInfiniteHeadAttention(d_model, dtype=dtype)
         self.ln2 = nn.LayerNorm(d_model, dtype=dtype)
-        self.ffn = DynamicInfiniteExpert(d_model, d_ffn_factor, bcat_grid_size=bcat_grid_size, dtype=dtype)
+        self.ffn = DynamicInfiniteExpert(d_model, d_ffn_factor, dtype=dtype)
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
@@ -39,7 +39,7 @@ class ReferenceModel(nn.Module):
         self.embedding = nn.Embedding(CONFIG["VOCAB_SIZE"], CONFIG["D_MODEL"], dtype=CONFIG["DTYPE"])
         self.pos_embedding = nn.Embedding(CONFIG["SEQ_LEN"], CONFIG["D_MODEL"], dtype=CONFIG["DTYPE"])
         self.blocks = nn.ModuleList([MoIETransformerBlock(
-            CONFIG["D_MODEL"], CONFIG["D_FFN_FACTOR"], CONFIG["BCAT_GRID_SIZE"], dtype=CONFIG["DTYPE"]
+            CONFIG["D_MODEL"], CONFIG["D_FFN_FACTOR"], dtype=CONFIG["DTYPE"]
         ) for _ in range(CONFIG["NUM_TRANSFORMER_BLOCKS"])])
         self.lm_head = nn.Linear(CONFIG["D_MODEL"], CONFIG["VOCAB_SIZE"], dtype=CONFIG["DTYPE"])
 
@@ -78,30 +78,20 @@ def run_training_loop():
         gate_loss = torch.tensor(0.0, device=x.device, dtype=CONFIG["DTYPE"])
         activation_rate = 0.0
 
-        if masked_outputs and main_loss.item() > 1e-4:
-            detached_outputs = [mo.detach().requires_grad_(True) for mo in masked_outputs]
-            
-            with torch.enable_grad():
-                # Re-run the final part of the forward pass to build a temporary graph for surprise
-                # Approximate the final block's output before the LM head. Shape should be (batch*seq, d_model) -> (batch, seq, d_model)
-                temp_final_output = detached_outputs[-1].view(CONFIG["BATCH_SIZE"], CONFIG["SEQ_LEN"], CONFIG["D_MODEL"])
-                temp_logits = model.lm_head(temp_final_output)
-                surprise_loss = F.cross_entropy(temp_logits.view(-1, CONFIG["VOCAB_SIZE"]), masked_labels.view(-1), ignore_index=IGNORE_INDEX)
-            
-            surprise_grads = torch.autograd.grad(surprise_loss, detached_outputs, allow_unused=True)
+        if masked_outputs:
+            total_active = sum((mo.abs() > 1e-5).float().sum() for mo in masked_outputs if mo is not None)
+            total_elements = sum(mo.numel() for mo in masked_outputs if mo is not None)
+            activation_rate = (total_active / total_elements).item() if total_elements > 0 else 0.0
 
-            with torch.no_grad():
-                total_active = sum((mo.abs() > 1e-5).float().sum() for mo in masked_outputs if mo is not None)
-                total_elements = sum(mo.numel() for mo in masked_outputs if mo is not None)
-                activation_rate = (total_active / total_elements).item() if total_elements > 0 else 0.0
-                
-                for grad_tensor in surprise_grads:
-                    if grad_tensor is not None:
-                        surprise_per_neuron = grad_tensor.view(-1, grad_tensor.shape[-1]).norm(p=2, dim=0)
-                        active_surprise = surprise_per_neuron[surprise_per_neuron > 1e-9]
-                        if active_surprise.numel() > 0:
-                            weighted_surprise = active_surprise * activation_rate
-                            gate_loss += (-torch.log(weighted_surprise + 1e-9) * weighted_surprise).sum()
+            surprise_grads = torch.autograd.grad(main_loss, masked_outputs, retain_graph=True, allow_unused=True)
+
+            for grad_tensor in surprise_grads:
+                if grad_tensor is not None:
+                    surprise_per_neuron = grad_tensor.view(-1, grad_tensor.shape[-1]).norm(p=2, dim=0)
+                    active_surprise = surprise_per_neuron[surprise_per_neuron > 1e-9]
+                    if active_surprise.numel() > 0:
+                        weighted_surprise = active_surprise * activation_rate
+                        gate_loss += (-torch.log(weighted_surprise + 1e-9) * weighted_surprise).sum()
         
         avg_tau = torch.distributions.Categorical(logits=logits.detach()).entropy()[loss_mask].mean() if loss_mask.any() else torch.tensor(0.0)
         prior_std = torch.clamp(avg_tau, min=CONFIG["KL_PRIOR_EPSILON"])
@@ -109,9 +99,9 @@ def run_training_loop():
         kl_loss = torch.tensor(0.0, device=x.device, dtype=CONFIG["DTYPE"])
         num_sbl_layers = 0
         for module in model.modules():
-            if isinstance(module, SparseBayesianLinear):
-                q_w = torch.distributions.Normal(module.mu_weight, F.softplus(module.sigma_weight))
-                p_w = torch.distributions.Normal(torch.zeros_like(module.mu_weight), prior_std)
+            if isinstance(module, BitSBL):
+                q_w = torch.distributions.Normal(module.mu_weight_latent, F.softplus(module.sigma_weight))
+                p_w = torch.distributions.Normal(torch.zeros_like(module.mu_weight_latent), prior_std)
                 kl_loss += torch.distributions.kl_divergence(q_w, p_w).mean()
                 num_sbl_layers += 1
         if num_sbl_layers > 0: 

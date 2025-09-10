@@ -13,8 +13,5 @@ CONFIG = {
     "DTYPE": torch.float32,
     "TRAINING_STEPS": 5000, 
     "LOG_INTERVAL": 50,
-    "KL_PRIOR_EPSILON": 1e-9,
-
-    "BCAT_CLUSTER_UPDATE_INTERVAL": 100,
-    "BCAT_GRID_SIZE": 16,
+    "KL_PRIOR_EPSILON": 1e-9
 }
