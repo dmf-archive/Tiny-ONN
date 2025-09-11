@@ -1,8 +1,10 @@
-# Tiny-ONN-ARC: 项目报告与实施计划 (v2.2)
+# Tiny-ONN-ARC: 项目报告与实施计划 (v3.0)
 
 ## 摘要
 
 `Tiny-ONN-ARC` 是一个为解决 `ARC-AGI-2` 抽象推理任务而设计的专用语言模型。作为 `Tiny-ONN` 项目的一个分支，它继承了**超稀疏混合专家 (Hyper-SMoE)** 的核心思想，并针对 ARC 任务的特性进行了深度特化。本项目并非传统的程序合成，而是通过构建一个通用的**可微计算基质 (Differentiable Computational Substrate)**，让解决问题的抽象程序在梯度下降中**自组织地涌现**。模型架构基于 **DynSIHA (动态稀疏无限头注意力)** 和 **MoIE (无限专家混合)**，训练范式依赖 **Teacher Forcing** 和 **多视角数据增强** 来驱动模型学习抽象规则。
+
+v3.0 版本标志着实验架构的彻底融合：从 `exp/tiny_onn_arc` 的数据与训练基础设施，到 `exp/sparse_bayesian_linear` 的 SBL 核心模块，已实现无缝集成。新架构引入了位置感知 tokenizer 和内建几何不变性训练，提升了空间推理效率。
 
 ---
 
@@ -11,31 +13,31 @@
 整个系统的工作流程遵循一个清晰的、顺序化的数据处理与学习管道：
 
 1. **M1: 数据表征 (Data Representation)**
-    - **Tokenizer**: 使用一个极小的、针对 ARC 任务的专属词汇表，包含 0-9 的颜色 token 和必要的控制 token (`<|im_start|>`, `<|im_end|>`, `problem`, `solution` 等)。
-    - **Serializer**: 将 2D 网格及其坐标信息线性化为 1D token 序列。这是模型能够理解空间关系的基础。
+    - **Tokenizer**: 使用一个组合式、位置感知的词汇表 `ArcPositionalTokenizer`，规模约 9007（7 个控制 token + 30×30×10 个空间-颜色对 token）。每个 token 直接编码 `(i, j, c)`，注入空间先验，降低空间关系学习压力。
+    - **Serializer**: 将 2D 网格直接序列化为 token ID 列表（`GridSerializer`），遍历每个像素 `(r, c)` 生成 `token_id(r, c, color)`。这是模型原生感知空间结构的基础。
 
 2. **M3: 数据加载与预处理 (Data Loading & Pre-processing)**
     - **ArcDataset**: 从 JSON 文件中读取并加载完整的任务数据，每个任务（包含其所有 `train` 和 `test` 对）作为一个样本。
-    - **ArcCollator**: 作为数据加载器的核心，它接收一批原始任务数据，并负责执行"多示例上下文"拼接、D8 对称数据增强、序列化以及最终的批次填充，直接产出可供模型计算的规整张量。
+    - **ArcCollator**: 作为数据加载器的核心，它接收一批原始任务数据，并负责执行"多示例上下文"拼接、序列化以及最终的批次填充，直接产出可供模型计算的规整张量。训练时，`batch_size` 硬性为 1；评估时为 1。
 
 3. **M2: 模型架构 (Model Architecture)**
-    - **核心**: `ArcTransformer`，一个标准的 Decoder-only Transformer 骨架。
-    - **创新**: 其核心计算单元是 `DynONNBlock`，它用 **DynSIHA (动态稀疏无限头注意力)** 和我们定制的 **MoIE (无限专家混合)** 分别取代了标准的注意力和前馈网络层。
+    - **核心**: `ArcTransformer`，一个 Decoder-only Transformer 骨架，使用 `bfloat16` 精度。
+    - **创新**: 其核心计算单元是 `MoIETransformerBlock`，用 **DynSIHA** 和 **MoIE** 取代标准注意力和前馈层。移除了冗余的位置编码层，依赖 tokenizer 的空间先验。模型通过 instrumented forward pass 暴露内部激活值 (`masked_outputs`)，支持 SML 计算。
 
 4. **M6 & M4: 训练编排与范式 (Orchestration & Paradigms)**
     - **Trainer**: 作为顶层协调器，负责驱动整个训练与评估循环。
     - **StepRunners**: `Trainer` 根据配置，实例化具体的训练步骤执行器 (`TFStepRunner`)，将训练范式的具体逻辑解耦。
-    - **训练循环**: `Trainer` 从 `DataLoader` 获取批次，交由 `StepRunner` 执行，然后负责梯度累积和优化器步骤。
+    - **训练循环**: `Trainer` 从 `DataLoader` 获取批次，交由 `StepRunner` 执行，然后负责梯度累积和优化器步骤。每个步骤内部应用 D8 多视角增强，形成有效批次。
 
 5. **M5: 推理与评估 (Inference & Evaluation)**
     - **EvaluationStep**: 一个独立的评估逻辑单元，负责在 `torch.no_grad()` 上下文中执行完整的评估流程。
     - **Sequence Generator**: 利用 `model.generate` 进行自回归推理，生成解答序列。
-    - **Grid Decoder**: `Serializer` 的逆过程，将 token 序列解码回 2D 网格。
+    - **Grid Decoder**: `Serializer` 的逆过程，将 token 序列解码回 2D 网格（`GridDeserializer` 使用 `token_id_to_grid` 动态重建）。
     - **AugScore Evaluator**: 实现多视角一致性评估，为模型的最终解答提供鲁棒性评分。
 
 6. **M6: 系统支持 (System Support)**
     - **Config**: 提供统一的、结构化的配置管理。
-    - **Observer**: 负责所有训练过程中的日志记录与可视化。
+    - **Observer**: 负责所有训练过程中的日志记录与可视化，包括 SBL 指标（`avg_sigma`, `activation_rate` 等）。
 
 ---
 
@@ -61,7 +63,7 @@
 
 - **多视角数据增强 (Multi-View Data Augmentation)**:
   - **目标**: 学习几何不变性，增强模型的泛化能力。
-  - **方法**: 在训练过程中，对输入的 ARC 网格进行 D8 对称变换（旋转、翻转），让模型在多种视角下学习同一个任务的解决方案。
+  - **方法**: 在训练过程中，对输入的 ARC 网格进行 D8 对称变换（旋转、翻转），让模型在多种视角下学习同一个任务的解决方案。每个训练步骤处理单一任务的 8 个视角，形成有效批次。
   - **作用**: 这是驱动模型从"记住模式"到"理解规则"的助推。
 
 ### 2.3. AugScore 多视角一致性评估
@@ -75,41 +77,23 @@
 
 ---
 
-## 附录 B: v3.0 组件来源形式化分析与融合计划
+## 3. 工程决策与关键约束
 
-本附录基于对 `exp/tiny_onn_arc` 和 `exp/bit_sbl_poc` 的形式化代码分析，为 v3.0 的实现提供了更精确的组件提取与适配计划。
+本章节突出记录 v3.0 实施中的关键工程决策与约束。这些决策源于理论分析与实验验证，确保训练的稳定性和自组织学习的有效性。
 
-### B.1 `tiny_onn_arc` (项目外骨骼)
+- **单任务梯度流约束**: `batch_size` 必须硬性约束为 `1`。每个训练步骤的有效批次 (effective batch) 完全由多视角数据增强（如 D8 对称变换）的数量构成。这一约束源于 SML 的元学习特性：由于门控参数的更新依赖于主任务损失的高阶梯度 (`Surprise`)，混合来自多个具有不同潜在规则的 ARC 任务的梯度，会产生相互冲突的、破坏性的学习信号，从而阻碍门控的自组织过程。因此，确保每个优化步骤的梯度流都源自**单一任务**的多个视角，是保证训练稳定性和有效性的结构性先决条件。
 
-此项目提供了构建 ARC 任务端到端解决方案所需的、经过验证的**训练与数据基础设施**。
+- **高学习率必要性 (2025-09-11)**: 对 `exp/dynsiha_moie_arc` 的初步实验明确表明，标准的低学习率（如 `3e-4`）对于 SBL 架构是**完全无效**的，无法为 `sigma_weight` 参数提供足够的梯度信号，导致 `avg_sigma` 指标停滞。实验证明，将学习率提高一个数量级（至 `3e-3`）是激活模型自组织能力（`avg_sigma` 开始稳步下降）的**先决条件**。
 
-- **计划提取的组件**:
-    1. **训练与评估框架**: 提取其顶层的**训练协调器** (Trainer)、**评估器** (EvaluationStep) 和**观测器** (Observer) 的设计哲学，包括检查点管理、基于 `model.generate` 的评估流程以及高质量的可视化界面。
-    2. **数据管道与增强**: 复用其完整的 ARC **数据处理流水线**，包括 `Dataset`、**网格序列化/反序列化**逻辑，以及至关重要的 **D8 对称数据增强** (`ConsistencyTools`)，后者是驱动模型学习泛化规则的基础。
-    3. **模型骨架**: 不得沿用其基于 `Qwen3` 的 Transformer 骨架，模型层将完全被替换以避免 `Transformers` 适配的复杂性。
+- **禁止手动损失加权 (2025-09-11)**: 实验同样证明，为 `gate_loss` (SML) 和 `kl_loss` 手动设置固定的权重超参数（`w_gate`, `w_kl`）是有害的。移除这些权重，直接将 `main_loss`、`gate_loss` 和 `kl_loss` 相加，能让梯度在不同目标间更自然地平衡，从而产生更健康的训练动态。
 
-- **需要适配的部分**:
-  - **日志系统 (`Observer`)**: 其现有的日志功能需要重构，以兼容并展示 `sparse_bayesian_linear` 中用于观测 SBL 内部状态的、信息更丰富的指标集。
-  - **模型核心 (`model.py`)**: 必须移除其现有的、基于启发式损失的 `DynMoE` 实现，以全面移植**标准 `bfloat16` SBL** 系列的 `DynSIHA` 和 `MoIE` 模块。
+- **禁用梯度检查点 (2025-09-11)**: 实验 (`exp/RoPE_SBL`) 的交叉验证最终确认，`torch.utils.checkpoint.checkpoint` 在我们的 SML+KL 训练范式下，会**完全破坏** KL 散度损失到 `sigma_weight` 参数的梯度流，导致 `avg σ` 指标冻结，自适应先验机制失效。**在找到替代方案前，禁用梯度检查点是唯一选择**。
 
-### B.2 `sparse_bayesian_linear` (模型核心与训练范式)
+- **禁止标签平滑**: ARC 任务的离散特性要求模型学习清晰、明确的决策边界。标签平滑会模糊这个信号，对需要精确梯度信息的 SML 造成“梯度污染”，与我们的自组织目标背道而驰。
 
-此项目是标准 SBL 的功能验证，提供了 v3.0 经过验证的、在 `bfloat16` 精度下**稳定可靠的核心计算架构**和**自组织学习范式**。
+- **bfloat16 精度与 BitNet 约束 (2025-09-10)**: 实验 (`exp/bit_sbl_poc`, `exp/sparse_bayesian_linear`) 的交叉验证最终确认，当 `bfloat16` 精度与 BitNet 的二值化前向传播（及其直通估计器 STE 梯度）结合时，会导致 SML+DynKL 组合损失中 KL 散度部分的梯度流**完全中断**，使得自适应正则化机制失效。**最终技术决策**: 放弃在训练中直接使用 BitNet。v3.0 将完全基于**标准 `bfloat16` SBL** 进行训练。权重二值化将被视为一种可选的、**训练后**的压缩与部署策略。
 
-- **计划提取的组件**:
-    1. **核心模型架构**: 提取 `SparseBayesianLinear`、`DynamicInfiniteHeadAttention` (DynSIHA) 和 `DynamicInfiniteExpert` (MoIE) 的 `bfloat16` **架构设计**作为 v3.0 的计算核心。
-    2. **核心训练范式**: 提取其完整的 **SML + KL 散度**双辅助损失的**训练哲学**。这包括“通过 instrumented forward pass 暴露内部状态以计算 Surprise”的设计模式。
-    3. **关键观测指标**: 提取其日志中用于洞察 SBL 动态行为的**指标集**，如 `Avg σ/g` (不确定性/门控), `Act%` (激活率), `τ/p_std` (模型熵/先验宽度)。
-
-- **需要适配的部分**:
-  - **位置编码**: 必须废弃其原有的绝对位置编码，以采用更先进的 RoPE 方案。
-  - **上下文扩展**: 引入**滑动窗口注意力 (SWA)** 机制作为可配置选项。需要对 SWA (基于位置的粗粒度稀疏) 与 DynSIHA (基于内容的细粒度稀疏) 的兼容性进行消融实验，以规避“过度稀疏化”风险。
-  - **关键发现与约束 (2025-09-10)**:
-    - **`bfloat16` 精度陷阱**: 实验 (`exp/bit_sbl_poc`, `exp/sparse_bayesian_linear`) 的交叉验证最终确认，当 `bfloat16` 精度与 BitNet 的二值化前向传播（及其直通估计器 STE 梯度）结合时，会导致 SML+DynKL 组合损失中 KL 散度部分的梯度流**完全中断**，使得自适应正则化机制失效。
-    - **最终技术决策**: 鉴于自适应先验对 `Tiny-ONN` 哲学的核心重要性，我们决定**放弃在训练中直接使用 BitNet**。v3.0 将完全基于**标准 `bfloat16` SBL** 进行训练。权重二值化将被视为一种可选的、**训练后**的压缩与部署策略。
-  - **关键发现与约束 (2025-09-11)**:
-    - **梯度检查点陷阱**: 实验 (`exp/RoPE_SBL`) 的交叉验证最终确认，`torch.utils.checkpoint.checkpoint` 在我们的 SML+KL 训练范式下，会**完全破坏** KL 散度损失到 `sigma_weight` 参数的梯度流，导致 `avg σ` 指标冻结，自适应先验机制失效。**在找到替代方案前，禁用梯度检查点是唯一选择**。
-    - **RoPE 显存开销**: 自定义的 Python 级 RoPE 实现，因其复杂的计算图和 Autograd 引擎的中间张量缓存，会比绝对位置编码消耗更多的显存。这是我们当前实现的固有属性，需要通过定制 CUDA 核等方式进行深度优化。
+- **RoPE 显存开销 (2025-09-11)**: 自定义的 Python 级 RoPE 实现，因其复杂的计算图和 Autograd 引擎的中间张量缓存，会比绝对位置编码消耗更多的显存。这是我们当前实现的固有属性，需要通过定制 CUDA 核等方式进行深度优化。
 
 ---
 

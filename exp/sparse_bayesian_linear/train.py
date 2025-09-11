@@ -57,7 +57,6 @@ def run_training_loop():
             prior_std = torch.clamp(avg_tau.detach(), min=0.01, max=3.0).item()
 
         w_gate = 1.0 - torch.sigmoid(main_loss.detach())
-        w_kl = 0.001
         total_loss = main_loss + w_gate * gate_loss + w_kl * kl_loss
         
         total_loss.backward()
