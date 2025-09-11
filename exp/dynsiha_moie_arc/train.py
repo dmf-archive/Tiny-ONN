@@ -1,21 +1,20 @@
-import glob
+import itertools
 import os
 import time
 from pathlib import Path
 from typing import Any
+
 import torch
 import torch.nn.functional as F
 from rich.console import Console
-from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader
-import itertools
 
 from .config import TrainConfig
 from .consistency import ConsistencyTools
 from .data import ArcCollator, ArcDataset, GridDeserializer, GridSerializer
 from .model import ArcTransformer
 from .observer import Observer
-from .tokenizer import ArcPositionalTokenizer
+from .tokenizer import ArcColorTokenizer
 
 
 class Trainer:
@@ -28,13 +27,13 @@ class Trainer:
         self.observer = Observer(self.console, config)
         self.prior_std = 1.0
 
-        self.tokenizer = ArcPositionalTokenizer()
+        self.tokenizer = ArcColorTokenizer()
         self.serializer = GridSerializer(self.tokenizer)
         self.deserializer = GridDeserializer(self.tokenizer)
 
         train_dataset = ArcDataset(data_path=config.data.data_path, split="training")
         eval_dataset = ArcDataset(data_path=config.data.data_path, split="evaluation")
-        
+
         train_collator = ArcCollator(self.tokenizer, max_len=config.model.max_position_embeddings)
         eval_collator = ArcCollator(self.tokenizer, max_len=config.model.max_position_embeddings)
 
@@ -47,27 +46,37 @@ class Trainer:
         )
 
         self.config.model.vocab_size = self.tokenizer.vocab_size
-        self.model = ArcTransformer(self.config.model).to(self.device)
-        
-        sigma_params = [p for name, p in self.model.named_parameters() if 'sigma_weight' in name]
-        other_params = [p for name, p in self.model.named_parameters() if 'sigma_weight' not in name]
+        self.model = ArcTransformer(self.config.model, device=self.device).to(self.device)
+        # self.model = torch.jit.script(self.model)
 
-        optimizer_grouped_parameters = [
-            {'params': other_params},
-            {'params': sigma_params, 'lr': config.kl_learning_rate}
+        # Separate parameter groups for differential learning rates
+        prior_params = []
+        base_params = []
+
+        for name, param in self.model.named_parameters():
+            if 'sigma_weight' in name or 'gate_param' in name:
+                prior_params.append(param)
+            else:
+                base_params.append(param)
+
+        param_groups = [
+            {'params': base_params, 'lr': self.config.base_learning_rate, 'weight_decay': self.config.weight_decay},
+            {'params': prior_params, 'lr': self.config.prior_learning_rate, 'weight_decay': self.config.weight_decay}
         ]
-        
-        self.optimizer = torch.optim.AdamW(
-            optimizer_grouped_parameters, lr=config.learning_rate, weight_decay=config.weight_decay
-        )
+
+        self.optimizer = torch.optim.AdamW(param_groups)
         self.consistency_tools = ConsistencyTools()
-        
+
         self.checkpoint_dir = Path(__file__).parent / "checkpoints"
         self.checkpoint_dir.mkdir(exist_ok=True)
         self.global_step = 0
 
     def _save_checkpoint(self):
-        state = {'step': self.global_step, 'model_state_dict': self.model.state_dict(), 'optimizer_state_dict': self.optimizer.state_dict()}
+        state = {
+            'step': self.global_step,
+            'model_state_dict': self.model.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict()
+        }
         filepath = self.checkpoint_dir / f"checkpoint_{self.global_step}.pt"
         torch.save(state, filepath)
         checkpoints = sorted(self.checkpoint_dir.glob("*.pt"), key=os.path.getmtime)
@@ -86,159 +95,156 @@ class Trainer:
         self.console.print(f"[bold blue]Loaded checkpoint from {latest_checkpoint} at step {self.global_step}[/bold blue]")
 
     def _calculate_token_accuracy(self, logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
-        masked_labels = labels.view(-1)
+        logits = logits[:, :-1, :]
+        labels = labels[:, 1:]
+
+        masked_labels = labels.contiguous().view(-1)
         active_mask = masked_labels != -100
         if not active_mask.any():
             return torch.tensor(0.0)
-        active_logits = logits.view(-1, logits.size(-1))[active_mask]
+
+        active_logits = logits.contiguous().view(-1, logits.size(-1))[active_mask]
         active_labels = masked_labels[active_mask]
+
         preds = torch.argmax(active_logits, dim=-1)
         return (preds == active_labels).float().mean()
 
-    def _run_tf_step(self, batch: dict[str, Any]) -> tuple[torch.Tensor, dict[str, Any]]:
-        task_data = batch['task_data'][0]
+    def _run_tf_step(self, task_data: dict[str, Any], view_idx: int) -> tuple[torch.Tensor, dict[str, Any]] | None:
+        kl_epsilon = self.config.kl_prior_epsilon
+
+        input_grid = torch.tensor(task_data['test'][0]['input'])
+        output_grid = torch.tensor(task_data['test'][0]['output'])
+
+        transforms = self.consistency_tools.get_transforms()
+        input_grid_aug = transforms[view_idx](input_grid)
+        output_grid_aug = transforms[view_idx](output_grid)
         
-        input_grids_aug = self.consistency_tools.apply_transforms(torch.tensor(task_data['test'][0]['input']))
-        output_grids_aug = self.consistency_tools.apply_transforms(torch.tensor(task_data['test'][0]['output']))
+        view_task_data = {'train': task_data['train'], 'test': [{'input': input_grid_aug.tolist(), 'output': output_grid_aug.tolist()}]}
+        input_ids_list, labels_list = self.serializer.serialize_task_with_context(view_task_data)
         
-        # Pre-calculate global tau from all views for a stable prior
-        all_logits_no_grad = []
-        with torch.no_grad():
-            for i in range(8):
-                view_task_data = { 'train': task_data['train'], 'test': [{'input': input_grids_aug[i].tolist(), 'output': output_grids_aug[i].tolist()}] }
-                input_ids_list, _ = self.serializer.serialize_task_with_context(view_task_data)
-                if len(input_ids_list) > self.config.model.max_position_embeddings: continue
-                input_ids = torch.tensor([input_ids_list], dtype=torch.long, device=self.device)
-                logits, _, _ = self.model(input_ids, 1.0, self.config.kl_prior_epsilon)
-                all_logits_no_grad.append(logits)
+        if len(input_ids_list) > self.config.model.max_position_embeddings:
+            return None
+
+        input_ids = torch.tensor([input_ids_list], dtype=torch.long, device=self.device)
+        labels = torch.tensor([labels_list], dtype=torch.long, device=self.device)
+
+        logits, masked_outputs, computation_outputs, raw_weights, kl_loss, _, _ = self.model(
+            input_ids, self.prior_std, kl_epsilon
+        )
         
-        if not all_logits_no_grad: return torch.tensor(0.0), {}
-
-        with torch.no_grad():
-            avg_tau = torch.mean(torch.stack([torch.distributions.Categorical(logits=l).entropy().mean() for l in all_logits_no_grad]))
-            self.prior_std = torch.clamp(avg_tau.detach(), min=0.01, max=3.0).item()
+        shifted_logits = logits[:, :-1, :]
+        shifted_labels = labels[:, 1:]
+        main_loss = F.cross_entropy(
+            shifted_logits.contiguous().view(-1, self.config.model.vocab_size),
+            shifted_labels.contiguous().view(-1), ignore_index=-100
+        )
         
-        # Grouped gradient accumulation
-        num_groups = 4
-        group_size = 8 // num_groups
-        total_loss_for_backward = torch.tensor(0.0, device=self.device)
-        
-        # Metrics to aggregate across groups
-        agg_metrics = {"main_loss": 0.0, "gate_loss": 0.0, "kl_loss": 0.0, "total_loss": 0.0, "token_acc": 0.0, "activation_rate": 0.0}
+        sml_loss = torch.tensor(0.0, device=self.device)
+        if computation_outputs:
+            active_elements = sum((rw > 1e-5).float().sum().item() for rw in raw_weights)
+            total_elements = sum(rw.numel() for rw in raw_weights)
+            activation_rate = active_elements / total_elements if total_elements > 0 else 0.0
 
-        for group_idx in range(num_groups):
-            start_idx = group_idx * group_size
-            end_idx = start_idx + group_size
-            
-            group_main_loss = torch.tensor(0.0, device=self.device)
-            group_kl_loss = torch.tensor(0.0, device=self.device)
-            group_masked_outputs = []
-            group_active_elements, group_total_elements = 0, 0
-            group_logits, group_labels = [], []
+            masked_grads = torch.autograd.grad(
+                main_loss, computation_outputs, retain_graph=True, allow_unused=True
+            )
 
-            for i in range(start_idx, end_idx):
-                view_task_data = { 'train': task_data['train'], 'test': [{'input': input_grids_aug[i].tolist(), 'output': output_grids_aug[i].tolist()}] }
-                input_ids_list, labels_list = self.serializer.serialize_task_with_context(view_task_data)
-                if len(input_ids_list) > self.config.model.max_position_embeddings: continue
-
-                input_ids = torch.tensor([input_ids_list], dtype=torch.long, device=self.device)
-                labels = torch.tensor([labels_list], dtype=torch.long, device=self.device)
-
-                logits, masked_outputs, kl_loss = self.model(input_ids, self.prior_std, self.config.kl_prior_epsilon)
-                
-                group_main_loss += F.cross_entropy(logits.view(-1, self.config.model.vocab_size), labels.view(-1), ignore_index=-100)
-                group_kl_loss += kl_loss
-                group_masked_outputs.extend(masked_outputs)
-                group_logits.append(logits)
-                group_labels.append(labels)
-
-                with torch.no_grad():
-                    for mo in masked_outputs:
-                        group_active_elements += (mo.abs() > 1e-5).float().sum()
-                        group_total_elements += mo.numel()
-
-            if not group_masked_outputs: continue
-
-            group_activation_rate = (group_active_elements / group_total_elements).item() if group_total_elements > 0 else 0.0
-            
-            group_gate_loss = torch.tensor(0.0, device=self.device)
-            surprise_grads = torch.autograd.grad(group_main_loss, group_masked_outputs, retain_graph=True, allow_unused=True)
-            for grad_tensor in surprise_grads:
+            for grad_tensor in masked_grads:
                 if grad_tensor is not None:
                     surprise_per_neuron = grad_tensor.view(-1, grad_tensor.shape[-1]).norm(p=2, dim=0)
                     active_surprise = surprise_per_neuron[surprise_per_neuron > 1e-9]
                     if active_surprise.numel() > 0:
-                        weighted_surprise = active_surprise * group_activation_rate
-                        group_gate_loss += (-torch.log(weighted_surprise + 1e-9) * weighted_surprise).sum()
-
-            with torch.no_grad():
-                w_gate = -torch.log(avg_tau.detach() + self.config.kl_prior_epsilon)
-            
-            group_total_loss = group_main_loss + w_gate * group_gate_loss + group_kl_loss
-            total_loss_for_backward += group_total_loss
-
-            # Aggregate metrics
-            with torch.no_grad():
-                agg_metrics["main_loss"] += group_main_loss.item()
-                agg_metrics["gate_loss"] += (w_gate * group_gate_loss).item()
-                agg_metrics["kl_loss"] += group_kl_loss.item()
-                agg_metrics["total_loss"] += group_total_loss.item()
-                agg_metrics["token_acc"] += torch.mean(torch.stack([self._calculate_token_accuracy(l, la) for l, la in zip(group_logits, group_labels)])).item()
-                agg_metrics["activation_rate"] += group_activation_rate
-
-        # Normalize aggregated metrics
-        for key in agg_metrics: agg_metrics[key] /= num_groups
+                        weighted_surprise = active_surprise * activation_rate
+                        sml_loss += (-torch.log(weighted_surprise + 1e-9) * weighted_surprise).sum()
         
         with torch.no_grad():
-            all_sigmas = [p for name, p in self.model.named_parameters() if 'sigma_weight' in name]
-            all_gates = [p for name, p in self.model.named_parameters() if 'gate_param' in name]
-            agg_metrics["avg_sigma"] = torch.mean(torch.stack([F.softplus(s).mean() for s in all_sigmas])).item() if all_sigmas else 0
-            agg_metrics["avg_gate"] = torch.mean(torch.stack([g.mean() for g in all_gates])).item() if all_gates else 0
-            agg_metrics["avg_tau"] = avg_tau.item()
-            agg_metrics["prior_std"] = self.prior_std
+            avg_tau = torch.distributions.Categorical(logits=logits).entropy().mean()
+        
+        w_sml = -torch.log(avg_tau + kl_epsilon)
+        total_loss = main_loss + kl_loss + w_sml * sml_loss
 
-        return total_loss_for_backward, agg_metrics
+        # --- Metric Calculation ---
+        with torch.no_grad():
+            token_acc = self._calculate_token_accuracy(logits, labels).item()
+            active_elements = sum((rw > 0).float().sum().item() for rw in raw_weights)
+            total_elements = sum(rw.numel() for rw in raw_weights)
+            activation_rate = active_elements / total_elements if total_elements > 0 else 0.0
+            
+            pi_score = torch.exp(-(main_loss + kl_loss)).item()
+
+            metrics = {
+                "main_loss": main_loss.item(),
+                "sml_loss": sml_loss.item(),
+                "kl_loss": kl_loss.item(),
+                "total_loss": total_loss.item(),
+                "token_acc": token_acc,
+                "activation_rate": activation_rate,
+                "avg_tau": avg_tau.item(),
+                "prior_std": self.prior_std,
+                "pi_score": pi_score
+            }
+            all_sigmas = [p for name, p in self.model.named_parameters() if 'sigma_weight' in name]
+            metrics["avg_sigma"] = (torch.mean(torch.stack([F.softplus(s).mean() for s in all_sigmas])).item() if all_sigmas else 0.0)
+            all_gates = [p for name, p in self.model.named_parameters() if 'gate_param' in name]
+            metrics["avg_gate"] = (torch.mean(torch.stack([g.mean() for g in all_gates])).item() if all_gates else 0.0)
+
+        return total_loss, metrics
 
     def _train_epoch(self, epoch: int):
         self.model.train()
         for i, batch in enumerate(self.train_loader):
             if not batch: continue
             
-            start_time = time.time()
-            
-            loss, metrics = self._run_tf_step(batch)
+            task_data = batch['task_data'][0]
 
-            if loss.item() == 0.0: continue
+            for view_idx in range(8): # Treat each view as a separate training step
+                start_time = time.time()
+                
+                step_output = self._run_tf_step(task_data, view_idx)
+                if step_output is None:
+                    continue
+                
+                loss, metrics = step_output
+                
+                if loss.item() == 0.0: continue
 
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-            self.optimizer.step()
-            self.optimizer.zero_grad()
-            torch.cuda.empty_cache() # Clean cache after each full step
-            elapsed_time = time.time() - start_time
-            
-            if self.global_step > 0 and self.global_step % self.config.log_interval == 0:
-                self.observer.log_step(epoch, self.global_step, metrics, elapsed_time)
-            
-            if self.global_step > 0 and self.global_step % self.config.eval_interval == 0:
-                self.evaluate(quick_eval=True)
-                self._save_checkpoint()
+                self.optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                self.optimizer.step()
+                
+                # Update prior_std based on the dual-layer mechanism
+                avg_sigma = metrics.get('avg_sigma', 0.0)
+                avg_gate = metrics.get('avg_gate', 0.0)
+                beta = torch.sigmoid(torch.tensor(avg_sigma - avg_gate)).item()
+                current_tau = metrics.get('avg_tau', self.prior_std)
+                self.prior_std = beta * self.prior_std + (1 - beta) * current_tau
 
-            self.global_step += 1
-        
+                torch.cuda.empty_cache()
+                elapsed_time = time.time() - start_time
+
+                if self.global_step > 0 and self.global_step % self.config.log_interval == 0:
+                    self.observer.log_step(epoch, self.global_step, metrics, elapsed_time)
+                
+                if self.global_step > 0 and (self.global_step % self.config.eval_interval == 0):
+                    self.evaluate(quick_eval=True)
+                    self._save_checkpoint() # Save checkpoint after eval
+
+                self.global_step += 1
+
         self.console.print(f"[bold yellow]End of Epoch {epoch}.[/bold yellow]")
-    
+
     @torch.no_grad()
-    def evaluate(self, quick_eval: bool = True):
+    def evaluate(self, quick_eval: bool = True, verbose: bool = True):
         self.model.eval()
-        torch.cuda.empty_cache() # Clean cache before evaluation
+        torch.cuda.empty_cache()
         eval_title = "Quick Eval" if quick_eval and len(self.eval_loader) > 10 else "Full Eval"
         num_samples_to_eval = 10 if quick_eval and len(self.eval_loader) > 10 else len(self.eval_loader)
         self.console.print(f"\n[bold cyan]--- Running {eval_title} ({num_samples_to_eval} samples) ---[/bold cyan]")
-        
+
         total_grid_acc, evaluated_count = 0, 0
         visualized = False
-        
+
         for i, batch in enumerate(itertools.islice(self.eval_loader, num_samples_to_eval)):
             if not batch: continue
 
@@ -248,33 +254,44 @@ class Trainer:
 
             prompt_ids = self.serializer.serialize_for_inference(task_data)
             prompt_tensor = torch.tensor(prompt_ids, dtype=torch.long, device=self.device).unsqueeze(0)
-            
+
             h, w = target_grid_raw.shape
             max_new_tokens = int(h * w * 1.5) + 30
 
-            generated_ids = self.model.generate(
+            solutions = self.model.dfs_generate(
                 input_ids=prompt_tensor,
                 max_new_tokens=max_new_tokens,
-                top_p=0.05,
-                eos_token_id=self.tokenizer.eos_token_id
+                eos_token_id=self.tokenizer.eos_token_id,
+                threshold=-5.0
             )
             
-            pred_grid = self.deserializer.deserialize(generated_ids[0].tolist())
+            pred_grid_1, pred_grid_2 = None, None
+            is_correct = 0
+            
+            if solutions:
+                prompt_len = prompt_tensor.shape[1]
+                pred_tokens_1 = solutions[0][1][0, prompt_len:].tolist()
+                pred_grid_1 = self.deserializer.deserialize(pred_tokens_1)
+                
+                if torch.equal(pred_grid_1, target_grid_raw):
+                    is_correct = 1
+                elif len(solutions) > 1:
+                    pred_tokens_2 = solutions[1][1][0, prompt_len:].tolist()
+                    pred_grid_2 = self.deserializer.deserialize(pred_tokens_2)
+                    if torch.equal(pred_grid_2, target_grid_raw):
+                        is_correct = 1
 
             if not visualized:
-                self.observer.visualize_evaluation_sample(input_grid_raw, target_grid_raw, pred_grid, self.global_step)
+                self.observer.visualize_evaluation_sample(input_grid_raw, target_grid_raw, pred_grid_1, self.global_step)
+                if verbose and solutions:
+                    self.console.print(f"[bold]Top solution decoded:[/bold] {self.tokenizer.decode(pred_tokens_1)}")
                 visualized = True
-            
-            is_correct = 1 if pred_grid is not None and torch.equal(pred_grid, target_grid_raw) else 0
+
             total_grid_acc += is_correct
             evaluated_count += 1
 
         avg_grid_acc = total_grid_acc / evaluated_count if evaluated_count > 0 else 0
-
-        eval_metrics = {
-            "eval_grid_acc": avg_grid_acc,
-            "total_count": float(evaluated_count)
-        }
+        eval_metrics = {"eval_grid_acc": avg_grid_acc, "total_count": float(evaluated_count)}
         self.observer.log_eval_summary(eval_metrics, self.global_step)
         self.model.train()
 

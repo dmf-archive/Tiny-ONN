@@ -1,5 +1,4 @@
 import torch
-import torch.nn.functional as F
 from rich.columns import Columns
 from rich.console import Console
 from rich.padding import Padding
@@ -20,7 +19,7 @@ class Observer:
 
     def log_step(self, epoch: int, step: int, metrics: dict[str, float], elapsed_time: float):
         main_loss = metrics.get('main_loss', 0.0)
-        gate_loss = metrics.get('gate_loss', 0.0)
+        sml_loss = metrics.get('sml_loss', 0.0)
         kl_loss = metrics.get('kl_loss', 0.0)
         token_acc = metrics.get('token_acc', 0.0)
         activation_rate = metrics.get('activation_rate', 0.0)
@@ -28,12 +27,13 @@ class Observer:
         prior_std = metrics.get('prior_std', 0.0)
         avg_sigma = metrics.get('avg_sigma', 0.0)
         avg_gate = metrics.get('avg_gate', 0.0)
-        
+        pi_score = metrics.get('pi_score', 0.0)
+
         steps_per_sec = 1 / elapsed_time if elapsed_time > 0 else float('inf')
 
         log_str = (
-            f"E:{epoch:2d} S:{step:5d} | Loss(m/g/k): {main_loss:.3f}/{gate_loss:.3f}/{kl_loss:.3f} | "
-            f"Acc: {token_acc:.3f} | Avg σ/g: {avg_sigma:.4f}/{avg_gate:.4f} | τ/p_std: {avg_tau:.3f}/{prior_std:.3f} | "
+            f"E:{epoch:2d} S:{step:5d} | Loss(m/sml/k): {main_loss:.3f}/{sml_loss:.3f}/{kl_loss:.3f} | "
+            f"Acc: {token_acc:.3f} | PI: {pi_score:.3f} | Avg σ/g: {avg_sigma:.4f}/{avg_gate:.4f} | τ/p_std: {avg_tau:.3f}/{prior_std:.3f} | "
             f"Act%: {activation_rate*100:.2f} | step/s: {steps_per_sec:.2f}"
         )
         self.console.print(log_str)
@@ -55,7 +55,7 @@ class Observer:
 
         if pred_grid is None:
             pred_grid = torch.zeros((1, 1), dtype=torch.long)
-        
+
         input_text = self._create_grid_text(input_grid, "Input")
         target_text = self._create_grid_text(target_grid, "Target")
         pred_text = self._create_grid_text(pred_grid, "Prediction")
@@ -64,10 +64,10 @@ class Observer:
         self.console.print()
 
     def log_eval_summary(self, metrics: dict[str, float], step: int):
-        eval_loss = metrics.get('eval_loss', 0)
-        eval_acc = metrics.get('eval_acc', 0)
+        eval_loss = metrics.get('eval_loss', 0.0)
+        eval_grid_acc = metrics.get('eval_grid_acc', 0.0)
         total_count = int(metrics.get('total_count', 0))
-        summary_text = f"Avg Loss: {eval_loss:.4f} | Token Accuracy: {eval_acc:.4f} on {total_count} samples."
+        summary_text = f"Avg Loss: {eval_loss:.4f} | Grid Accuracy: {eval_grid_acc:.4f} on {total_count} samples."
         self.console.print(Padding(f"[bold yellow]===== EVALUATION COMPLETE (Step: {step}) =====\n"
                                    f"{summary_text}\n"
                                    f"=============================================[/bold yellow]", (1, 2)))

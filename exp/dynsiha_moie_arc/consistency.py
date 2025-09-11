@@ -56,17 +56,17 @@ class ConsistencyTools:
     def apply_transforms(cls, grids: torch.Tensor) -> torch.Tensor:
         transforms = cls.get_transforms()
         transformed_grids = [transform(grids) for transform in transforms]
-        
+
         max_h = max(g.shape[-2] for g in transformed_grids)
         max_w = max(g.shape[-1] for g in transformed_grids)
-        
+
         padded_grids = []
         for grid in transformed_grids:
             pad_h = max_h - grid.shape[-2]
             pad_w = max_w - grid.shape[-1]
             padded_grid = F.pad(grid, (0, pad_w, 0, pad_h), "constant", 0)
             padded_grids.append(padded_grid)
-            
+
         return torch.stack(padded_grids, dim=0)
 
     @classmethod

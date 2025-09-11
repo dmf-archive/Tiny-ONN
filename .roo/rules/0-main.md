@@ -60,30 +60,3 @@
 
 </workflow_and_safety>
 
-## 3. Tiny-ONN 专用术语表
-
-### 核心项目术语
-
-- **ONN (Ouroboros Neural Network)**: 一种`动态稀疏激活`的`IPWT/FEP-AI`。
-- **PI (Predictive Integrity)**: 预测完整性，一个用于实时监控模型“认知健康度”的功能性代理指标。其核心假设是，一个能够高效进行信息整合（高 Ωₜ）的系统，必然会展现出更强的预测能力（低误差 ε）、更高的状态稳定性（低模型不确定性 τ）和更低的整合成本（低惊奇度 Surprise）。
-- **SMK (Surprise Min_K)**: 一种基于“惊奇度”的`选择性梯度更新策略`。在 MoE 架构中，当多个专家被激活并计算梯度后，SMK 策略仅保留梯度范数（Surprise）最小的 `min_k` 个专家的梯度用于参数更新，其余专家的梯度被置零。SMK 已经被弃用，但其思想启发了 SML。
-- **EAVI (Excursion-Alignment Variational Inference)**: 一种曾被探索用于解决 Teacher Forcing 暴露偏差的`对齐微调`范式。其核心思想是通过对模型独立生成的完整序列进行全局对齐来提供更强的学习信号。后因其无法从根本上解决暴露偏差问题，且增加了训练流程的复杂性而被**弃用**。
-
-### 机制：辅助损失函数
-
-- **SML (Surprise Minimization Loss)**: 一种`元学习门控损失`。其核心假设是，一个高效的路由应该将信息分配给能以最低“扰动”处理它的专家。“扰动”（即`Surprise`）在计算上被定义为**主任务损失对各专家输出的梯度范数**。门控层通过 SML 选择能产生最低 `Surprise` 的专家。该实现仅利用一阶梯度信息来优化门控参数，不涉及梯度的梯度计算，因此计算开销实际极小。
-- **SDL (Sparse-Diversity Loss)**: 一种`启发式门控损失`，由两个子任务构成。**稀疏性损失 (Sparsity Loss)** 鼓励每一步激活的专家数量接近一个预设的目标值。**多样性损失 (Diversity Loss)** 通过惩罚门控网络中专家原型向量之间的相似性，来鼓励专家功能的分化。SDL 是原始 `DynMoE` 论文中使用的辅助损失函数。
-
-### 机制：动态函数合成
-
-- **SBL（Sparse Bayesian Linear）/MoIE (Mixture of Infinite Experts)**: 一种将稠密权重矩阵视为**连续专家空间**的`动态稀疏`范式。它通过一种“神经元注意力”机制，为每个输入动态地从该空间中“采样”出一个临时的、专用的稀疏子网络。其核心是实现了“前向稠密，反向稀疏”的特性，并由 `SML` 引导进行自组织学习。其基本构建块为 `Sparse Bayesian Linear`。
-- **DynSIHA (Dynamic Sparse Infinite-Head Attention)**: `MoIE` 范式在注意力机制中的应用。它将标准注意力中固定的 `Q, K, V` 投影矩阵替换为 `SBL` 层，从而为每个 `token` 动态地、内容感知地“合成”出专用的投影子网络，旨在实现一种可编程的、表达力远超传统多头注意力的机制。
-
-### 机制：动态专家混合
-
-- **DynSMHA (Dynamic Sparse Multi-Head Attention)**: `token` 级别的动态稀疏注意力机制。通过门控网络为每个 `token` 动态选择并激活最合适的“注意力头专家”，取代了标准的 `Multi-Head Attention`。
-- **DynMoE (Dynamic Mixture of Experts)**: `token` 级别的动态计算路由机制。与 `DynSMHA` 类似，它通过门控网络为每个 `token` 激活最合适的 `MLP` 专家，取代了标准的 `Feed-Forward` 层。值得注意的是，`Tiny-ONN` 项目探索使用 `SML` 作为其训练目标，而 `DynMoE` 的原始论文则主要采用 `SDL` 作为其辅助损失。
-
-### 机制：分块注意力
-
-- **NSA (Native Sparse Attention)**: 一种高效的稀疏注意力`forward`优化方法。它通过**全局压缩**、**分块Top-N选择**和**滑动窗口**三种策略的固定组合，来逼近全注意力的性能，同时显著降低计算和内存开销。遗憾的是，它和DynSIHA兼容性不佳。

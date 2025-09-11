@@ -14,7 +14,7 @@
 
 使用 `TensorBoard` 进行细粒度数据记录，使用 `Matplotlib` 生成即时概览图表。
 
-#### 核心指标定义与计算
+### 核心指标定义与计算
 
 | 指标名称 | 计算公式 / 伪代码 | 记录工具 | 描述 |
 | :--- | :--- | :--- | :--- |
@@ -31,7 +31,7 @@
 | **`avg_sigma`** | `mean(softplus(sbl_layer.sigma_weight))` | TB | SBL层权重的平均后验不确定性。 |
 | **`avg_gate`** | `mean(sbl_layer.gate_param)` | TB | SBL层神经元的平均激活阈值。 |
 
-#### Matplotlib 实时图表
+### Matplotlib 实时图表
 
 **图 1: `core_metrics_latest.png`**
 

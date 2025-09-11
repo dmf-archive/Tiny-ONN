@@ -271,8 +271,3 @@ class TinyOnnTrainer(Trainer):
 ### 4.2. `generate()` 方法
 
 只要 `forward` 方法正确实现了 KV 缓存的接口，并返回包含 `logits` 和 `past_key_values` 的 `CausalLMOutputWithPast` 对象，`model.generate()` 即可无缝工作。
-
-### 4.3. 梯度检查点 (关键约束)
-
-- **不兼容性确认**: 基于历史实验 (`exp/RoPE_SBL`) 和 `DeepWiki` 的信息，`torch.utils.checkpoint.checkpoint` 与我们的 SML+KL 训练范式（特别是依赖 `retain_graph=True` 的 SML）存在根本性冲突，会导致 KL 损失的梯度流中断。
-- **当前决策**: **在找到可行的替代方案之前，必须禁用梯度检查点功能。** 这意味着在工程实现阶段，需要接受比标准 Transformer 模型更高的激活值内存占用。此约束是本次技术预研的关键发现，必须在资源规划中予以考虑。
