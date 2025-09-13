@@ -41,8 +41,8 @@ class GridSerializer:
         test_input_grid_ids = self._serialize_grid(task_data['test'][0]['input'])
         test_output_grid_ids = self._serialize_grid(task_data['test'][0]['output'])
 
-        prompt_part1 = context_ids + [self.tokenizer.vocab["<|im_start|>"], self.tokenizer.vocab["problem"]] + test_input_grid_ids + [self.tokenizer.vocab["<|im_end|>"]]
-        prompt_part2 = [self.tokenizer.vocab["<|im_start|>"], self.tokenizer.vocab["solution"]]
+        prompt_part1 = context_ids + [self.tokenizer.vocab["<|im_start|>"], self.tokenizer.vocab["problem"]] + test_input_grid_ids + [self.tokenizer.vocab["<|im_end|>"]] + [self.tokenizer.vocab["<|im_start|>"]]
+        prompt_part2 = [self.tokenizer.vocab["solution"]]
 
         full_ids = prompt_part1 + prompt_part2 + test_output_grid_ids + [self.tokenizer.eos_token_id]
 

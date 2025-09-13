@@ -171,7 +171,7 @@ class Trainer:
             total_elements = sum(rw.numel() for rw in raw_weights)
             activation_rate = active_elements / total_elements if total_elements > 0 else 0.0
 
-            pi_score = torch.exp(-(main_loss + kl_loss)).item()
+            pi_score = torch.exp(-(main_loss + kl_loss + sml_loss)).item()
 
             metrics = {
                 "main_loss": main_loss.item(),
@@ -217,7 +217,7 @@ class Trainer:
                 # Update prior_std based on the dual-layer mechanism
                 avg_sigma = metrics.get('avg_sigma', 0.0)
                 avg_gate = metrics.get('avg_gate', 0.0)
-                beta = torch.sigmoid(torch.tensor(avg_sigma - avg_gate)).item()
+                beta = torch.sigmoid(torch.tensor(avg_gate - avg_sigma)).item()
                 current_tau = metrics.get('avg_tau', self.prior_std)
                 self.prior_std = beta * self.prior_std + (1 - beta) * current_tau
 

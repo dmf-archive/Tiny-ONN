@@ -31,6 +31,6 @@ class TrainConfig:
     # SBL specific
     kl_prior_epsilon: float = 1e-9
 
-    eval_interval: int = 200 # Eval less frequently
+    eval_interval: int = 500 # Eval less frequently
     log_interval: int = 10 # Log more frequently
     max_checkpoints: int = 3

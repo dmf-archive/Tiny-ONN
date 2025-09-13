@@ -1,4 +1,5 @@
 import itertools
+from rich.progress import Progress
 from typing import Any
 
 import torch
@@ -94,50 +95,56 @@ class EvaluationStep:
         total_grid_acc, evaluated_count = 0, 0
         visualized = False
 
-        for batch in itertools.islice(eval_loader, num_samples_to_eval):
-            if not batch: continue
+        with Progress(console=self.observer.console, transient=True) as progress:
+            task = progress.add_task(f"[cyan]Running {eval_title}...", total=num_samples_to_eval)
 
-            task_data = batch['task_data'][0]
-            input_grid_raw = torch.tensor(task_data['test'][0]['input'])
-            target_grid_raw = torch.tensor(task_data['test'][0]['output'])
+            for batch in itertools.islice(eval_loader, num_samples_to_eval):
+                if not batch:
+                    progress.update(task, advance=1)
+                    continue
 
-            prompt_ids = self.serializer.serialize_for_inference(task_data)
-            prompt_tensor = torch.tensor(prompt_ids, dtype=torch.long, device=self.device).unsqueeze(0)
+                task_data = batch['task_data'][0]
+                input_grid_raw = torch.tensor(task_data['test'][0]['input'])
+                target_grid_raw = torch.tensor(task_data['test'][0]['output'])
 
-            h, w = target_grid_raw.shape
-            max_new_tokens = int(h * w * 1.5) + 30
+                prompt_ids = self.serializer.serialize_for_inference(task_data)
+                prompt_tensor = torch.tensor(prompt_ids, dtype=torch.long, device=self.device).unsqueeze(0)
 
-            solutions = self.dfs_generate(
-                input_ids=prompt_tensor,
-                max_new_tokens=max_new_tokens,
-                eos_token_id=self.serializer.tokenizer.eos_token_id,
-                threshold=-5.0
-            )
+                h, w = target_grid_raw.shape
+                max_new_tokens = int(h * w * 1.5) + 30
 
-            pred_grid_1, pred_grid_2 = None, None
-            is_correct = 0
+                solutions = self.dfs_generate(
+                    input_ids=prompt_tensor,
+                    max_new_tokens=max_new_tokens,
+                    eos_token_id=self.serializer.tokenizer.eos_token_id,
+                    threshold=-5.0
+                )
 
-            if solutions:
-                prompt_len = prompt_tensor.shape[1]
-                pred_tokens_1 = solutions[0][1][0, prompt_len:].tolist()
-                pred_grid_1 = self.deserializer.deserialize(pred_tokens_1)
+                pred_grid_1, pred_grid_2, pred_tokens_1 = None, None, None
+                is_correct = 0
 
-                if torch.equal(pred_grid_1, target_grid_raw):
-                    is_correct = 1
-                elif len(solutions) > 1:
-                    pred_tokens_2 = solutions[1][1][0, prompt_len:].tolist()
-                    pred_grid_2 = self.deserializer.deserialize(pred_tokens_2)
-                    if torch.equal(pred_grid_2, target_grid_raw):
+                if solutions:
+                    prompt_len = prompt_tensor.shape[1]
+                    pred_tokens_1 = solutions[0][1][0, prompt_len:].tolist()
+                    pred_grid_1 = self.deserializer.deserialize(pred_tokens_1)
+
+                    if torch.equal(pred_grid_1, target_grid_raw):
                         is_correct = 1
+                    elif len(solutions) > 1:
+                        pred_tokens_2 = solutions[1][1][0, prompt_len:].tolist()
+                        pred_grid_2 = self.deserializer.deserialize(pred_tokens_2)
+                        if torch.equal(pred_grid_2, target_grid_raw):
+                            is_correct = 1
 
-            if not visualized:
-                self.observer.visualize_evaluation_sample(input_grid_raw, target_grid_raw, pred_grid_1, global_step)
-                if verbose and solutions:
-                    self.observer.console.print(f"[bold]Top solution decoded:[/bold] {self.serializer.tokenizer.decode(pred_tokens_1)}")
-                visualized = True
+                if not visualized:
+                    self.observer.visualize_evaluation_sample(input_grid_raw, target_grid_raw, pred_grid_1, global_step)
+                    if solutions and pred_tokens_1:
+                        self.observer.console.print(f"[bold]Top-1 Raw Tokens:[/bold] {pred_tokens_1}")
+                    visualized = True
 
-            total_grid_acc += is_correct
-            evaluated_count += 1
+                total_grid_acc += is_correct
+                evaluated_count += 1
+                progress.update(task, advance=1)
 
         avg_grid_acc = total_grid_acc / evaluated_count if evaluated_count > 0 else 0
         metrics = {"eval_grid_acc": avg_grid_acc, "total_count": float(evaluated_count)}

@@ -1,5 +1,5 @@
 import torch
-from rich.columns import Columns
+from rich.table import Table
 from rich.console import Console
 from rich.padding import Padding
 from rich.text import Text
@@ -38,15 +38,16 @@ class Observer:
         )
         self.console.print(log_str)
 
-    def _create_grid_text(self, grid: torch.Tensor, title: str) -> Text:
-        text = Text(f"{title}\n", style="bold")
+    def _create_grid_text(self, grid: torch.Tensor) -> Text:
+        text = Text()
         h, w = grid.shape
         for r in range(h):
             for p in range(w):
                 pixel = grid[r, p].item()
                 color = self.ARC_COLORS[pixel] if 0 <= pixel < len(self.ARC_COLORS) else "white"
                 text.append("■ ", style=color)
-            text.append("\n")
+            if r < h - 1:
+                text.append("\n")
         return text
 
     def visualize_evaluation_sample(self, input_grid: torch.Tensor, target_grid: torch.Tensor, pred_grid: torch.Tensor, step: int):
@@ -56,11 +57,17 @@ class Observer:
         if pred_grid is None:
             pred_grid = torch.zeros((1, 1), dtype=torch.long)
 
-        input_text = self._create_grid_text(input_grid, "Input")
-        target_text = self._create_grid_text(target_grid, "Target")
-        pred_text = self._create_grid_text(pred_grid, "Prediction")
+        table = Table(show_header=True, header_style="bold magenta", expand=True)
+        table.add_column("Input", justify="center")
+        table.add_column("Target", justify="center")
+        table.add_column("Prediction", justify="center")
 
-        self.console.print(Columns([input_text, target_text, pred_text], expand=True, equal=True))
+        input_text = self._create_grid_text(input_grid)
+        target_text = self._create_grid_text(target_grid)
+        pred_text = self._create_grid_text(pred_grid)
+
+        table.add_row(input_text, target_text, pred_text)
+        self.console.print(table)
         self.console.print()
 
     def log_eval_summary(self, metrics: dict[str, float], step: int):
