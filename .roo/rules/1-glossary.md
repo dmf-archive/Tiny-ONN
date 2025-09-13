@@ -12,7 +12,7 @@
   - **SMLv1 (事后信用分配)**: 通过计算主任务损失对**最终门控输出 (masked_output)** 的梯度来评估“惊奇度”。这是一种**事后**机制，用于惩罚已被激活但对任务贡献不佳的神经元。
     - **代码实现**: [`exp/sparse_bayesian_linear/train.py`](exp/sparse_bayesian_linear/train.py)
   - **SMLv2 (事前路径规划)**: 通过计算主任务损失对**稠密预计算输出 (computation_output)** 的梯度来评估“惊奇度”。这是一种**事前**机制，它利用一个完整的“惊奇场”来指导门控主动规避潜在的高成本计算路径，从而加速自组织过程。
-    - **代码实现**: [`exp/dynsiha_moie_arc/train.py`](exp/dynsiha_moie_arc/train.py)
+    - **代码实现**: [`exp/arc/train.py`](exp/arc/train.py)
 - **SDL (Sparse-Diversity Loss)**: 一种`启发式门控损失`，由两个子任务构成。**稀疏性损失 (Sparsity Loss)** 鼓励每一步激活的专家数量接近一个预设的目标值。**多样性损失 (Diversity Loss)** 通过惩罚门控网络中专家原型向量之间的相似性，来鼓励专家功能的分化。SDL 是原始 `DynMoE` 论文中使用的辅助损失函数。
 
 ## 机制：动态函数合成

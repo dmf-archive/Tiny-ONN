@@ -1,4 +1,3 @@
-import itertools
 import os
 import time
 from pathlib import Path
@@ -12,6 +11,7 @@ from torch.utils.data import DataLoader
 from .config import TrainConfig
 from .consistency import ConsistencyTools
 from .data import ArcCollator, ArcDataset, GridDeserializer, GridSerializer
+from .evaluation import EvaluationStep
 from .model import ArcTransformer
 from .observer import Observer
 from .tokenizer import ArcColorTokenizer
@@ -66,6 +66,7 @@ class Trainer:
 
         self.optimizer = torch.optim.AdamW(param_groups)
         self.consistency_tools = ConsistencyTools()
+        self.evaluator = EvaluationStep(self.model, self.serializer, self.deserializer, self.observer, self.device)
 
         self.checkpoint_dir = Path(__file__).parent / "checkpoints"
         self.checkpoint_dir.mkdir(exist_ok=True)
@@ -118,10 +119,10 @@ class Trainer:
         transforms = self.consistency_tools.get_transforms()
         input_grid_aug = transforms[view_idx](input_grid)
         output_grid_aug = transforms[view_idx](output_grid)
-        
+
         view_task_data = {'train': task_data['train'], 'test': [{'input': input_grid_aug.tolist(), 'output': output_grid_aug.tolist()}]}
         input_ids_list, labels_list = self.serializer.serialize_task_with_context(view_task_data)
-        
+
         if len(input_ids_list) > self.config.model.max_position_embeddings:
             return None
 
@@ -131,14 +132,14 @@ class Trainer:
         logits, masked_outputs, computation_outputs, raw_weights, kl_loss, _, _ = self.model(
             input_ids, self.prior_std, kl_epsilon
         )
-        
+
         shifted_logits = logits[:, :-1, :]
         shifted_labels = labels[:, 1:]
         main_loss = F.cross_entropy(
             shifted_logits.contiguous().view(-1, self.config.model.vocab_size),
             shifted_labels.contiguous().view(-1), ignore_index=-100
         )
-        
+
         sml_loss = torch.tensor(0.0, device=self.device)
         if computation_outputs:
             active_elements = sum((rw > 1e-5).float().sum().item() for rw in raw_weights)
@@ -156,10 +157,10 @@ class Trainer:
                     if active_surprise.numel() > 0:
                         weighted_surprise = active_surprise * activation_rate
                         sml_loss += (-torch.log(weighted_surprise + 1e-9) * weighted_surprise).sum()
-        
+
         with torch.no_grad():
             avg_tau = torch.distributions.Categorical(logits=logits).entropy().mean()
-        
+
         w_sml = -torch.log(avg_tau + kl_epsilon)
         total_loss = main_loss + kl_loss + w_sml * sml_loss
 
@@ -169,7 +170,7 @@ class Trainer:
             active_elements = sum((rw > 0).float().sum().item() for rw in raw_weights)
             total_elements = sum(rw.numel() for rw in raw_weights)
             activation_rate = active_elements / total_elements if total_elements > 0 else 0.0
-            
+
             pi_score = torch.exp(-(main_loss + kl_loss)).item()
 
             metrics = {
@@ -192,27 +193,27 @@ class Trainer:
 
     def _train_epoch(self, epoch: int):
         self.model.train()
-        for i, batch in enumerate(self.train_loader):
+        for _i, batch in enumerate(self.train_loader):
             if not batch: continue
-            
+
             task_data = batch['task_data'][0]
 
             for view_idx in range(8): # Treat each view as a separate training step
                 start_time = time.time()
-                
+
                 step_output = self._run_tf_step(task_data, view_idx)
                 if step_output is None:
                     continue
-                
+
                 loss, metrics = step_output
-                
+
                 if loss.item() == 0.0: continue
 
                 self.optimizer.zero_grad()
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
                 self.optimizer.step()
-                
+
                 # Update prior_std based on the dual-layer mechanism
                 avg_sigma = metrics.get('avg_sigma', 0.0)
                 avg_gate = metrics.get('avg_gate', 0.0)
@@ -225,75 +226,14 @@ class Trainer:
 
                 if self.global_step > 0 and self.global_step % self.config.log_interval == 0:
                     self.observer.log_step(epoch, self.global_step, metrics, elapsed_time)
-                
+                    self._save_checkpoint()
+
                 if self.global_step > 0 and (self.global_step % self.config.eval_interval == 0):
-                    self.evaluate(quick_eval=True)
-                    self._save_checkpoint() # Save checkpoint after eval
+                    self.evaluator.run(self.eval_loader, self.global_step, quick_eval=True)
 
                 self.global_step += 1
 
         self.console.print(f"[bold yellow]End of Epoch {epoch}.[/bold yellow]")
-
-    @torch.no_grad()
-    def evaluate(self, quick_eval: bool = True, verbose: bool = True):
-        self.model.eval()
-        torch.cuda.empty_cache()
-        eval_title = "Quick Eval" if quick_eval and len(self.eval_loader) > 10 else "Full Eval"
-        num_samples_to_eval = 10 if quick_eval and len(self.eval_loader) > 10 else len(self.eval_loader)
-        self.console.print(f"\n[bold cyan]--- Running {eval_title} ({num_samples_to_eval} samples) ---[/bold cyan]")
-
-        total_grid_acc, evaluated_count = 0, 0
-        visualized = False
-
-        for i, batch in enumerate(itertools.islice(self.eval_loader, num_samples_to_eval)):
-            if not batch: continue
-
-            task_data = batch['task_data'][0]
-            input_grid_raw = torch.tensor(task_data['test'][0]['input'])
-            target_grid_raw = torch.tensor(task_data['test'][0]['output'])
-
-            prompt_ids = self.serializer.serialize_for_inference(task_data)
-            prompt_tensor = torch.tensor(prompt_ids, dtype=torch.long, device=self.device).unsqueeze(0)
-
-            h, w = target_grid_raw.shape
-            max_new_tokens = int(h * w * 1.5) + 30
-
-            solutions = self.model.dfs_generate(
-                input_ids=prompt_tensor,
-                max_new_tokens=max_new_tokens,
-                eos_token_id=self.tokenizer.eos_token_id,
-                threshold=-5.0
-            )
-            
-            pred_grid_1, pred_grid_2 = None, None
-            is_correct = 0
-            
-            if solutions:
-                prompt_len = prompt_tensor.shape[1]
-                pred_tokens_1 = solutions[0][1][0, prompt_len:].tolist()
-                pred_grid_1 = self.deserializer.deserialize(pred_tokens_1)
-                
-                if torch.equal(pred_grid_1, target_grid_raw):
-                    is_correct = 1
-                elif len(solutions) > 1:
-                    pred_tokens_2 = solutions[1][1][0, prompt_len:].tolist()
-                    pred_grid_2 = self.deserializer.deserialize(pred_tokens_2)
-                    if torch.equal(pred_grid_2, target_grid_raw):
-                        is_correct = 1
-
-            if not visualized:
-                self.observer.visualize_evaluation_sample(input_grid_raw, target_grid_raw, pred_grid_1, self.global_step)
-                if verbose and solutions:
-                    self.console.print(f"[bold]Top solution decoded:[/bold] {self.tokenizer.decode(pred_tokens_1)}")
-                visualized = True
-
-            total_grid_acc += is_correct
-            evaluated_count += 1
-
-        avg_grid_acc = total_grid_acc / evaluated_count if evaluated_count > 0 else 0
-        eval_metrics = {"eval_grid_acc": avg_grid_acc, "total_count": float(evaluated_count)}
-        self.observer.log_eval_summary(eval_metrics, self.global_step)
-        self.model.train()
 
     def train(self):
         self._load_checkpoint()

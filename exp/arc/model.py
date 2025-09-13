@@ -75,7 +75,7 @@ class SparseBayesianLinear(nn.Module):
         mu_q = self.mu_weight
         sigma_q = F.softplus(self.sigma_weight)
         var_q = sigma_q.pow(2)
-        
+
         mu_p = torch.zeros_like(mu_q)
         var_p = torch.full_like(sigma_q, prior_std).pow(2)
 
@@ -83,18 +83,10 @@ class SparseBayesianLinear(nn.Module):
         kl_loss = kl_div.mean()
 
         if torch.isnan(kl_loss).any() or torch.isinf(kl_loss).any():
-            print(f"SBL KL Loss is NaN/Inf!")
+            print("SBL KL Loss is NaN/Inf!")
             print(f"var_p: {var_p.mean().item()}, var_q: {var_q.mean().item()}, mu_norm: {self.mu_weight.pow(2).mean().item()}")
 
         return output, masked_output, computation_output, raw_weights, kl_loss
-
-    def update_priors(self) -> None:
-        """
-        A method to be called after each optimizer step to update the priors.
-        This is now handled inside forward to be safer with JIT and graph tracing.
-        Kept as a placeholder in case of future design changes.
-        """
-        pass
 
 class DynamicInfiniteHeadAttention(nn.Module):
     def __init__(self, config: ModelConfig, dtype: torch.dtype = torch.float32):
@@ -181,11 +173,8 @@ class MoIETransformerBlock(nn.Module):
         ffn_out, ffn_m, ffn_c, ffn_rw, ffn_kl = self.ffn(ffn_in, prior_std, kl_epsilon)
         x = x + ffn_out
 
-        layer_entropy = torch.tensor(0.0, device=x.device)
-        # The with torch.no_grad() is not JIT-compatible
-        # with torch.no_grad():
-        #     probs = F.softmax(x, dim=-1)
-        #     layer_entropy = -(probs * torch.log(probs + 1e-9)).sum(dim=-1).mean()
+        probs = F.softmax(x, dim=-1)
+        layer_entropy = -(probs * torch.log(probs + 1e-9)).sum(dim=-1).mean()
 
         total_kl_loss = attn_kl + ffn_kl
         masked_outputs = attn_m + ffn_m
@@ -262,89 +251,3 @@ class ArcTransformer(nn.Module):
         # JIT requires consistent return types. We will return a list of tuples.
         return logits, all_masked_outputs, all_comp_outputs, all_raw_weights, total_kl_loss, layer_taus, present_key_values
 
-    @torch.no_grad()
-    def generate(self, input_ids: torch.Tensor, max_new_tokens: int, eos_token_id: int, pad_token_id: int | None = None, use_cache: bool = True):
-        self.eval()
-        past_key_values = None
-        
-        for _ in range(max_new_tokens):
-            if past_key_values is None or not use_cache:
-                model_input = input_ids
-            else:
-                model_input = input_ids[:, -1:]
-
-            logits, _, _, _, _, _, pkv = self.forward(
-                model_input, prior_std=1.0, kl_epsilon=self.config.kl_prior_epsilon, past_key_values=past_key_values if use_cache else None
-            )
-            if use_cache:
-                past_key_values = pkv
-
-            next_token = torch.argmax(logits[:, -1, :], dim=-1).unsqueeze(-1)
-            
-            input_ids = torch.cat([input_ids, next_token], dim=1)
-            
-            if eos_token_id is not None and next_token.item() == eos_token_id:
-                break
-        
-        self.train()
-        return input_ids
-
-    @torch.no_grad()
-    def dfs_generate(
-        self,
-        input_ids: torch.Tensor,
-        max_new_tokens: int,
-        eos_token_id: int,
-        threshold: float
-    ) -> list[tuple[float, torch.Tensor]]:
-        self.eval()
-        
-        past_key_values: list[tuple[torch.Tensor, torch.Tensor] | None] = [None] * self.num_layers
-        valid_sequences: list[tuple[float, torch.Tensor]] = []
-        max_len = input_ids.shape[1] + max_new_tokens
-
-        def _explore(tokens: torch.Tensor, score: float):
-            nonlocal past_key_values
-            if tokens.shape[1] >= max_len or tokens[0, -1] == eos_token_id:
-                if tokens[0, -1] == eos_token_id:
-                    valid_sequences.append((score, tokens.clone()))
-                return
-
-            len_before_recursion = tokens.shape[1]
-            model_input = tokens if past_key_values[0] is None else tokens[:, -1:]
-
-            logits, _, _, _, _, _, past_key_values = self.forward(
-                model_input, prior_std=1.0, kl_epsilon=1e-9, past_key_values=past_key_values
-            )
-
-            next_token_logits = logits[:, -1, :]
-            next_token_log_prob = F.log_softmax(next_token_logits, dim=-1)
-            
-            top_k_log_probs, top_k_indices = torch.topk(next_token_log_prob, k=50, dim=-1)
-
-            for i in range(top_k_indices.shape[1]):
-                token_id = top_k_indices[0, i]
-                log_prob = top_k_log_probs[0, i].item()
-                next_score = score + log_prob
-
-                if next_score >= threshold:
-                    next_tokens = torch.cat([tokens, token_id.view(1, 1)], dim=1)
-                    _explore(next_tokens, next_score)
-
-            # KV Cache Pruning / Backtracking
-            if past_key_values[0] is not None:
-                trimmed_pkv: list[tuple[torch.Tensor, torch.Tensor] | None] = []
-                for k_v_pair in past_key_values:
-                    if k_v_pair is not None:
-                        k, v = k_v_pair
-                        k = k[:, :len_before_recursion, :]
-                        v = v[:, :len_before_recursion, :]
-                        trimmed_pkv.append((k, v))
-                    else:
-                        trimmed_pkv.append(None)
-                past_key_values = trimmed_pkv
-
-        _explore(input_ids.clone(), 0.0)
-
-        self.train()
-        return sorted(valid_sequences, key=lambda x: x[0], reverse=True)
