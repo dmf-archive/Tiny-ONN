@@ -1,5 +1,5 @@
-from typing import Optional
 from dataclasses import dataclass, field
+
 
 @dataclass
 class ModelConfig:
@@ -20,16 +20,21 @@ class TrainConfig:
     model: ModelConfig = field(default_factory=ModelConfig)
     data: DataConfig = field(default_factory=DataConfig)
 
-    base_learning_rate: float = 3e-3
-    prior_learning_rate: float = 3e-2
+    base_learning_rate: float = 3e-4
+    proto_learning_rate: float = 3e-3
+    gate_learning_rate: float = 3e-2
+
     weight_decay: float = 0.0
     num_epochs: int = 100
 
     device: str = "cuda"
     seed: int = 42
 
-    # SBL specific
-    kl_prior_epsilon: float = 1e-9
+    gate_loss_weight: float = 1.0
+    diversity_loss_weight: float = 1.0
+    kl_loss_weight: float = 0.1
+    gate_convergence_tolerance: float = 1e-4
+    max_mcmc_iterations: int = 100
 
     eval_interval: int = 10000 # Eval less frequently
     log_interval: int = 10 # Log more frequently
@@ -43,5 +48,5 @@ class GenerationConfig:
     top_p: float = 1.0
     top_k: int = 50
     temperature: float = 1.0
-    eos_token_id: Optional[int] = None
+    eos_token_id: int | None = None
     num_return_sequences: int = 1

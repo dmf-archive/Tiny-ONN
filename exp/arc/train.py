@@ -25,8 +25,6 @@ class Trainer:
 
         self.console = Console()
         self.observer = Observer(self.console, config)
-        self.tau_ema = torch.tensor(3.0, device=self.device)
-
         self.tokenizer = ArcColorTokenizer()
         self.serializer = GridSerializer(self.tokenizer)
         self.deserializer = GridDeserializer(self.tokenizer)
@@ -48,16 +46,14 @@ class Trainer:
         self.config.model.vocab_size = self.tokenizer.vocab_size
         self.model = ArcTransformer(self.config.model, device=self.device).to(self.device)
 
-        proto_params = [p for name, p in self.model.named_parameters() if 'proto_weight' in name]
-        gate_params = [p for name, p in self.model.named_parameters() if 'gate_param' in name]
-        base_params = [p for name, p in self.model.named_parameters() if 'proto_weight' not in name and 'gate_param' not in name]
-
+        # SPLv2: Unified optimizer for global loss optimization
         param_groups = [
-            {'params': base_params, 'lr': self.config.base_learning_rate, 'weight_decay': self.config.weight_decay},
-            {'params': proto_params, 'lr': self.config.prior_learning_rate, 'weight_decay': 0.0},
-            {'params': gate_params, 'lr': self.config.prior_learning_rate, 'weight_decay': 0.0}
+            {'params': [p for name, p in self.model.named_parameters() if 'mu_' in name or 'embedding' in name or 'lm_head' in name or 'ln' in name], 'lr': config.base_learning_rate},
+            {'params': [p for name, p in self.model.named_parameters() if 'proto_weight' in name], 'lr': config.proto_learning_rate},
+            {'params': [p for name, p in self.model.named_parameters() if 'gate_param' in name], 'lr': config.gate_learning_rate}
         ]
-        self.optimizer = torch.optim.AdamW(param_groups)
+        self.optimizer = torch.optim.AdamW(param_groups, weight_decay=config.weight_decay)
+
         self.consistency_tools = ConsistencyTools()
         self.evaluator = EvaluationStep(self.model, self.serializer, self.deserializer, self.observer, self.device)
 
@@ -70,7 +66,6 @@ class Trainer:
             'step': self.global_step,
             'model_state_dict': self.model.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
-            'tau_ema': self.tau_ema
         }
         filepath = self.checkpoint_dir / f"checkpoint_{self.global_step}.pt"
         torch.save(state, filepath)
@@ -85,9 +80,9 @@ class Trainer:
         latest_checkpoint = checkpoints[0]
         checkpoint = torch.load(latest_checkpoint, map_location=self.device)
         self.model.load_state_dict(checkpoint['model_state_dict'])
+
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         self.global_step = checkpoint['step']
-        self.tau_ema = checkpoint.get('tau_ema', torch.tensor(3.0, device=self.device))
         self.console.print(f"[bold blue]Loaded checkpoint from {latest_checkpoint} at step {self.global_step}[/bold blue]")
 
     def _calculate_token_accuracy(self, logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
@@ -105,127 +100,110 @@ class Trainer:
         preds = torch.argmax(active_logits, dim=-1)
         return (preds == active_labels).float().mean()
 
-    def _run_tf_step(self, task_data: dict[str, Any], view_idx: int) -> tuple[torch.Tensor, dict[str, Any]] | None:
+    def _calculate_diversity_loss(self, proto_weights: list[torch.Tensor]) -> torch.Tensor:
+        if not proto_weights: return torch.tensor(0.0, device=self.device)
+        losses = [1.0 - F.cosine_similarity(p.unsqueeze(0), p.unsqueeze(1), dim=-1).abs().mean() for p in proto_weights if p.dim() > 1]
+        return torch.stack(losses).mean() if losses else torch.tensor(0.0, device=self.device)
+
+    def _calculate_kl_proto_loss(self, proto_weights: list[torch.Tensor], tau: torch.Tensor) -> torch.Tensor:
+        if not proto_weights: return torch.tensor(0.0, device=self.device)
+
+        kl_losses = []
+        tau_sq = tau.square().clamp(min=1e-9)
+
+        for p in proto_weights:
+            if p.dim() > 1:
+                p_norm_sq = p.norm(p=2, dim=1).square().clamp(min=1e-9)
+                # Formula from SPL.md: 0.5 * [ (1 / (||p||² * τ²)) - 1 + ln(τ² * ||p||²) ]
+                kl_div = 0.5 * ( (1 / (p_norm_sq * tau_sq)) - 1 + torch.log(tau_sq * p_norm_sq) )
+                kl_losses.append(kl_div.mean())
+
+        return torch.stack(kl_losses).mean() if kl_losses else torch.tensor(0.0, device=self.device)
+
+    def _calculate_sml_loss(self, main_loss: torch.Tensor, computation_outputs: list[torch.Tensor]) -> torch.Tensor:
+        if not computation_outputs or not torch.isfinite(main_loss):
+            return torch.tensor(0.0, device=self.device)
+
+        surprise_grads = torch.autograd.grad(main_loss, computation_outputs, retain_graph=True, allow_unused=True)
+
+        sml_components = []
+        for grad in surprise_grads:
+            if grad is not None:
+                surprise_per_neuron = grad.norm(p=2, dim=-1)
+                clamped_surprise = surprise_per_neuron.clamp(min=1e-9)
+                sml_loss_per_neuron = -clamped_surprise.log() * clamped_surprise
+                sml_components.append(sml_loss_per_neuron.mean())
+
+        return torch.stack(sml_components).mean() if sml_components else torch.tensor(0.0, device=self.device)
+
+    def _run_step(self, task_data: dict[str, Any], view_idx: int, epoch: int):
+        start_time = time.time()
+        transforms = self.consistency_tools.get_transforms()
         input_grid = torch.tensor(task_data['test'][0]['input'])
         output_grid = torch.tensor(task_data['test'][0]['output'])
-
-        transforms = self.consistency_tools.get_transforms()
-        input_grid_aug = transforms[view_idx](input_grid)
-        output_grid_aug = transforms[view_idx](output_grid)
+        input_grid_aug, output_grid_aug = transforms[view_idx](input_grid), transforms[view_idx](output_grid)
 
         view_task_data = {'train': task_data['train'], 'test': [{'input': input_grid_aug.tolist(), 'output': output_grid_aug.tolist()}]}
         input_ids_list, labels_list = self.serializer.serialize_task_with_context(view_task_data)
 
-        if len(input_ids_list) > self.config.model.max_position_embeddings:
-            return None
+        if len(input_ids_list) > self.config.model.max_position_embeddings: return
 
         input_ids = torch.tensor([input_ids_list], dtype=torch.long, device=self.device)
         labels = torch.tensor([labels_list], dtype=torch.long, device=self.device)
 
         logits, _, computation_outputs, raw_weights, proto_weights, layer_taus, _ = self.model(input_ids)
 
-        shifted_logits = logits[:, :-1, :]
-        shifted_labels = labels[:, 1:]
-        main_loss = F.cross_entropy(
-            shifted_logits.contiguous().view(-1, self.config.model.vocab_size),
-            shifted_labels.contiguous().view(-1), ignore_index=-100
-        )
+        main_loss = F.cross_entropy(logits[:, :-1, :].contiguous().view(-1, self.config.model.vocab_size), labels[:, 1:].contiguous().view(-1), ignore_index=-100)
 
-        sml_loss = torch.tensor(0.0, device=self.device)
-        if computation_outputs:
-            surprise_grads = torch.autograd.grad(
-                main_loss, computation_outputs, retain_graph=True, allow_unused=True
-            )
-            
-            sml_components = []
-            for grad, rw in zip(surprise_grads, raw_weights):
-                if grad is not None and torch.isfinite(grad).all():
-                    surprise_magnitude = grad.norm().detach()
-                    avg_activation = rw.mean()
-                    sml_components.append(surprise_magnitude * avg_activation)
-            
-            if sml_components:
-                sml_loss = torch.stack(sml_components).mean()
+        sml_loss = self._calculate_sml_loss(main_loss, computation_outputs)
+        diversity_loss = self._calculate_diversity_loss(proto_weights)
 
-        diversity_loss = torch.tensor(0.0, device=self.device)
-        if proto_weights:
-            all_protos = torch.cat([p.view(-1, p.shape[-1]) for p in proto_weights], dim=0)
-            if all_protos.shape[0] > 1:
-                normed_protos = F.normalize(all_protos, p=2, dim=1)
-                cosine_sim = torch.matmul(normed_protos, normed_protos.t())
-                diversity_loss = (torch.abs(cosine_sim) - torch.eye(cosine_sim.shape[0], device=self.device)).pow(2).mean()
+        avg_tau = layer_taus.mean().detach()
+        kl_proto_loss = self._calculate_kl_proto_loss(proto_weights, avg_tau)
 
-        with torch.no_grad():
-            avg_tau = layer_taus.mean()
-            all_gates = [p for name, p in self.model.named_parameters() if 'gate_param' in name]
-            avg_gate = torch.mean(torch.stack([g.mean() for g in all_gates])).item() if all_gates else 0.0
-            
-            beta = torch.sigmoid(torch.tensor(avg_gate, device=self.device))
-            self.tau_ema = beta * self.tau_ema + (1 - beta) * avg_tau
+        total_loss = (main_loss +
+                      self.config.gate_loss_weight * sml_loss +
+                      self.config.diversity_loss_weight * diversity_loss +
+                      self.config.kl_loss_weight * kl_proto_loss)
 
-        w_meta = -torch.log(self.tau_ema + 1e-9)
-        meta_loss = sml_loss + diversity_loss
-        total_loss = main_loss + w_meta * meta_loss
+        if torch.isfinite(total_loss):
+            self.optimizer.zero_grad()
+            total_loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+            self.optimizer.step()
 
         with torch.no_grad():
             token_acc = self._calculate_token_accuracy(logits, labels).item()
-            pi_score = torch.exp(-(main_loss + meta_loss)).item()
+            pi_score = torch.exp(-main_loss).item()
+            all_gates = [p for name, p in self.model.named_parameters() if 'gate_param' in name]
+            avg_gate = torch.mean(torch.stack([g.mean() for g in all_gates])).item() if all_gates else 0.0
+            activation_rate = torch.cat([rw.view(-1) for rw in raw_weights]).gt(0).float().mean().item() if raw_weights else 0.0
 
             metrics = {
-                "main_loss": main_loss.item(),
-                "sml_loss": sml_loss.item(),
-                "div_loss": diversity_loss.item(),
-                "total_loss": total_loss.item(),
-                "token_acc": token_acc,
-                "avg_tau": avg_tau.item(),
-                "pi_score": pi_score,
-                "avg_gate": avg_gate,
-                "w_meta": w_meta.item(),
-                "tau_ema": self.tau_ema.item()
+                "main_loss": main_loss.item(), "sml_loss": sml_loss.item(),
+                "div_loss": diversity_loss.item(), "kl_loss": kl_proto_loss.item(),
+                "token_acc": token_acc, "pi_score": pi_score, "avg_tau": avg_tau.item(),
+                "avg_gate": avg_gate, "activation_rate": activation_rate
             }
-            if raw_weights:
-                all_raw_weights = torch.cat([rw.view(-1) for rw in raw_weights])
-                activation_rate = (all_raw_weights > 0).float().mean().item()
-                metrics["activation_rate"] = activation_rate
 
-        return total_loss, metrics
+        elapsed_time = time.time() - start_time
+        if self.global_step % self.config.log_interval == 0:
+            self.observer.log_step(epoch, self.global_step, metrics, elapsed_time)
+
+        if self.global_step > 0 and self.global_step % self.config.eval_interval == 0:
+            self._save_checkpoint()
+            self.evaluator.run(self.eval_loader, self.global_step, quick_eval=True)
+
+        self.global_step += 1
+        torch.cuda.empty_cache()
 
     def _train_epoch(self, epoch: int):
         self.model.train()
         for _i, batch in enumerate(self.train_loader):
             if not batch: continue
-
             task_data = batch['task_data'][0]
-
             for view_idx in range(8):
-                start_time = time.time()
-
-                step_output = self._run_tf_step(task_data, view_idx)
-                if step_output is None:
-                    continue
-
-                loss, metrics = step_output
-
-                if not torch.isfinite(loss):
-                    self.console.print(f"[bold red]Warning: Skipping step {self.global_step} due to non-finite loss.[/bold red]")
-                    continue
-
-                self.optimizer.zero_grad()
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-                self.optimizer.step()
-
-                torch.cuda.empty_cache()
-                elapsed_time = time.time() - start_time
-
-                if self.global_step > 0 and self.global_step % self.config.log_interval == 0:
-                    self.observer.log_step(epoch, self.global_step, metrics, elapsed_time)
-                    self._save_checkpoint()
-
-                if self.global_step > 0 and (self.global_step % self.config.eval_interval == 0):
-                    self.evaluator.run(self.eval_loader, self.global_step, quick_eval=True)
-
-                self.global_step += 1
+                self._run_step(task_data, view_idx, epoch)
 
         self.console.print(f"[bold yellow]End of Epoch {epoch}.[/bold yellow]")
 
