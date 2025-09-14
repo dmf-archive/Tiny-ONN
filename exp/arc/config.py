@@ -1,5 +1,5 @@
+from typing import Optional
 from dataclasses import dataclass, field
-
 
 @dataclass
 class ModelConfig:
@@ -31,6 +31,17 @@ class TrainConfig:
     # SBL specific
     kl_prior_epsilon: float = 1e-9
 
-    eval_interval: int = 500 # Eval less frequently
+    eval_interval: int = 10000 # Eval less frequently
     log_interval: int = 10 # Log more frequently
     max_checkpoints: int = 3
+
+@dataclass
+class GenerationConfig:
+    max_new_tokens: int = 256
+    do_sample: bool = False
+    num_beams: int = 1
+    top_p: float = 1.0
+    top_k: int = 50
+    temperature: float = 1.0
+    eos_token_id: Optional[int] = None
+    num_return_sequences: int = 1

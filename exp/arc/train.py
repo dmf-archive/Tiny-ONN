@@ -25,7 +25,7 @@ class Trainer:
 
         self.console = Console()
         self.observer = Observer(self.console, config)
-        self.prior_std = 1.0
+        self.tau_ema = torch.tensor(3.0, device=self.device)
 
         self.tokenizer = ArcColorTokenizer()
         self.serializer = GridSerializer(self.tokenizer)
@@ -47,23 +47,16 @@ class Trainer:
 
         self.config.model.vocab_size = self.tokenizer.vocab_size
         self.model = ArcTransformer(self.config.model, device=self.device).to(self.device)
-        # self.model = torch.jit.script(self.model)
 
-        # Separate parameter groups for differential learning rates
-        prior_params = []
-        base_params = []
-
-        for name, param in self.model.named_parameters():
-            if 'sigma_weight' in name or 'gate_param' in name:
-                prior_params.append(param)
-            else:
-                base_params.append(param)
+        proto_params = [p for name, p in self.model.named_parameters() if 'proto_weight' in name]
+        gate_params = [p for name, p in self.model.named_parameters() if 'gate_param' in name]
+        base_params = [p for name, p in self.model.named_parameters() if 'proto_weight' not in name and 'gate_param' not in name]
 
         param_groups = [
             {'params': base_params, 'lr': self.config.base_learning_rate, 'weight_decay': self.config.weight_decay},
-            {'params': prior_params, 'lr': self.config.prior_learning_rate, 'weight_decay': self.config.weight_decay}
+            {'params': proto_params, 'lr': self.config.prior_learning_rate, 'weight_decay': 0.0},
+            {'params': gate_params, 'lr': self.config.prior_learning_rate, 'weight_decay': 0.0}
         ]
-
         self.optimizer = torch.optim.AdamW(param_groups)
         self.consistency_tools = ConsistencyTools()
         self.evaluator = EvaluationStep(self.model, self.serializer, self.deserializer, self.observer, self.device)
@@ -76,7 +69,8 @@ class Trainer:
         state = {
             'step': self.global_step,
             'model_state_dict': self.model.state_dict(),
-            'optimizer_state_dict': self.optimizer.state_dict()
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'tau_ema': self.tau_ema
         }
         filepath = self.checkpoint_dir / f"checkpoint_{self.global_step}.pt"
         torch.save(state, filepath)
@@ -93,6 +87,7 @@ class Trainer:
         self.model.load_state_dict(checkpoint['model_state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         self.global_step = checkpoint['step']
+        self.tau_ema = checkpoint.get('tau_ema', torch.tensor(3.0, device=self.device))
         self.console.print(f"[bold blue]Loaded checkpoint from {latest_checkpoint} at step {self.global_step}[/bold blue]")
 
     def _calculate_token_accuracy(self, logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
@@ -111,8 +106,6 @@ class Trainer:
         return (preds == active_labels).float().mean()
 
     def _run_tf_step(self, task_data: dict[str, Any], view_idx: int) -> tuple[torch.Tensor, dict[str, Any]] | None:
-        kl_epsilon = self.config.kl_prior_epsilon
-
         input_grid = torch.tensor(task_data['test'][0]['input'])
         output_grid = torch.tensor(task_data['test'][0]['output'])
 
@@ -129,9 +122,7 @@ class Trainer:
         input_ids = torch.tensor([input_ids_list], dtype=torch.long, device=self.device)
         labels = torch.tensor([labels_list], dtype=torch.long, device=self.device)
 
-        logits, masked_outputs, computation_outputs, raw_weights, kl_loss, _, _ = self.model(
-            input_ids, self.prior_std, kl_epsilon
-        )
+        logits, _, computation_outputs, raw_weights, proto_weights, layer_taus, _ = self.model(input_ids)
 
         shifted_logits = logits[:, :-1, :]
         shifted_labels = labels[:, 1:]
@@ -142,52 +133,60 @@ class Trainer:
 
         sml_loss = torch.tensor(0.0, device=self.device)
         if computation_outputs:
-            active_elements = sum((rw > 1e-5).float().sum().item() for rw in raw_weights)
-            total_elements = sum(rw.numel() for rw in raw_weights)
-            activation_rate = active_elements / total_elements if total_elements > 0 else 0.0
-
-            masked_grads = torch.autograd.grad(
+            surprise_grads = torch.autograd.grad(
                 main_loss, computation_outputs, retain_graph=True, allow_unused=True
             )
+            
+            sml_components = []
+            for grad, rw in zip(surprise_grads, raw_weights):
+                if grad is not None and torch.isfinite(grad).all():
+                    surprise_magnitude = grad.norm().detach()
+                    avg_activation = rw.mean()
+                    sml_components.append(surprise_magnitude * avg_activation)
+            
+            if sml_components:
+                sml_loss = torch.stack(sml_components).mean()
 
-            for grad_tensor in masked_grads:
-                if grad_tensor is not None:
-                    surprise_per_neuron = grad_tensor.view(-1, grad_tensor.shape[-1]).norm(p=2, dim=0)
-                    active_surprise = surprise_per_neuron[surprise_per_neuron > 1e-9]
-                    if active_surprise.numel() > 0:
-                        weighted_surprise = active_surprise * activation_rate
-                        sml_loss += (-torch.log(weighted_surprise + 1e-9) * weighted_surprise).sum()
+        diversity_loss = torch.tensor(0.0, device=self.device)
+        if proto_weights:
+            all_protos = torch.cat([p.view(-1, p.shape[-1]) for p in proto_weights], dim=0)
+            if all_protos.shape[0] > 1:
+                normed_protos = F.normalize(all_protos, p=2, dim=1)
+                cosine_sim = torch.matmul(normed_protos, normed_protos.t())
+                diversity_loss = (torch.abs(cosine_sim) - torch.eye(cosine_sim.shape[0], device=self.device)).pow(2).mean()
 
         with torch.no_grad():
-            avg_tau = torch.distributions.Categorical(logits=logits).entropy().mean()
+            avg_tau = layer_taus.mean()
+            all_gates = [p for name, p in self.model.named_parameters() if 'gate_param' in name]
+            avg_gate = torch.mean(torch.stack([g.mean() for g in all_gates])).item() if all_gates else 0.0
+            
+            beta = torch.sigmoid(torch.tensor(avg_gate, device=self.device))
+            self.tau_ema = beta * self.tau_ema + (1 - beta) * avg_tau
 
-        w_sml = -torch.log(avg_tau + kl_epsilon)
-        total_loss = main_loss + kl_loss + w_sml * sml_loss
+        w_meta = -torch.log(self.tau_ema + 1e-9)
+        meta_loss = sml_loss + diversity_loss
+        total_loss = main_loss + w_meta * meta_loss
 
-        # --- Metric Calculation ---
         with torch.no_grad():
             token_acc = self._calculate_token_accuracy(logits, labels).item()
-            active_elements = sum((rw > 0).float().sum().item() for rw in raw_weights)
-            total_elements = sum(rw.numel() for rw in raw_weights)
-            activation_rate = active_elements / total_elements if total_elements > 0 else 0.0
-
-            pi_score = torch.exp(-(main_loss + kl_loss + sml_loss)).item()
+            pi_score = torch.exp(-(main_loss + meta_loss)).item()
 
             metrics = {
                 "main_loss": main_loss.item(),
                 "sml_loss": sml_loss.item(),
-                "kl_loss": kl_loss.item(),
+                "div_loss": diversity_loss.item(),
                 "total_loss": total_loss.item(),
                 "token_acc": token_acc,
-                "activation_rate": activation_rate,
                 "avg_tau": avg_tau.item(),
-                "prior_std": self.prior_std,
-                "pi_score": pi_score
+                "pi_score": pi_score,
+                "avg_gate": avg_gate,
+                "w_meta": w_meta.item(),
+                "tau_ema": self.tau_ema.item()
             }
-            all_sigmas = [p for name, p in self.model.named_parameters() if 'sigma_weight' in name]
-            metrics["avg_sigma"] = (torch.mean(torch.stack([F.softplus(s).mean() for s in all_sigmas])).item() if all_sigmas else 0.0)
-            all_gates = [p for name, p in self.model.named_parameters() if 'gate_param' in name]
-            metrics["avg_gate"] = (torch.mean(torch.stack([g.mean() for g in all_gates])).item() if all_gates else 0.0)
+            if raw_weights:
+                all_raw_weights = torch.cat([rw.view(-1) for rw in raw_weights])
+                activation_rate = (all_raw_weights > 0).float().mean().item()
+                metrics["activation_rate"] = activation_rate
 
         return total_loss, metrics
 
@@ -198,7 +197,7 @@ class Trainer:
 
             task_data = batch['task_data'][0]
 
-            for view_idx in range(8): # Treat each view as a separate training step
+            for view_idx in range(8):
                 start_time = time.time()
 
                 step_output = self._run_tf_step(task_data, view_idx)
@@ -207,19 +206,14 @@ class Trainer:
 
                 loss, metrics = step_output
 
-                if loss.item() == 0.0: continue
+                if not torch.isfinite(loss):
+                    self.console.print(f"[bold red]Warning: Skipping step {self.global_step} due to non-finite loss.[/bold red]")
+                    continue
 
                 self.optimizer.zero_grad()
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
                 self.optimizer.step()
-
-                # Update prior_std based on the dual-layer mechanism
-                avg_sigma = metrics.get('avg_sigma', 0.0)
-                avg_gate = metrics.get('avg_gate', 0.0)
-                beta = torch.sigmoid(torch.tensor(avg_gate - avg_sigma)).item()
-                current_tau = metrics.get('avg_tau', self.prior_std)
-                self.prior_std = beta * self.prior_std + (1 - beta) * current_tau
 
                 torch.cuda.empty_cache()
                 elapsed_time = time.time() - start_time

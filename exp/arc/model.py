@@ -37,32 +37,30 @@ class RotaryEmbedding(nn.Module):
         sin = emb.sin().to(dtype=x.dtype)
         return cos, sin
 
-class SparseBayesianLinear(nn.Module):
+class ProtoSparseLinear(nn.Module):
     def __init__(self, in_features: int, out_features: int, dtype: torch.dtype = torch.float32):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
 
         self.mu_weight = nn.Parameter(torch.empty(out_features, in_features, dtype=dtype))
-        self.sigma_weight = nn.Parameter(torch.empty(out_features, in_features, dtype=dtype))
+        self.proto_weight = nn.Parameter(torch.empty(out_features, in_features, dtype=dtype))
         self.gate_param = nn.Parameter(torch.empty(out_features, dtype=dtype))
         self.mu_bias = nn.Parameter(torch.empty(out_features, dtype=dtype))
 
         self.reset_parameters()
 
-
     def reset_parameters(self) -> None:
         nn.init.kaiming_uniform_(self.mu_weight, a=math.sqrt(5))
-        nn.init.normal_(self.sigma_weight, mean=2.0, std=0.5)
+        nn.init.kaiming_uniform_(self.proto_weight, a=math.sqrt(5))
         nn.init.constant_(self.gate_param, -0.1)
         nn.init.zeros_(self.mu_bias)
 
-    def forward(self, x: torch.Tensor, prior_std: float, kl_epsilon: float) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         original_shape = x.shape
         x_reshaped = x.view(-1, self.in_features)
 
-        keys = self.mu_weight * F.softplus(self.sigma_weight)
-        scores = torch.matmul(x_reshaped, keys.t()) / math.sqrt(self.in_features)
+        scores = torch.matmul(x_reshaped, self.proto_weight.t()) / math.sqrt(self.in_features)
         raw_weights = F.relu(scores - self.gate_param.unsqueeze(0))
 
         computation_output = F.linear(x_reshaped, self.mu_weight, self.mu_bias)
@@ -71,39 +69,22 @@ class SparseBayesianLinear(nn.Module):
         new_shape = list(original_shape[:-1]) + [self.out_features]
         output = masked_output.view(new_shape)
 
-        # Unified KL divergence with zero-mean prior
-        mu_q = self.mu_weight
-        sigma_q = F.softplus(self.sigma_weight)
-        var_q = sigma_q.pow(2)
-
-        mu_p = torch.zeros_like(mu_q)
-        var_p = torch.full_like(sigma_q, prior_std).pow(2)
-
-        kl_div = 0.5 * (torch.log(var_p / (var_q + kl_epsilon)) + (var_q + (mu_q - mu_p).pow(2)) / var_p - 1)
-        kl_loss = kl_div.mean()
-
-        if torch.isnan(kl_loss).any() or torch.isinf(kl_loss).any():
-            print("SBL KL Loss is NaN/Inf!")
-            print(f"var_p: {var_p.mean().item()}, var_q: {var_q.mean().item()}, mu_norm: {self.mu_weight.pow(2).mean().item()}")
-
-        return output, masked_output, computation_output, raw_weights, kl_loss
+        return output, masked_output, computation_output, raw_weights, self.proto_weight
 
 class DynamicInfiniteHeadAttention(nn.Module):
     def __init__(self, config: ModelConfig, dtype: torch.dtype = torch.float32):
         super().__init__()
         self.d_model = config.hidden_size
-        self.sbl_qkv = SparseBayesianLinear(self.d_model, 3 * self.d_model, dtype=dtype)
-        self.sbl_o = SparseBayesianLinear(self.d_model, self.d_model, dtype=dtype)
+        self.sbl_qkv = ProtoSparseLinear(self.d_model, 3 * self.d_model, dtype=dtype)
+        self.sbl_o = ProtoSparseLinear(self.d_model, self.d_model, dtype=dtype)
 
     def forward(
         self,
         x: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
-        prior_std: float,
-        kl_epsilon: float,
         past_key_value: tuple[torch.Tensor, torch.Tensor] | None = None
-    ) -> tuple[torch.Tensor, list[torch.Tensor], list[torch.Tensor], list[torch.Tensor], torch.Tensor, torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
-        qkv, m_qkv, c_qkv, rw_qkv, kl_qkv = self.sbl_qkv(x, prior_std, kl_epsilon)
+    ) -> tuple[torch.Tensor, list[torch.Tensor], list[torch.Tensor], list[torch.Tensor], list[torch.Tensor], tuple[torch.Tensor, torch.Tensor]]:
+        qkv, m_qkv, c_qkv, rw_qkv, proto_qkv = self.sbl_qkv(x)
         q, k, v = torch.split(qkv, self.d_model, dim=-1)
 
         cos, sin = position_embeddings
@@ -119,33 +100,33 @@ class DynamicInfiniteHeadAttention(nn.Module):
         is_causal = past_key_value is None
         attn_out = F.scaled_dot_product_attention(q, k, v, is_causal=is_causal)
 
-        y, m_o, c_o, rw_o, kl_o = self.sbl_o(attn_out, prior_std, kl_epsilon)
+        y, m_o, c_o, rw_o, proto_o = self.sbl_o(attn_out)
 
-        total_kl_loss = kl_qkv + kl_o
-        masked_outputs: list[torch.Tensor] = [m_qkv, m_o]
-        comp_outputs: list[torch.Tensor] = [c_qkv, c_o]
-        raw_weights: list[torch.Tensor] = [rw_qkv, rw_o]
+        masked_outputs = [m_qkv, m_o]
+        comp_outputs = [c_qkv, c_o]
+        raw_weights = [rw_qkv, rw_o]
+        proto_weights = [proto_qkv, proto_o]
 
-        return y, masked_outputs, comp_outputs, raw_weights, total_kl_loss, present_key_value
+        return y, masked_outputs, comp_outputs, raw_weights, proto_weights, present_key_value
 
 class DynamicInfiniteExpert(nn.Module):
     def __init__(self, config: ModelConfig, dtype: torch.dtype = torch.float32):
         super().__init__()
         d_ffn = config.hidden_size * config.d_ffn_factor
-        self.sbl1 = SparseBayesianLinear(config.hidden_size, d_ffn, dtype=dtype)
-        self.sbl2 = SparseBayesianLinear(d_ffn, config.hidden_size, dtype=dtype)
+        self.sbl1 = ProtoSparseLinear(config.hidden_size, d_ffn, dtype=dtype)
+        self.sbl2 = ProtoSparseLinear(d_ffn, config.hidden_size, dtype=dtype)
 
-    def forward(self, x: torch.Tensor, prior_std: float, kl_epsilon: float) -> tuple[torch.Tensor, list[torch.Tensor], list[torch.Tensor], list[torch.Tensor], torch.Tensor]:
-        h, m1, c1, rw1, kl1 = self.sbl1(x, prior_std, kl_epsilon)
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, list[torch.Tensor], list[torch.Tensor], list[torch.Tensor], list[torch.Tensor]]:
+        h, m1, c1, rw1, proto1 = self.sbl1(x)
         h_act = F.relu(h)
-        y, m2, c2, rw2, kl2 = self.sbl2(h_act, prior_std, kl_epsilon)
-
-        total_kl_loss = kl1 + kl2
-        masked_outputs: list[torch.Tensor] = [m1, m2]
-        comp_outputs: list[torch.Tensor] = [c1, c2]
-        raw_weights: list[torch.Tensor] = [rw1, rw2]
-
-        return y, masked_outputs, comp_outputs, raw_weights, total_kl_loss
+        y, m2, c2, rw2, proto2 = self.sbl2(h_act)
+        
+        masked_outputs = [m1, m2]
+        comp_outputs = [c1, c2]
+        raw_weights = [rw1, rw2]
+        proto_weights = [proto1, proto2]
+        
+        return y, masked_outputs, comp_outputs, raw_weights, proto_weights
 
 class MoIETransformerBlock(nn.Module):
     def __init__(self, config: ModelConfig, dtype: torch.dtype = torch.float32):
@@ -159,29 +140,27 @@ class MoIETransformerBlock(nn.Module):
         self,
         x: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
-        prior_std: float,
-        kl_epsilon: float,
         past_key_value: tuple[torch.Tensor, torch.Tensor] | None = None
-    ) -> tuple[torch.Tensor, list[torch.Tensor], list[torch.Tensor], list[torch.Tensor], torch.Tensor, torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+    ) -> tuple[torch.Tensor, list[torch.Tensor], list[torch.Tensor], list[torch.Tensor], list[torch.Tensor], torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
         attn_in = self.ln1(x)
-        attn_out, attn_m, attn_c, attn_rw, attn_kl, present_key_value = self.attn(
-            attn_in, position_embeddings, prior_std, kl_epsilon, past_key_value
+        attn_out, attn_m, attn_c, attn_rw, attn_protos, present_key_value = self.attn(
+            attn_in, position_embeddings, past_key_value
         )
         x = x + attn_out
 
         ffn_in = self.ln2(x)
-        ffn_out, ffn_m, ffn_c, ffn_rw, ffn_kl = self.ffn(ffn_in, prior_std, kl_epsilon)
+        ffn_out, ffn_m, ffn_c, ffn_rw, ffn_protos = self.ffn(ffn_in)
         x = x + ffn_out
 
         probs = F.softmax(x, dim=-1)
         layer_entropy = -(probs * torch.log(probs + 1e-9)).sum(dim=-1).mean()
 
-        total_kl_loss = attn_kl + ffn_kl
         masked_outputs = attn_m + ffn_m
         comp_outputs = attn_c + ffn_c
         raw_weights = attn_rw + ffn_rw
+        all_proto_weights = attn_protos + ffn_protos
 
-        return x, masked_outputs, comp_outputs, raw_weights, total_kl_loss, layer_entropy, present_key_value
+        return x, masked_outputs, comp_outputs, raw_weights, all_proto_weights, layer_entropy, present_key_value
 
 class ArcTransformer(nn.Module):
     def __init__(self, config: ModelConfig, device: torch.device | str):
@@ -189,7 +168,8 @@ class ArcTransformer(nn.Module):
         self.config = config # Keep for non-JIT access if needed
         self.num_layers = config.num_layers
         self.vocab_size = config.vocab_size
-
+        self.device = device
+ 
         self.config.kl_prior_epsilon = 1e-9 # Used in recalculate_kl_prior
         dtype = torch.bfloat16 # Hardcode for now as per project spec
 
@@ -208,9 +188,7 @@ class ArcTransformer(nn.Module):
     def forward(
         self,
         input_ids: torch.Tensor,
-        prior_std: float,
-       kl_epsilon: float,
-       past_key_values: list[tuple[torch.Tensor, torch.Tensor] | None] | None = None
+        past_key_values: list[tuple[torch.Tensor, torch.Tensor] | None] | None = None
     ):
         assert input_ids.max().item() < self.embedding.num_embeddings, "Token ID out of vocab range"
         tok_emb = self.embedding(input_ids)
@@ -220,7 +198,6 @@ class ArcTransformer(nn.Module):
         position_embeddings = self.rotary_emb(x, seq_len=seq_len)
 
         if past_key_values is None:
-            # JIT-compatible way to initialize a list of Nones with the correct type hint
             pkv: list[tuple[torch.Tensor, torch.Tensor] | None] = []
             for _ in range(self.num_layers):
                 pkv.append(None)
@@ -230,24 +207,23 @@ class ArcTransformer(nn.Module):
         all_masked_outputs: list[torch.Tensor] = []
         all_comp_outputs: list[torch.Tensor] = []
         all_raw_weights: list[torch.Tensor] = []
+        all_proto_weights: list[torch.Tensor] = []
         layer_entropies: list[torch.Tensor] = []
-        total_kl_loss = torch.tensor(0.0, device=x.device, dtype=x.dtype)
 
         for i, block in enumerate(self.blocks):
-            x, masked_outputs, comp_outputs, raw_weights, kl, layer_entropy, present_key_value = block(
-                x, position_embeddings, prior_std, kl_epsilon, past_key_values[i]
+            x, masked, comp, raw, protos, layer_entropy, present_key_value = block(
+                x, position_embeddings, past_key_values[i]
             )
             present_key_values.append(present_key_value)
-            all_masked_outputs.extend(masked_outputs)
-            all_comp_outputs.extend(comp_outputs)
-            all_raw_weights.extend(raw_weights)
-            total_kl_loss += kl
+            all_masked_outputs.extend(masked)
+            all_comp_outputs.extend(comp)
+            all_raw_weights.extend(raw)
+            all_proto_weights.extend(protos)
             layer_entropies.append(layer_entropy)
 
         logits = self.lm_head(x)
 
         layer_taus = torch.stack(layer_entropies)
 
-        # JIT requires consistent return types. We will return a list of tuples.
-        return logits, all_masked_outputs, all_comp_outputs, all_raw_weights, total_kl_loss, layer_taus, present_key_values
+        return logits, all_masked_outputs, all_comp_outputs, all_raw_weights, all_proto_weights, layer_taus, present_key_values
 

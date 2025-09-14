@@ -20,20 +20,20 @@ class Observer:
     def log_step(self, epoch: int, step: int, metrics: dict[str, float], elapsed_time: float):
         main_loss = metrics.get('main_loss', 0.0)
         sml_loss = metrics.get('sml_loss', 0.0)
-        kl_loss = metrics.get('kl_loss', 0.0)
+        div_loss = metrics.get('div_loss', 0.0)
         token_acc = metrics.get('token_acc', 0.0)
         activation_rate = metrics.get('activation_rate', 0.0)
         avg_tau = metrics.get('avg_tau', 0.0)
-        prior_std = metrics.get('prior_std', 0.0)
-        avg_sigma = metrics.get('avg_sigma', 0.0)
         avg_gate = metrics.get('avg_gate', 0.0)
         pi_score = metrics.get('pi_score', 0.0)
+        w_meta = metrics.get('w_meta', 0.0)
+        tau_ema = metrics.get('tau_ema', 0.0)
 
         steps_per_sec = 1 / elapsed_time if elapsed_time > 0 else float('inf')
 
         log_str = (
-            f"E:{epoch:2d} S:{step:5d} | Loss(m/sml/k): {main_loss:.3f}/{sml_loss:.3f}/{kl_loss:.3f} | "
-            f"Acc: {token_acc:.3f} | PI: {pi_score:.3f} | Avg σ/g: {avg_sigma:.4f}/{avg_gate:.4f} | τ/p_std: {avg_tau:.3f}/{prior_std:.3f} | "
+            f"E:{epoch:2d} S:{step:5d} | Loss(m/s/d): {main_loss:.3f}/{sml_loss:.3f}/{div_loss:.3f} | "
+            f"Acc: {token_acc:.3f} | PI: {pi_score:.3f} | Avg g: {avg_gate:.4f} | τ(ema): {tau_ema:.3f} | w_m: {w_meta:.3f} | "
             f"Act%: {activation_rate*100:.2f} | step/s: {steps_per_sec:.2f}"
         )
         self.console.print(log_str)
