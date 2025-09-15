@@ -30,11 +30,12 @@ class TrainConfig:
     device: str = "cuda"
     seed: int = 42
 
-    gate_loss_weight: float = 1.0
+    mu_surprise_loss_weight: float = 1.0
     diversity_loss_weight: float = 1.0
-    kl_loss_weight: float = 0.1
-    gate_convergence_tolerance: float = 1e-4
-    max_mcmc_iterations: int = 100
+
+    inner_loop_convergence_tolerance: float = 1e-5
+    inner_loop_patience: int = 3
+    inner_loop_max_steps: int = 100
 
     eval_interval: int = 10000 # Eval less frequently
     log_interval: int = 10 # Log more frequently

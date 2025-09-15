@@ -200,6 +200,7 @@ class ArcTransformer(nn.Module):
         all_masked_outputs: list[torch.Tensor] = []
         all_comp_outputs: list[torch.Tensor] = []
         all_raw_weights: list[torch.Tensor] = []
+        all_mu_weights: list[torch.Tensor] = []
         all_proto_weights: list[torch.Tensor] = []
         layer_entropies: list[torch.Tensor] = []
 
@@ -213,6 +214,7 @@ class ArcTransformer(nn.Module):
             all_raw_weights.extend(raw)
             for module in block.modules():
                 if isinstance(module, SparseProtoLinear):
+                    all_mu_weights.append(module.mu_weight)
                     all_proto_weights.append(module.proto_weight)
             layer_entropies.append(layer_entropy)
 
@@ -220,4 +222,4 @@ class ArcTransformer(nn.Module):
 
         layer_taus = torch.stack(layer_entropies)
 
-        return logits, all_masked_outputs, all_comp_outputs, all_raw_weights, all_proto_weights, layer_taus, present_key_values
+        return logits, all_masked_outputs, all_comp_outputs, all_raw_weights, all_mu_weights, all_proto_weights, layer_taus, present_key_values
