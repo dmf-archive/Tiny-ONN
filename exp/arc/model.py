@@ -45,7 +45,6 @@ class SparseProtoLinear(nn.Module):
 
         self.mu_weight = nn.Parameter(torch.empty(out_features, in_features, dtype=dtype))
         self.proto_weight = nn.Parameter(torch.empty(out_features, in_features, dtype=dtype))
-        self.gate_param = nn.Parameter(torch.empty(out_features, dtype=dtype))
         self.mu_bias = nn.Parameter(torch.empty(out_features, dtype=dtype))
 
         self.reset_parameters()
@@ -53,7 +52,6 @@ class SparseProtoLinear(nn.Module):
     def reset_parameters(self) -> None:
         nn.init.kaiming_uniform_(self.mu_weight, a=math.sqrt(5))
         nn.init.kaiming_uniform_(self.proto_weight, a=math.sqrt(5))
-        nn.init.constant_(self.gate_param, -0.1)
         nn.init.zeros_(self.mu_bias)
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -61,7 +59,7 @@ class SparseProtoLinear(nn.Module):
         x_reshaped = x.view(-1, self.in_features)
 
         scores = torch.matmul(x_reshaped, self.proto_weight.t())
-        raw_weights = F.relu(scores - self.gate_param.unsqueeze(0))
+        raw_weights = F.relu(scores)
 
         computation_output = F.linear(x_reshaped, self.mu_weight, self.mu_bias)
         masked_output = computation_output * raw_weights
@@ -69,7 +67,7 @@ class SparseProtoLinear(nn.Module):
         new_shape = list(original_shape[:-1]) + [self.out_features]
         output = masked_output.view(new_shape)
 
-        return output, masked_output, computation_output, raw_weights
+        return output, masked_output, computation_output, raw_weights.view(new_shape)
 
 class DynamicInfiniteHeadAttention(nn.Module):
     def __init__(self, config: ModelConfig, dtype: torch.dtype = torch.float32):
@@ -139,25 +137,28 @@ class MoIETransformerBlock(nn.Module):
         x: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         past_key_value: tuple[torch.Tensor, torch.Tensor] | None = None
-    ) -> tuple[torch.Tensor, list[torch.Tensor], list[torch.Tensor], list[torch.Tensor], torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+    ) -> tuple[torch.Tensor, torch.Tensor, list[torch.Tensor], list[torch.Tensor], list[torch.Tensor], torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
         attn_in = self.ln1(x)
-        attn_out, attn_m, attn_c, attn_rw, present_key_value = self.attn(
+        attn_out, attn_m, attn_c, attn_rw, attn_scores, present_key_value = self.attn(
             attn_in, position_embeddings, past_key_value
         )
         x = x + attn_out
 
         ffn_in = self.ln2(x)
-        ffn_out, ffn_m, ffn_c, ffn_rw = self.ffn(ffn_in)
-        x = x + ffn_out
+        ffn_out, ffn_m, ffn_c, ffn_rw, ffn_scores = self.ffn(ffn_in)
+        x_out = x + ffn_out
 
-        probs = F.softmax(x, dim=-1)
+        # Placeholder for layer_entropy, will be replaced by activation entropy
+        probs = F.softmax(x_out, dim=-1)
         layer_entropy = -(probs * torch.log(probs + 1e-9)).sum(dim=-1).mean()
 
         masked_outputs = attn_m + ffn_m
         comp_outputs = attn_c + ffn_c
         raw_weights = attn_rw + ffn_rw
+        
+        all_scores = attn_scores + ffn_scores
 
-        return x, masked_outputs, comp_outputs, raw_weights, layer_entropy, present_key_value
+        return x_out, x, masked_outputs, comp_outputs, raw_weights, all_scores, layer_entropy, present_key_value
 
 class ArcTransformer(nn.Module):
     def __init__(self, config: ModelConfig, device: torch.device | str):
@@ -203,23 +204,31 @@ class ArcTransformer(nn.Module):
         all_mu_weights: list[torch.Tensor] = []
         all_proto_weights: list[torch.Tensor] = []
         layer_entropies: list[torch.Tensor] = []
+        all_block_outputs: list[torch.Tensor] = []
+        all_ffn_inputs: list[torch.Tensor] = []
+        all_block_raw_weights: list[list[torch.Tensor]] = []
+
 
         for i, block in enumerate(self.blocks):
-            x, masked, comp, raw, layer_entropy, present_key_value = block(
+            x, ffn_in, masked, comp, raw, layer_entropy, present_key_value = block(
                 x, position_embeddings, past_key_values[i]
             )
             present_key_values.append(present_key_value)
             all_masked_outputs.extend(masked)
             all_comp_outputs.extend(comp)
             all_raw_weights.extend(raw)
+            all_block_raw_weights.append(raw)
             for module in block.modules():
                 if isinstance(module, SparseProtoLinear):
                     all_mu_weights.append(module.mu_weight)
                     all_proto_weights.append(module.proto_weight)
             layer_entropies.append(layer_entropy)
+            all_block_outputs.append(x)
+            all_ffn_inputs.append(ffn_in)
+
 
         logits = self.lm_head(x)
 
         layer_taus = torch.stack(layer_entropies)
 
-        return logits, all_masked_outputs, all_comp_outputs, all_raw_weights, all_mu_weights, all_proto_weights, layer_taus, present_key_values
+        return logits, all_masked_outputs, all_comp_outputs, all_raw_weights, all_mu_weights, all_proto_weights, layer_taus, all_block_outputs, all_ffn_inputs, all_block_raw_weights, present_key_values

@@ -5,6 +5,7 @@ from typing import Any
 
 import torch
 import torch.nn.functional as F
+import torch.nn as nn
 from rich.console import Console
 from torch.utils.data import DataLoader
 
@@ -48,16 +49,14 @@ class Trainer:
 
         mu_params = [p for name, p in self.model.named_parameters() if 'mu_weight' in name or 'mu_bias' in name]
         proto_params = [p for name, p in self.model.named_parameters() if 'proto_weight' in name]
-        gate_params = [p for name, p in self.model.named_parameters() if 'gate_param' in name]
-        base_params = [p for name, p in self.model.named_parameters() if 'mu_' not in name and 'proto_' not in name and 'gate_' not in name]
+        base_params = [p for name, p in self.model.named_parameters() if 'mu_' not in name and 'proto_' not in name]
 
-        self.optimizer_main = torch.optim.AdamW(
-            [{'params': base_params}, {'params': mu_params}],
-            lr=self.config.base_learning_rate,
-            weight_decay=self.config.weight_decay
-        )
-        self.optimizer_proto = torch.optim.AdamW(proto_params, lr=self.config.proto_learning_rate)
-        self.optimizer_gate = torch.optim.AdamW(gate_params, lr=self.config.gate_learning_rate)
+        self.optimizer = torch.optim.AdamW([
+            {'params': base_params, 'lr': self.config.base_learning_rate},
+            {'params': mu_params, 'lr': self.config.base_learning_rate},
+            {'params': proto_params, 'lr': self.config.proto_learning_rate}
+        ], weight_decay=self.config.weight_decay)
+
 
         self.consistency_tools = ConsistencyTools()
         self.evaluator = EvaluationStep(self.model, self.serializer, self.deserializer, self.observer, self.device)
@@ -70,9 +69,7 @@ class Trainer:
         state = {
             'step': self.global_step,
             'model_state_dict': self.model.state_dict(),
-            'optimizer_main_state_dict': self.optimizer_main.state_dict(),
-            'optimizer_proto_state_dict': self.optimizer_proto.state_dict(),
-            'optimizer_gate_state_dict': self.optimizer_gate.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
         }
         filepath = self.checkpoint_dir / f"checkpoint_{self.global_step}.pt"
         torch.save(state, filepath)
@@ -87,9 +84,7 @@ class Trainer:
         latest_checkpoint = checkpoints[0]
         checkpoint = torch.load(latest_checkpoint, map_location=self.device)
         self.model.load_state_dict(checkpoint['model_state_dict'])
-        self.optimizer_main.load_state_dict(checkpoint['optimizer_main_state_dict'])
-        self.optimizer_proto.load_state_dict(checkpoint['optimizer_proto_state_dict'])
-        self.optimizer_gate.load_state_dict(checkpoint['optimizer_gate_state_dict'])
+        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         self.global_step = checkpoint['step']
         self.console.print(f"[bold blue]Loaded checkpoint from {latest_checkpoint} at step {self.global_step}[/bold blue]")
 
@@ -105,53 +100,22 @@ class Trainer:
         preds = torch.argmax(active_logits, dim=-1)
         return (preds == active_labels).float().mean()
 
-    def _calculate_diversity_loss(self, proto_weights: list[torch.Tensor]) -> torch.Tensor:
-        if not proto_weights: return torch.tensor(0.0, device=self.device)
-        losses = [1.0 - F.cosine_similarity(p.unsqueeze(0), p.unsqueeze(1), dim=-1).abs().mean() for p in proto_weights if p.dim() > 1]
-        return torch.stack(losses).mean() if losses else torch.tensor(0.0, device=self.device)
 
-    def _inner_loop_step(self, input_ids: torch.Tensor, labels: torch.Tensor) -> dict[str, torch.Tensor]:
-        last_meta_loss = torch.tensor(float('inf'))
-        patience_counter = 0
-        final_mu_surprise_loss = torch.tensor(0.0, device=self.device)
-        final_diversity_loss = torch.tensor(0.0, device=self.device)
-
-        for _ in range(self.config.inner_loop_max_steps):
-            self.optimizer_proto.zero_grad(set_to_none=True)
-            self.optimizer_gate.zero_grad(set_to_none=True)
-
-            logits, _, _, _, mu_weights, proto_weights, _, _ = self.model(input_ids)
-            main_loss = F.cross_entropy(logits[:, :-1, :].contiguous().view(-1, self.config.model.vocab_size), labels[:, 1:].contiguous().view(-1), ignore_index=-100)
-
-            if not torch.isfinite(main_loss):
-                break
-
-            mu_grads = torch.autograd.grad(main_loss, mu_weights, retain_graph=True, allow_unused=True)
-            
-            mu_surprises = [g.norm(p=2) for g in mu_grads if g is not None]
-            mu_surprise_loss = torch.stack(mu_surprises).mean() if mu_surprises else torch.tensor(0.0, device=self.device)
-            
-            diversity_loss = self._calculate_diversity_loss(proto_weights)
-            meta_loss = self.config.mu_surprise_loss_weight * mu_surprise_loss + self.config.diversity_loss_weight * diversity_loss
-
-            if torch.isfinite(meta_loss):
-                meta_loss.backward()
-                self.optimizer_proto.step()
-                self.optimizer_gate.step()
-
-            if torch.abs(last_meta_loss - meta_loss).item() < self.config.inner_loop_convergence_tolerance:
-                patience_counter += 1
-            else:
-                patience_counter = 0
-            
-            if patience_counter >= self.config.inner_loop_patience:
-                break
-            
-            last_meta_loss = meta_loss.detach()
-            final_mu_surprise_loss = mu_surprise_loss.detach()
-            final_diversity_loss = diversity_loss.detach()
+    def _calculate_ibs_loss(self, main_loss: torch.Tensor, block_outputs: list[torch.Tensor], ffn_inputs: list[torch.Tensor], layer_taus: torch.Tensor) -> torch.Tensor:
+        intermediate_tensors = block_outputs + ffn_inputs
         
-        return {"mu_surprise_loss": final_mu_surprise_loss, "diversity_loss": final_diversity_loss}
+        grads = torch.autograd.grad(main_loss, intermediate_tensors, retain_graph=True, allow_unused=True)
+        
+        surprise_norms = [g.norm(p=2) for g in grads if g is not None]
+        
+        if not surprise_norms:
+            return torch.tensor(0.0, device=self.device)
+            
+        surprise_loss = torch.stack(surprise_norms).mean()
+        entropy_loss = layer_taus.mean()
+        
+        return surprise_loss + self.config.entropy_loss_weight * entropy_loss
+
 
     def _run_step(self, task_data: dict[str, Any], view_idx: int, epoch: int):
         start_time = time.time()
@@ -169,35 +133,53 @@ class Trainer:
         labels = torch.tensor([labels_list], dtype=torch.long, device=self.device)
 
         self.model.train()
-        inner_loop_results = self._inner_loop_step(input_ids, labels)
-        
-        self.optimizer_main.zero_grad(set_to_none=True)
-        
-        logits, _, _, raw_weights, _, _, layer_taus, _ = self.model(input_ids)
+        self.optimizer.zero_grad(set_to_none=True)
+
+        logits, _, _, raw_weights, _, proto_weights, layer_taus, block_outputs, ffn_inputs, block_raw_weights, _ = self.model(input_ids)
         main_loss = F.cross_entropy(logits[:, :-1, :].contiguous().view(-1, self.config.model.vocab_size), labels[:, 1:].contiguous().view(-1), ignore_index=-100)
-        task_loss = main_loss
+        
+        ibs_loss = self._calculate_ibs_loss(main_loss, block_outputs, ffn_inputs, layer_taus)
+        total_loss = main_loss + self.config.ibs_loss_weight * ibs_loss
 
-        if torch.isfinite(task_loss):
-            task_loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.optimizer_main.param_groups[0]['params'], 1.0)
-            torch.nn.utils.clip_grad_norm_(self.optimizer_main.param_groups[1]['params'], 1.0)
-            self.optimizer_main.step()
+        if torch.isfinite(total_loss):
+            total_loss.backward()
+            torch.nn.utils.clip_grad_norm_([p for group in self.optimizer.param_groups for p in group['params']], 1.0)
+            self.optimizer.step()
 
+        complexity_cost = 0.0
+        for p_group in self.optimizer.param_groups:
+            for p in p_group['params']:
+                if p.grad is not None:
+                    complexity_cost += p.grad.norm(p=2).item() ** 2
+        complexity_cost = complexity_cost ** 0.5
+        
         with torch.no_grad():
+            seq_len = input_ids.shape[1]
+            token_counts = torch.bincount(input_ids.flatten(), minlength=self.tokenizer.vocab_size)
+            token_probs = token_counts / seq_len
+            token_probs = token_probs[token_probs > 0]
+            seq_entropy = -torch.sum(token_probs * torch.log2(token_probs)).item()
+
             token_acc = self._calculate_token_accuracy(logits, labels).item()
-            pi_score = torch.exp(-main_loss).item()
+            pi_score = torch.exp(-(main_loss + complexity_cost)).item()
             avg_tau = layer_taus.mean().item()
-            all_gates = [p for name, p in self.model.named_parameters() if 'gate_param' in name]
-            avg_gate = torch.mean(torch.stack([g.mean() for g in all_gates])).item() if all_gates else 0.0
-            all_protos = [p for name, p in self.model.named_parameters() if 'proto_weight' in name]
-            avg_proto = torch.mean(torch.stack([p.mean() for p in all_protos])).item() if all_protos else 0.0
-            activation_rate = torch.cat([rw.view(-1) for rw in raw_weights]).gt(0).float().mean().item() if raw_weights else 0.0
+            proto_norm = torch.mean(torch.stack([p.norm(p=2) for p in proto_weights])).item() if proto_weights else 0.0
+            avg_proto = torch.mean(torch.stack([p.mean() for p in proto_weights])).item() if proto_weights else 0.0
+            
+            activation_rate_avg = torch.cat([rw.view(-1) for rw in raw_weights]).gt(0).float().mean().item() if raw_weights else 0.0
+            
+            # Layer-wise activation rates
+            act_rate_l0 = torch.cat([rw.view(-1) for rw in block_raw_weights[0]]).gt(0).float().mean().item() if block_raw_weights else 0.0
+            act_rate_ln = torch.cat([rw.view(-1) for rw in block_raw_weights[-1]]).gt(0).float().mean().item() if block_raw_weights else 0.0
+
 
             metrics = {
-                "main_loss": main_loss.item(), "mu_surprise_loss": inner_loop_results["mu_surprise_loss"].item(),
-                "div_loss": inner_loop_results["diversity_loss"].item(),
-                "token_acc": token_acc, "pi_score": pi_score, "avg_tau": avg_tau, "avg_gate": avg_gate, "avg_proto": avg_proto,
-                "activation_rate": activation_rate
+                "main_loss": main_loss.item(), "ibs_loss": ibs_loss.item(),
+                "token_acc": token_acc, "pi_score": pi_score, "avg_tau": avg_tau, "avg_proto": avg_proto, "proto_norm": proto_norm,
+                "activation_rate_avg": activation_rate_avg,
+                "activation_rate_l0": act_rate_l0,
+                "activation_rate_ln": act_rate_ln,
+                "seq_len": float(seq_len), "seq_entropy": seq_entropy,
             }
 
         elapsed_time = time.time() - start_time
@@ -224,9 +206,7 @@ class Trainer:
     def train(self):
         self._load_checkpoint()
         self.console.print("[bold green]Starting Training...[/bold green]")
-        self.optimizer_main.zero_grad()
-        self.optimizer_proto.zero_grad()
-        self.optimizer_gate.zero_grad()
+        self.optimizer.zero_grad()
         for epoch in range(self.config.num_epochs):
             self._train_epoch(epoch)
         self.console.print("[bold green]Training Finished.[/bold green]")

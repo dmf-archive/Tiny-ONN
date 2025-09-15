@@ -18,24 +18,36 @@ class Observer:
         self.config = config
 
     def log_step(self, epoch: int, step: int, metrics: dict[str, float], elapsed_time: float):
-        main_loss = metrics.get('main_loss', 0.0)
-        mu_surprise_loss = metrics.get('mu_surprise_loss', 0.0)
-        div_loss = metrics.get('div_loss', 0.0)
-        token_acc = metrics.get('token_acc', 0.0)
-        activation_rate = metrics.get('activation_rate', 0.0)
-        avg_tau = metrics.get('avg_tau', 0.0)
-        avg_gate = metrics.get('avg_gate', 0.0)
-        avg_proto = metrics.get('avg_proto', 0.0)
-        pi_score = metrics.get('pi_score', 0.0)
-
         steps_per_sec = 1 / elapsed_time if elapsed_time > 0 else float('inf')
 
-        log_str = (
-            f"E:{epoch:2d} S:{step:5d} | Loss(m/s_mu/d): {main_loss:.3f}/{mu_surprise_loss:.3f}/{div_loss:.3f} | "
-            f"Acc: {token_acc:.3f} | PI: {pi_score:.3f} | Avg g/p: {avg_gate:.4f}/{avg_proto:.4f} | τ: {avg_tau:.3f} | "
-            f"Act%: {activation_rate*100:.2f} | step/s: {steps_per_sec:.2f}"
+        table = Table(title=f"Epoch {epoch} | Step {step}", show_header=True, header_style="bold magenta", expand=True)
+        
+        # Row 1: Headers
+        table.add_column("Loss (Main/IBS)", justify="center")
+        table.add_column("Accuracy", justify="center")
+        table.add_column("PI Score", justify="center")
+        table.add_column("Proto (Norm/Avg)", justify="center")
+        table.add_column("τ (Tau)", justify="center")
+        table.add_column("Act % (L0/Avg/LN)", justify="center")
+        table.add_column("Seq (Len/Entr)", justify="center")
+        table.add_column("Speed", justify="center")
+
+        # Row 2: Values
+        act_l0 = metrics.get('activation_rate_l0', 0.0) * 100
+        act_avg = metrics.get('activation_rate_avg', 0.0) * 100
+        act_ln = metrics.get('activation_rate_ln', 0.0) * 100
+        table.add_row(
+            f"{metrics.get('main_loss', 0.0):.3f}/{metrics.get('ibs_loss', 0.0):.3f}",
+            f"{metrics.get('token_acc', 0.0):.3f}",
+            f"{metrics.get('pi_score', 0.0):.3f}",
+            f"{metrics.get('proto_norm', 0.0):.3f} / {metrics.get('avg_proto', 0.0):.4f}",
+            f"{metrics.get('avg_tau', 0.0):.3f}",
+            f"{act_l0:.1f}/{act_avg:.1f}/{act_ln:.1f}",
+            f"{int(metrics.get('seq_len', 0))} / {metrics.get('seq_entropy', 0.0):.2f}",
+            f"{steps_per_sec:.2f} st/s"
         )
-        self.console.print(log_str)
+        
+        self.console.print(table)
 
     def _create_grid_text(self, grid: torch.Tensor) -> Text:
         text = Text()

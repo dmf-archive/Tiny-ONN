@@ -4,10 +4,10 @@ from dataclasses import dataclass, field
 @dataclass
 class ModelConfig:
     vocab_size: int = 18 # 8 control tokens + 10 color tokens
-    hidden_size: int = 256
-    num_layers: int = 7
+    hidden_size: int = 128
+    num_layers: int = 8
     max_position_embeddings: int = 4096
-    d_ffn_factor: int = 1 # Trust MoIE's dynamic routing, expand hidden state instead.
+    d_ffn_factor: int = 4 # Trust MoIE's dynamic routing, expand hidden state instead.
 
 @dataclass
 class DataConfig:
@@ -20,22 +20,16 @@ class TrainConfig:
     model: ModelConfig = field(default_factory=ModelConfig)
     data: DataConfig = field(default_factory=DataConfig)
 
-    base_learning_rate: float = 3e-4
-    proto_learning_rate: float = 3e-3
-    gate_learning_rate: float = 3e-2
+    base_learning_rate: float = 3e-3
+    proto_learning_rate: float = 3e-4
+    ibs_loss_weight: float = 1e-1
+    entropy_loss_weight: float = 1e-3
 
     weight_decay: float = 0.0
     num_epochs: int = 100
 
     device: str = "cuda"
     seed: int = 42
-
-    mu_surprise_loss_weight: float = 1.0
-    diversity_loss_weight: float = 1.0
-
-    inner_loop_convergence_tolerance: float = 1e-5
-    inner_loop_patience: int = 3
-    inner_loop_max_steps: int = 100
 
     eval_interval: int = 10000 # Eval less frequently
     log_interval: int = 10 # Log more frequently
