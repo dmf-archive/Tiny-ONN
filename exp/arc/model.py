@@ -54,10 +54,14 @@ class SparseProtoLinear(nn.Module):
         nn.init.kaiming_uniform_(self.mu_weight, a=math.sqrt(5))
         nn.init.kaiming_uniform_(self.proto_weight, a=math.sqrt(5))
         nn.init.zeros_(self.mu_bias)
-        nn.init.constant_(self.gate_param, -0.1)
+        nn.init.constant_(self.gate_param, 0.0)
 
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        scores = torch.matmul(x, self.proto_weight.t())
+    def forward(self, x: torch.Tensor, effective_proto: torch.Tensor, gate_temperature: float) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # Normalized Prototype Routing to decouple direction and norm
+        x_norm = F.normalize(x, p=2.0, dim=-1)
+        proto_norm = F.normalize(effective_proto, p=2.0, dim=-1)
+        scores = torch.matmul(x_norm, proto_norm.t())
+
         raw_weights = F.relu(scores - self.gate_param)
         computation_output = F.linear(x, self.mu_weight, self.mu_bias)
         masked_output = computation_output * raw_weights
@@ -74,9 +78,13 @@ class DynamicInfiniteHeadAttention(nn.Module):
         self,
         x: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
-        past_key_value: tuple[torch.Tensor, torch.Tensor] | None = None
+        past_key_value: tuple[torch.Tensor, torch.Tensor] | None = None,
+        effective_protos: dict[str, torch.Tensor] | None = None,
+        gate_temperature: float = 1.0,
     ) -> tuple[torch.Tensor, list[torch.Tensor], list[torch.Tensor], list[torch.Tensor], list[torch.Tensor], tuple[torch.Tensor, torch.Tensor]]:
-        m_qkv, c_qkv, rw_qkv = self.sbl_qkv(x)
+        if effective_protos is None:
+            raise ValueError("effective_protos cannot be None")
+        m_qkv, c_qkv, rw_qkv = self.sbl_qkv(x, effective_protos["attn_qkv"], gate_temperature)
         q, k, v = torch.split(m_qkv, self.d_model, dim=-1)
 
         cos, sin = position_embeddings
@@ -92,7 +100,7 @@ class DynamicInfiniteHeadAttention(nn.Module):
         is_causal = past_key_value is None
         attn_out = F.scaled_dot_product_attention(q, k, v, is_causal=is_causal)
 
-        m_o, c_o, rw_o = self.sbl_o(attn_out)
+        m_o, c_o, rw_o = self.sbl_o(attn_out, effective_protos["attn_o"], gate_temperature)
         
         masked_outputs = [m_qkv, m_o]
         comp_outputs = [c_qkv, c_o]
@@ -108,10 +116,12 @@ class DynamicInfiniteExpert(nn.Module):
         self.sbl1 = SparseProtoLinear(config.hidden_size, d_ffn, dtype=dtype)
         self.sbl2 = SparseProtoLinear(d_ffn, config.hidden_size, dtype=dtype)
 
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, list[torch.Tensor], list[torch.Tensor], list[torch.Tensor], list[torch.Tensor]]:
-        m1, c1, rw1 = self.sbl1(x)
+    def forward(self, x: torch.Tensor, effective_protos: dict[str, torch.Tensor], gate_temperature: float = 1.0) -> tuple[torch.Tensor, list[torch.Tensor], list[torch.Tensor], list[torch.Tensor], list[torch.Tensor]]:
+        if effective_protos is None:
+            raise ValueError("effective_protos cannot be None")
+        m1, c1, rw1 = self.sbl1(x, effective_protos["ffn_sbl1"], gate_temperature)
         h_act = F.relu(m1)
-        m2, c2, rw2 = self.sbl2(h_act)
+        m2, c2, rw2 = self.sbl2(h_act, effective_protos["ffn_sbl2"], gate_temperature)
 
         masked_outputs = [m1, m2]
         comp_outputs = [c1, c2]
@@ -128,20 +138,62 @@ class MoIETransformerBlock(nn.Module):
         self.ln2 = nn.LayerNorm(config.hidden_size, dtype=dtype)
         self.ffn = DynamicInfiniteExpert(config, dtype=dtype)
 
+        # Create transform layers for each proto residual connection
+        # The transform for 'ffn_sbl2' must match its input dimension (d_ffn), not hidden_size.
+        d_ffn = config.hidden_size * config.d_ffn_factor
+        self.proto_transforms = nn.ModuleDict({
+            "attn_qkv": nn.Linear(config.hidden_size, config.hidden_size, bias=False, dtype=dtype),
+            "attn_o": nn.Linear(config.hidden_size, config.hidden_size, bias=False, dtype=dtype),
+            "ffn_sbl1": nn.Linear(config.hidden_size, config.hidden_size, bias=False, dtype=dtype),
+            "ffn_sbl2": nn.Linear(d_ffn, d_ffn, bias=False, dtype=dtype),
+        })
+        self.proto_layernorms = nn.ModuleDict({
+            "attn_qkv": nn.LayerNorm(config.hidden_size, dtype=dtype),
+            "attn_o": nn.LayerNorm(config.hidden_size, dtype=dtype),
+            "ffn_sbl1": nn.LayerNorm(config.hidden_size, dtype=dtype),
+            "ffn_sbl2": nn.LayerNorm(d_ffn, dtype=dtype),
+        })
+
     def forward(
         self,
         x: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
-        past_key_value: tuple[torch.Tensor, torch.Tensor] | None = None
-    ) -> tuple[torch.Tensor, list[torch.Tensor], list[torch.Tensor], list[torch.Tensor], list[torch.Tensor], tuple[torch.Tensor, torch.Tensor]]:
+        past_key_value: tuple[torch.Tensor, torch.Tensor] | None = None,
+        prev_protos: dict[str, torch.Tensor] | None = None,
+        gate_temperature: float = 1.0,
+    ) -> tuple[torch.Tensor, list[torch.Tensor], list[torch.Tensor], list[torch.Tensor], list[torch.Tensor], tuple[torch.Tensor, torch.Tensor], dict[str, torch.Tensor]]:
+        
+        effective_protos = {}
+        # Define the mapping from SPL module name to its specific previous proto residual
+        # Each module now only receives residual from its direct predecessor of the same type.
+        proto_residual_mapping = {
+            "attn_qkv": "attn_qkv",
+            "attn_o": "attn_o",
+            "ffn_sbl1": "ffn_sbl1",
+            "ffn_sbl2": "ffn_sbl2",
+        }
+        sbl_modules = {
+            "attn_qkv": self.attn.sbl_qkv, "attn_o": self.attn.sbl_o,
+            "ffn_sbl1": self.ffn.sbl1, "ffn_sbl2": self.ffn.sbl2,
+        }
+
+        for name, module in sbl_modules.items():
+            residual_key = proto_residual_mapping[name]
+            if prev_protos is not None and residual_key in prev_protos:
+                transformed_residual = self.proto_transforms[name](prev_protos[residual_key])
+                normed_residual = self.proto_layernorms[name](transformed_residual)
+                effective_protos[name] = module.proto_weight + normed_residual
+            else:
+                effective_protos[name] = module.proto_weight
+
         attn_in = self.ln1(x)
         attn_out, attn_m, attn_c, attn_rw, attn_inputs, present_key_value = self.attn(
-            attn_in, position_embeddings, past_key_value
+            attn_in, position_embeddings, past_key_value, effective_protos=effective_protos, gate_temperature=gate_temperature
         )
         x = x + attn_out
 
         ffn_in = self.ln2(x)
-        ffn_out, ffn_m, ffn_c, ffn_rw, ffn_inputs = self.ffn(ffn_in)
+        ffn_out, ffn_m, ffn_c, ffn_rw, ffn_inputs = self.ffn(ffn_in, effective_protos=effective_protos, gate_temperature=gate_temperature)
         x_out = x + ffn_out
 
         masked_outputs = attn_m + ffn_m
@@ -149,7 +201,7 @@ class MoIETransformerBlock(nn.Module):
         raw_weights = attn_rw + ffn_rw
         sbl_inputs = attn_inputs + ffn_inputs
 
-        return x_out, masked_outputs, comp_outputs, raw_weights, sbl_inputs, present_key_value
+        return x_out, masked_outputs, comp_outputs, raw_weights, sbl_inputs, present_key_value, effective_protos
 
 class ArcTransformer(nn.Module):
     def __init__(self, config: ModelConfig, device: torch.device | str):
@@ -176,7 +228,8 @@ class ArcTransformer(nn.Module):
     def forward(
         self,
         input_ids: torch.Tensor,
-        past_key_values: list[tuple[torch.Tensor, torch.Tensor] | None] | None = None
+        past_key_values: list[tuple[torch.Tensor, torch.Tensor] | None] | None = None,
+        gate_temperature: float = 1.0
     ):
         assert input_ids.max().item() < self.embedding.num_embeddings, "Token ID out of vocab range"
         tok_emb = self.embedding(input_ids)
@@ -191,23 +244,42 @@ class ArcTransformer(nn.Module):
         present_key_values: list[tuple[torch.Tensor, torch.Tensor]] = []
         all_masked_outputs: list[torch.Tensor] = []
         all_comp_outputs: list[torch.Tensor] = []
-        all_proto_weights: list[torch.Tensor] = []
         all_sbl_inputs: list[torch.Tensor] = []
-        all_block_raw_weights: list[list[torch.Tensor]] = []
+        all_block_raw_weights: list[torch.Tensor] = []
+        all_effective_protos: list[dict[str, torch.Tensor]] = []
+
+        prev_attn_qkv: torch.Tensor | None = None
+        prev_attn_o: torch.Tensor | None = None
+        prev_ffn_sbl1: torch.Tensor | None = None
+        prev_ffn_sbl2: torch.Tensor | None = None
 
         for i, block in enumerate(self.blocks):
-            x, masked, comp, raw, sbl_inputs, present_key_value = block(
-                x, position_embeddings, past_key_values[i]
+            prev_protos_for_block: dict[str, torch.Tensor] = {}
+            if prev_attn_qkv is not None:
+                prev_protos_for_block["attn_qkv"] = prev_attn_qkv
+            if prev_attn_o is not None:
+                prev_protos_for_block["attn_o"] = prev_attn_o
+            if prev_ffn_sbl1 is not None:
+                prev_protos_for_block["ffn_sbl1"] = prev_ffn_sbl1
+            if prev_ffn_sbl2 is not None:
+                prev_protos_for_block["ffn_sbl2"] = prev_ffn_sbl2
+            
+            x, masked, comp, raw, sbl_inputs, present_key_value, effective_protos = block(
+                x, position_embeddings, past_key_values[i], prev_protos_for_block if prev_protos_for_block else None, gate_temperature
             )
+            
+            prev_attn_qkv = effective_protos.get("attn_qkv")
+            prev_attn_o = effective_protos.get("attn_o")
+            prev_ffn_sbl1 = effective_protos.get("ffn_sbl1")
+            prev_ffn_sbl2 = effective_protos.get("ffn_sbl2")
+            
             present_key_values.append(present_key_value)
             all_masked_outputs.extend(masked)
             all_comp_outputs.extend(comp)
             all_sbl_inputs.extend(sbl_inputs)
-            all_block_raw_weights.append(raw)
-            for module in block.modules():
-                if isinstance(module, SparseProtoLinear):
-                    all_proto_weights.append(module.proto_weight)
+            all_block_raw_weights.extend(raw)
+            all_effective_protos.append(effective_protos)
 
         logits = self.lm_head(x)
 
-        return logits, all_masked_outputs, all_comp_outputs, all_proto_weights, all_sbl_inputs, all_block_raw_weights, present_key_values
+        return logits, tok_emb, all_masked_outputs, all_comp_outputs, all_effective_protos, all_sbl_inputs, all_block_raw_weights, present_key_values

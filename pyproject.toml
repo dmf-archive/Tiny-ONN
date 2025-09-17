@@ -29,6 +29,7 @@ dependencies = [
   "tensorboard>=2.14.0",
   "tokenizers>=0.21.2",
   "torch>=2.7.1",
+  "torch-optimizer",
   "tqdm>=4.67.1",
   "transformers>=4.53.1",
   "umap-learn>=0.5.9.post2",

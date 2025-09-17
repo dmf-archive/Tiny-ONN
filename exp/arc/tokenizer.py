@@ -7,11 +7,9 @@ class ArcColorTokenizer:
             "<|pad|>": 0,
             "<|bos|>": 1,
             "<|eos|>": 2,
-            "<|im_start|>": 3,
-            "<|im_end|>": 4,
-            "problem": 5,
-            "solution": 6,
-            "\n": 7,
+            "problem": 3,
+            "solution": 4,
+            "\n": 5,
         }
 
         self.color_token_offset = len(self.control_tokens)

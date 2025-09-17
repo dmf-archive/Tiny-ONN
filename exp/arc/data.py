@@ -22,66 +22,57 @@ class GridSerializer:
                 tokens.append(self.tokenizer.color_to_token_id(color))
         return tokens
 
-    def serialize_task_with_context(self, task_data: dict[str, Any]) -> tuple[list[int], list[int]]:
+    def serialize_mini_task(self, mini_task: dict[str, Any]) -> tuple[list[int], list[int]]:
+        input_grid_ids = self._serialize_grid(mini_task['input'])
+        output_grid_ids = self._serialize_grid(mini_task['output'])
 
-        # This is a list of token IDs
-        context_ids = [self.tokenizer.bos_token_id]
-
-        for train_pair in task_data['train']:
-            context_ids.append(self.tokenizer.vocab["<|im_start|>"])
-            context_ids.append(self.tokenizer.vocab["problem"])
-            context_ids.extend(self._serialize_grid(train_pair['input']))
-            context_ids.append(self.tokenizer.vocab["<|im_end|>"])
-
-            context_ids.append(self.tokenizer.vocab["<|im_start|>"])
-            context_ids.append(self.tokenizer.vocab["solution"])
-            context_ids.extend(self._serialize_grid(train_pair['output']))
-            context_ids.append(self.tokenizer.vocab["<|im_end|>"])
-
-        test_input_grid_ids = self._serialize_grid(task_data['test'][0]['input'])
-        test_output_grid_ids = self._serialize_grid(task_data['test'][0]['output'])
-
-        prompt_part1 = context_ids + [self.tokenizer.vocab["<|im_start|>"], self.tokenizer.vocab["problem"]] + test_input_grid_ids + [self.tokenizer.vocab["<|im_end|>"]] + [self.tokenizer.vocab["<|im_start|>"]]
+        prompt_part1 = [self.tokenizer.bos_token_id, self.tokenizer.vocab["problem"]] + input_grid_ids
         prompt_part2 = [self.tokenizer.vocab["solution"]]
-
-        full_ids = prompt_part1 + prompt_part2 + test_output_grid_ids + [self.tokenizer.eos_token_id]
-
-        mask_len = len(prompt_part1)
-        labels = [-100] * mask_len + full_ids[mask_len:]
-
+        
+        full_ids = prompt_part1 + prompt_part2 + output_grid_ids + [self.tokenizer.eos_token_id]
+        
+        labels = full_ids
+        
         return full_ids, labels
 
     def serialize_for_inference(self, task_data: dict[str, Any]) -> list[int]:
-        context_ids = [self.tokenizer.bos_token_id]
-        for train_pair in task_data['train']:
-            context_ids.append(self.tokenizer.vocab["<|im_start|>"])
-            context_ids.append(self.tokenizer.vocab["problem"])
-            context_ids.extend(self._serialize_grid(train_pair['input']))
-            context_ids.append(self.tokenizer.vocab["<|im_end|>"])
-
-            context_ids.append(self.tokenizer.vocab["<|im_start|>"])
-            context_ids.append(self.tokenizer.vocab["solution"])
-            context_ids.extend(self._serialize_grid(train_pair['output']))
-            context_ids.append(self.tokenizer.vocab["<|im_end|>"])
-
+        # This now only uses the test input, ignoring the train pairs for context
         test_input_grid_ids = self._serialize_grid(task_data['test'][0]['input'])
-        problem_ids = context_ids + [self.tokenizer.vocab["<|im_start|>"], self.tokenizer.vocab["problem"]] + test_input_grid_ids + [self.tokenizer.vocab["<|im_end|>"]]
+        prompt_ids = [self.tokenizer.bos_token_id, self.tokenizer.vocab["problem"]] + test_input_grid_ids + [self.tokenizer.vocab["solution"]]
+        return prompt_ids
 
-        return problem_ids
-
-
-class ArcDataset(Dataset):
+class InMemoryArcDataset(Dataset):
     def __init__(self, data_path: str, split: str = "training"):
         self.data_path = Path(data_path) / split
-        self.file_paths = sorted(list(self.data_path.glob("*.json")))
+        self.mini_tasks = []
+        
+        file_paths = sorted(list(self.data_path.glob("*.json")))
+        for path in file_paths:
+            with open(path) as f:
+                task_data = json.load(f)
+            # Flatten all train and test pairs into a single list of mini-tasks
+            for pair in task_data['train']:
+                self.mini_tasks.append(pair)
+            for pair in task_data['test']:
+                self.mini_tasks.append(pair)
+        
+        # Sort mini_tasks by their serialized length to maximize batching efficiency
+        tokenizer_for_sorting = ArcColorTokenizer()
+        serializer_for_sorting = GridSerializer(tokenizer_for_sorting)
+        
+        tasks_with_lengths = []
+        for mini_task in self.mini_tasks:
+            input_ids, _ = serializer_for_sorting.serialize_mini_task(mini_task)
+            tasks_with_lengths.append((mini_task, len(input_ids)))
+        
+        sorted_tasks = sorted(tasks_with_lengths, key=lambda x: x[1])
+        self.mini_tasks = [task for task, length in sorted_tasks]
 
     def __len__(self) -> int:
-        return len(self.file_paths)
+        return len(self.mini_tasks)
 
     def __getitem__(self, idx: int) -> dict[str, Any]:
-        with open(self.file_paths[idx]) as f:
-            return json.load(f)
-
+        return self.mini_tasks[idx]
 
 class ArcCollator:
     def __init__(self, tokenizer: ArcColorTokenizer, max_len: int):
@@ -93,8 +84,8 @@ class ArcCollator:
         all_input_ids = []
         all_labels = []
 
-        for task_data in batch:
-            input_ids, labels = self.serializer.serialize_task_with_context(task_data)
+        for mini_task in batch:
+            input_ids, labels = self.serializer.serialize_mini_task(mini_task)
 
             if len(input_ids) > self.max_len:
                 continue
@@ -111,7 +102,7 @@ class ArcCollator:
         return {
             "input_ids": padded_input_ids,
             "labels": padded_labels,
-            "task_data": batch
+            "task_data": batch # Note: 'task_data' now refers to a batch of mini_tasks
         }
 
 class GridDeserializer:
