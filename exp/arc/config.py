@@ -20,10 +20,11 @@ class TrainConfig:
     model: ModelConfig = field(default_factory=ModelConfig)
     data: DataConfig = field(default_factory=DataConfig)
 
-    base_learning_rate: float = 3e-3
-    proto_learning_rate: float = 3e-4
-    ibs_loss_weight: float = 1e-1
-    entropy_loss_weight: float = 1e-3
+    lr_main: float = 3e-4
+    lr_meta: float = 3e-3
+    
+    w_proto: float = 1.0
+    w_gate: float = 1.0
 
     weight_decay: float = 0.0
     num_epochs: int = 100
@@ -31,7 +32,7 @@ class TrainConfig:
     device: str = "cuda"
     seed: int = 42
 
-    eval_interval: int = 10000 # Eval less frequently
+    eval_interval: int = 15000 # Eval less frequently
     log_interval: int = 10 # Log more frequently
     max_checkpoints: int = 3
 

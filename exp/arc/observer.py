@@ -23,25 +23,24 @@ class Observer:
         table = Table(title=f"Epoch {epoch} | Step {step}", show_header=True, header_style="bold magenta", expand=True)
         
         # Row 1: Headers
-        table.add_column("Loss (Main/IBS)", justify="center")
+        table.add_column("Loss (Main/Proto/Gate/τ)", justify="center")
         table.add_column("Accuracy", justify="center")
         table.add_column("PI Score", justify="center")
-        table.add_column("Proto (Norm/Avg)", justify="center")
-        table.add_column("τ (Tau)", justify="center")
+        table.add_column("SMP (p_dyn)", justify="center")
+        table.add_column("Proto (Norm/Avg/Gate)", justify="center")
         table.add_column("Act % (L0/Avg/LN)", justify="center")
         table.add_column("Seq (Len/Entr)", justify="center")
         table.add_column("Speed", justify="center")
 
-        # Row 2: Values
         act_l0 = metrics.get('activation_rate_l0', 0.0) * 100
         act_avg = metrics.get('activation_rate_avg', 0.0) * 100
         act_ln = metrics.get('activation_rate_ln', 0.0) * 100
         table.add_row(
-            f"{metrics.get('main_loss', 0.0):.3f}/{metrics.get('ibs_loss', 0.0):.3f}",
+            f"{metrics.get('main_loss', 0.0):.3f}/{metrics.get('proto_loss', 0.0):.4f}/{metrics.get('gate_loss', 0.0):.4f}/{metrics.get('tau', 0.0):.3f}",
             f"{metrics.get('token_acc', 0.0):.3f}",
             f"{metrics.get('pi_score', 0.0):.3f}",
-            f"{metrics.get('proto_norm', 0.0):.3f} / {metrics.get('avg_proto', 0.0):.4f}",
-            f"{metrics.get('avg_tau', 0.0):.3f}",
+            f"{metrics.get('p_dyn', 0.0):.3f}",
+            f"{metrics.get('proto_norm', 0.0):.3f} / {metrics.get('avg_proto', 0.0):.4f} / {metrics.get('avg_gate', 0.0):.4f}",
             f"{act_l0:.1f}/{act_avg:.1f}/{act_ln:.1f}",
             f"{int(metrics.get('seq_len', 0))} / {metrics.get('seq_entropy', 0.0):.2f}",
             f"{steps_per_sec:.2f} st/s"

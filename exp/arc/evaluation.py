@@ -78,7 +78,7 @@ class ArcGenerator:
             while not stopping_criteria(tokens, None):
                 model_input = tokens if past_key_values is None else tokens[:, -1:]
 
-                logits, _, _, _, _, _, _, past_key_values = self.model(
+                logits, _, _, _, _, _, past_key_values = self.model(
                     model_input, past_key_values=past_key_values
                 )
 
@@ -126,7 +126,7 @@ class ArcGenerator:
         while not stopping_criteria(input_ids, None):
             model_input = input_ids if past_key_values is None else input_ids[:, -1:]
 
-            logits, _, _, _, _, _, _, past_key_values = self.model(
+            logits, _, _, _, _, _, past_key_values = self.model(
                 model_input, past_key_values=past_key_values
             )
 
@@ -185,7 +185,7 @@ class ArcGenerator:
         while not stopping_criteria(tokens, None):
             model_input = tokens if past_key_values is None else tokens[:, -1:]
 
-            logits, _, _, _, _, _, _, past_key_values = self.model(
+            logits, _, _, _, _, _, past_key_values = self.model(
                 model_input, past_key_values=past_key_values
             )
 
@@ -414,7 +414,7 @@ class CandidateScorer:
             input_ids = torch.tensor([full_ids], dtype=torch.long, device=self.device)
             labels = torch.tensor([labels], dtype=torch.long, device=self.device)
 
-            logits, _, _, _, _, _, _, _ = self.model(input_ids)
+            logits, _, _, _, _, _, _ = self.model(input_ids)
 
             shifted_logits = logits[:, :-1, :]
             shifted_labels = labels[:, 1:]
