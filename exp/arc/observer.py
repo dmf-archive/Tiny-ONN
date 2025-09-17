@@ -17,10 +17,10 @@ class Observer:
         self.console = console
         self.config = config
 
-    def log_step(self, epoch: int, step: int, metrics: dict[str, float], elapsed_time: float):
+    def log_step(self, epoch: int, step: int, task_idx: int, metrics: dict[str, float], elapsed_time: float):
         steps_per_sec = 1 / elapsed_time if elapsed_time > 0 else float('inf')
 
-        table = Table(title=f"Epoch {epoch} | Step {step}", show_header=True, header_style="bold magenta", expand=True)
+        table = Table(title=f"Epoch {epoch} | Step {step} | Task {task_idx}", show_header=True, header_style="bold magenta", expand=True)
         
         # Row 1: Headers
         table.add_column("Loss (Main/Proto/Gate/τ)", justify="center")

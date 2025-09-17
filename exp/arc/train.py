@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Any
 
 import torch
+torch.autograd.set_detect_anomaly(True)
 import torch.nn.functional as F
 import torch.nn as nn
 from rich.console import Console
@@ -16,6 +17,7 @@ from .evaluation import EvaluationStep
 from .model import ArcTransformer
 from .observer import Observer
 from .tokenizer import ArcColorTokenizer
+from .optimizer import calculate_meta_loss, calculate_smp_masks
 
 
 class Trainer:
@@ -64,9 +66,11 @@ class Trainer:
         self.checkpoint_dir = Path(__file__).parent / "checkpoints"
         self.checkpoint_dir.mkdir(exist_ok=True)
         self.global_step = 0
+        self.epoch = 0
 
     def _save_checkpoint(self):
         state = {
+            'epoch': self.epoch,
             'step': self.global_step,
             'model_state_dict': self.model.state_dict(),
             'optimizer_main_state_dict': self.optimizer_main.state_dict(),
@@ -88,6 +92,7 @@ class Trainer:
         self.optimizer_main.load_state_dict(checkpoint['optimizer_main_state_dict'])
         self.optimizer_meta.load_state_dict(checkpoint['optimizer_meta_state_dict'])
         self.global_step = checkpoint['step']
+        self.epoch = checkpoint.get('epoch', 0)
         self.console.print(f"[bold blue]Loaded checkpoint from {latest_checkpoint} at step {self.global_step}[/bold blue]")
 
     def _calculate_token_accuracy(self, logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
@@ -103,14 +108,18 @@ class Trainer:
         return (preds == active_labels).float().mean()
 
 
-    def _run_step(self, task_data: dict[str, Any], view_idx: int, epoch: int):
+    def _run_step(self, task_data: dict[str, Any], view_idx: int, epoch: int, task_idx: int):
         start_time = time.time()
         transforms = self.consistency_tools.get_transforms()
-        input_grid = torch.tensor(task_data['test'][0]['input'])
-        output_grid = torch.tensor(task_data['test'][0]['output'])
+        
+        # Ensure all tensor operations are on the target device from the start
+        input_grid = torch.tensor(task_data['test'][0]['input'], device=self.device)
+        output_grid = torch.tensor(task_data['test'][0]['output'], device=self.device)
         input_grid_aug, output_grid_aug = transforms[view_idx](input_grid), transforms[view_idx](output_grid)
 
-        view_task_data = {'train': task_data['train'], 'test': [{'input': input_grid_aug.tolist(), 'output': output_grid_aug.tolist()}]}
+        # TODO: Optimize serializer to work directly with device tensors
+        # For now, the bottleneck is likely the .to() calls on input_ids and labels
+        view_task_data = {'train': task_data['train'], 'test': [{'input': input_grid_aug.cpu().tolist(), 'output': output_grid_aug.cpu().tolist()}]}
         input_ids_list, labels_list = self.serializer.serialize_task_with_context(view_task_data)
 
         if len(input_ids_list) > self.config.model.max_position_embeddings: return None
@@ -122,62 +131,52 @@ class Trainer:
         self.optimizer_main.zero_grad()
         self.optimizer_meta.zero_grad()
 
-        logits, _, _, _, _, all_block_raw_weights, _ = self.model(input_ids)
+        logits, _, _, _, all_sbl_inputs, all_block_raw_weights, _ = self.model(input_ids)
         main_loss = F.cross_entropy(logits[:, :-1, :].contiguous().view(-1, self.config.model.vocab_size), labels[:, 1:].contiguous().view(-1), ignore_index=-100)
-
         if not torch.isfinite(main_loss): return None
         
-        main_loss.backward(create_graph=True)
+        main_loss.backward(retain_graph=True)
 
-        proto_loss_total = torch.tensor(0.0, device=self.device)
-        gate_loss_total = torch.tensor(0.0, device=self.device)
-        surprise_norms_for_smp = []
-        
-        spl_module_type = type(self.model.blocks[0].attn.sbl_qkv)
-        spl_layers_in_order = [m for m in self.model.modules() if isinstance(m, spl_module_type)]
-        
-        for spl_layer in spl_layers_in_order:
-            if spl_layer.mu_weight.grad is not None:
-                # SAPS V5: 梯度强度作为惊奇度 - 使用绝对值创建对称排斥场
-                surprise_map_raw = spl_layer.mu_weight.grad.detach()
-                surprise_map = torch.abs(surprise_map_raw)  # 关键：统一扰动强度
-                
-                # 原型对齐：推动p与|S|反向
-                proto_loss = -F.cosine_similarity(spl_layer.proto_weight, -surprise_map, dim=-1).mean()
-                proto_loss_total += proto_loss
-                
-                # 门控校准：推动g与|S|的L1范数正相关
-                surprise_norm = torch.norm(surprise_map, p=1, dim=-1)  # L1范数：sum(|S_j|)
-                gate_loss = -(spl_layer.gate_param * surprise_norm).mean()
-                gate_loss_total += gate_loss
-                surprise_norms_for_smp.append(surprise_norm)
-
-        meta_loss = self.config.w_proto * proto_loss_total + self.config.w_gate * gate_loss_total
-        if torch.isfinite(meta_loss):
-            meta_loss.backward()
-            self.optimizer_meta.step()
-
+        # --- Unified Dynamics based on Entropy ---
         with torch.no_grad():
-            for i, spl_layer in enumerate(spl_layers_in_order):
-                if i < len(surprise_norms_for_smp):
-                    s_norm = surprise_norms_for_smp[i]
-                    num_total = s_norm.shape[0]
-                    # SAPS V4: 熵驱动的自适应可塑性
-                    probs = F.softmax(logits, dim=-1)
-                    entropy = -torch.sum(probs * torch.log(probs + 1e-9), dim=-1).mean()
-                    max_entropy = torch.log(torch.tensor(self.config.model.vocab_size, device=self.device))
-                    p_dyn = entropy / max_entropy
-                    num_winners = int(num_total * p_dyn)
-                    
-                    if num_winners < num_total:
-                        winner_indices = s_norm.argsort()[:num_winners]
-                        grad_mask = torch.zeros_like(s_norm)
-                        grad_mask[winner_indices] = 1.0
-                        
-                        if spl_layer.mu_weight.grad is not None:
-                            spl_layer.mu_weight.grad *= grad_mask.unsqueeze(-1)
-                        if spl_layer.mu_bias.grad is not None:
-                            spl_layer.mu_bias.grad *= grad_mask
+            probs = F.softmax(logits, dim=-1)
+            entropy = -torch.sum(probs * torch.log(probs + 1e-9), dim=-1).mean()
+            max_entropy = torch.log(torch.tensor(self.config.model.vocab_size, device=self.device))
+            p_dyn = entropy / max_entropy
+
+        # --- Meta-parameter Update ---
+        spl_module_type = type(self.model.blocks[0].attn.sbl_qkv)
+        spl_layers = [m for m in self.model.modules() if isinstance(m, spl_module_type)]
+        
+        layers_with_grads, proto_weights_w_grads, gate_params_w_grads, mu_grads_detached, sbl_inputs_w_grads = [], [], [], [], []
+        for i, layer in enumerate(spl_layers):
+            if layer.mu_weight.grad is not None:
+                layers_with_grads.append(layer)
+                proto_weights_w_grads.append(layer.proto_weight)
+                gate_params_w_grads.append(layer.gate_param)
+                mu_grads_detached.append(layer.mu_weight.grad.detach()) # Key: Use detached, static grads
+                sbl_inputs_w_grads.append(all_sbl_inputs[i])
+
+        if mu_grads_detached:
+            proto_loss_total, gate_loss_total = calculate_meta_loss(
+                proto_weights_w_grads, gate_params_w_grads, mu_grads_detached, sbl_inputs_w_grads, p_dyn
+            )
+            meta_loss = self.config.w_proto * proto_loss_total + self.config.w_gate * gate_loss_total
+            if torch.isfinite(meta_loss):
+                meta_loss.backward()
+                self.optimizer_meta.step()
+        else:
+            proto_loss_total = torch.tensor(0.0); gate_loss_total = torch.tensor(0.0); meta_loss = torch.tensor(0.0)
+
+        # --- Main Parameter Update (SMP Mask) ---
+        if mu_grads_detached:
+            grad_masks = calculate_smp_masks(mu_grads_detached, p_dyn)
+            with torch.no_grad():
+                for i, spl_layer in enumerate(layers_with_grads):
+                    grad_mask = grad_masks[i]
+                    spl_layer.mu_weight.grad.mul_(grad_mask.unsqueeze(-1))
+                    if spl_layer.mu_bias.grad is not None:
+                        spl_layer.mu_bias.grad.mul_(grad_mask)
 
         torch.nn.utils.clip_grad_norm_([p for p in self.optimizer_main.param_groups[0]['params'] if p.grad is not None], 1.0)
         self.optimizer_main.step()
@@ -211,6 +210,8 @@ class Trainer:
             gate_loss_val = gate_loss_total.item() if torch.isfinite(gate_loss_total) else 0.0
             proto_loss_val = proto_loss_total.item() if torch.isfinite(proto_loss_total) else 0.0
 
+            # τ (tau) is the unnormalized entropy of the model's output logits
+            tau = entropy.item()
             metrics = {
                 "main_loss": main_loss.item(), "proto_loss": proto_loss_val,
                 "gate_loss": gate_loss_val, "meta_loss": meta_loss_val,
@@ -221,11 +222,12 @@ class Trainer:
                 "activation_rate_ln": act_rate_ln,
                 "seq_len": float(seq_len),
                 "p_dyn": p_dyn.item(),
+                "tau": tau,
             }
 
         elapsed_time = time.time() - start_time
         if self.global_step % self.config.log_interval == 0:
-            self.observer.log_step(epoch, self.global_step, metrics, elapsed_time)
+            self.observer.log_step(epoch, self.global_step, task_idx, metrics, elapsed_time)
             self._save_checkpoint()
 
         if self.global_step > 0 and self.global_step % self.config.eval_interval == 0:
@@ -244,11 +246,11 @@ class Trainer:
             best_loss = float('inf')
             steps_without_improvement = 0
             inner_step = 0
-            MAX_INNER_STEPS = 200
+            MAX_INNER_STEPS = 2000
 
             while inner_step < MAX_INNER_STEPS:
                 view_idx = inner_step % 8
-                current_loss = self._run_step(task_data, view_idx, epoch)
+                current_loss = self._run_step(task_data, view_idx, epoch, task_idx)
 
                 if current_loss is None:
                     if inner_step == 0:
@@ -257,14 +259,14 @@ class Trainer:
                     inner_step += 1
                     continue
 
-                if current_loss < 0.1:
+                if current_loss < 0.01:
                     self.console.print(f"Task {task_idx} CONVERGED with loss {current_loss:.4f} in {inner_step + 1} steps.")
                     break
                 
                 if current_loss < best_loss:
                     best_loss = current_loss
                     steps_without_improvement = 0
-                else:
+                elif best_loss < 0.5:
                     steps_without_improvement += 1
                 
                 if steps_without_improvement >= 16:
@@ -281,7 +283,8 @@ class Trainer:
     def train(self):
         self._load_checkpoint()
         self.console.print("[bold green]Starting Training...[/bold green]")
-        for epoch in range(self.config.num_epochs):
+        for epoch in range(self.epoch, self.config.num_epochs):
+            self.epoch = epoch
             self._train_epoch(epoch)
         self.console.print("[bold green]Training Finished.[/bold green]")
 
