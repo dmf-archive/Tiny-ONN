@@ -57,7 +57,6 @@ class SparseProtoLinear(nn.Module):
         nn.init.constant_(self.gate_param, 0.0)
 
     def forward(self, x: torch.Tensor, effective_proto: torch.Tensor, gate_temperature: float) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        # Normalized Prototype Routing to decouple direction and norm
         x_norm = F.normalize(x, p=2.0, dim=-1)
         proto_norm = F.normalize(effective_proto, p=2.0, dim=-1)
         scores = torch.matmul(x_norm, proto_norm.t())
@@ -101,7 +100,7 @@ class DynamicInfiniteHeadAttention(nn.Module):
         attn_out = F.scaled_dot_product_attention(q, k, v, is_causal=is_causal)
 
         m_o, c_o, rw_o = self.sbl_o(attn_out, effective_protos["attn_o"], gate_temperature)
-        
+
         masked_outputs = [m_qkv, m_o]
         comp_outputs = [c_qkv, c_o]
         raw_weights = [rw_qkv, rw_o]
@@ -138,8 +137,6 @@ class MoIETransformerBlock(nn.Module):
         self.ln2 = nn.LayerNorm(config.hidden_size, dtype=dtype)
         self.ffn = DynamicInfiniteExpert(config, dtype=dtype)
 
-        # Create transform layers for each proto residual connection
-        # The transform for 'ffn_sbl2' must match its input dimension (d_ffn), not hidden_size.
         d_ffn = config.hidden_size * config.d_ffn_factor
         self.proto_transforms = nn.ModuleDict({
             "attn_qkv": nn.Linear(config.hidden_size, config.hidden_size, bias=False, dtype=dtype),
@@ -162,10 +159,8 @@ class MoIETransformerBlock(nn.Module):
         prev_protos: dict[str, torch.Tensor] | None = None,
         gate_temperature: float = 1.0,
     ) -> tuple[torch.Tensor, list[torch.Tensor], list[torch.Tensor], list[torch.Tensor], list[torch.Tensor], tuple[torch.Tensor, torch.Tensor], dict[str, torch.Tensor]]:
-        
+
         effective_protos = {}
-        # Define the mapping from SPL module name to its specific previous proto residual
-        # Each module now only receives residual from its direct predecessor of the same type.
         proto_residual_mapping = {
             "attn_qkv": "attn_qkv",
             "attn_o": "attn_o",
@@ -263,16 +258,16 @@ class ArcTransformer(nn.Module):
                 prev_protos_for_block["ffn_sbl1"] = prev_ffn_sbl1
             if prev_ffn_sbl2 is not None:
                 prev_protos_for_block["ffn_sbl2"] = prev_ffn_sbl2
-            
+
             x, masked, comp, raw, sbl_inputs, present_key_value, effective_protos = block(
                 x, position_embeddings, past_key_values[i], prev_protos_for_block if prev_protos_for_block else None, gate_temperature
             )
-            
+
             prev_attn_qkv = effective_protos.get("attn_qkv")
             prev_attn_o = effective_protos.get("attn_o")
             prev_ffn_sbl1 = effective_protos.get("ffn_sbl1")
             prev_ffn_sbl2 = effective_protos.get("ffn_sbl2")
-            
+
             present_key_values.append(present_key_value)
             all_masked_outputs.extend(masked)
             all_comp_outputs.extend(comp)

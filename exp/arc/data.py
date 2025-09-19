@@ -28,15 +28,14 @@ class GridSerializer:
 
         prompt_part1 = [self.tokenizer.bos_token_id, self.tokenizer.vocab["problem"]] + input_grid_ids
         prompt_part2 = [self.tokenizer.vocab["solution"]]
-        
+
         full_ids = prompt_part1 + prompt_part2 + output_grid_ids + [self.tokenizer.eos_token_id]
-        
+
         labels = full_ids
-        
+
         return full_ids, labels
 
     def serialize_for_inference(self, task_data: dict[str, Any]) -> list[int]:
-        # This now only uses the test input, ignoring the train pairs for context
         test_input_grid_ids = self._serialize_grid(task_data['test'][0]['input'])
         prompt_ids = [self.tokenizer.bos_token_id, self.tokenizer.vocab["problem"]] + test_input_grid_ids + [self.tokenizer.vocab["solution"]]
         return prompt_ids
@@ -45,26 +44,24 @@ class InMemoryArcDataset(Dataset):
     def __init__(self, data_path: str, split: str = "training"):
         self.data_path = Path(data_path) / split
         self.mini_tasks = []
-        
+
         file_paths = sorted(list(self.data_path.glob("*.json")))
         for path in file_paths:
             with open(path) as f:
                 task_data = json.load(f)
-            # Flatten all train and test pairs into a single list of mini-tasks
             for pair in task_data['train']:
                 self.mini_tasks.append(pair)
             for pair in task_data['test']:
                 self.mini_tasks.append(pair)
-        
-        # Sort mini_tasks by their serialized length to maximize batching efficiency
+
         tokenizer_for_sorting = ArcColorTokenizer()
         serializer_for_sorting = GridSerializer(tokenizer_for_sorting)
-        
+
         tasks_with_lengths = []
         for mini_task in self.mini_tasks:
             input_ids, _ = serializer_for_sorting.serialize_mini_task(mini_task)
             tasks_with_lengths.append((mini_task, len(input_ids)))
-        
+
         sorted_tasks = sorted(tasks_with_lengths, key=lambda x: x[1])
         self.mini_tasks = [task for task, length in sorted_tasks]
 
@@ -102,7 +99,7 @@ class ArcCollator:
         return {
             "input_ids": padded_input_ids,
             "labels": padded_labels,
-            "task_data": batch # Note: 'task_data' now refers to a batch of mini_tasks
+            "task_data": batch
         }
 
 class GridDeserializer:
@@ -131,7 +128,7 @@ class GridDeserializer:
 
         try:
             return torch.tensor(grid_rows, dtype=torch.long)
-        except ValueError: # Ragged tensor
+        except ValueError:
             max_len = max(len(r) for r in grid_rows)
             padded_rows = [r + [0] * (max_len - len(r)) for r in grid_rows]
             return torch.tensor(padded_rows, dtype=torch.long)

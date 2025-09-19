@@ -1,14 +1,12 @@
 import itertools
 import random
-from pathlib import Path
 from typing import Any
 
 import torch
-import torch.nn.functional as F
 from rich.progress import Progress
 from torch.utils.data import DataLoader, Subset
 
-from .config import GenerationConfig
+from .config import TrainConfig
 from .consistency import ConsistencyTools
 from .data import GridDeserializer, GridSerializer
 from .model import ArcTransformer
@@ -16,7 +14,6 @@ from .observer import Observer
 
 
 class SimpleEvaluator:
-    """A minimal, hardcoded evaluator for ARC tasks. No beams, no candidates, just inference."""
 
     def __init__(self, model: ArcTransformer, serializer: GridSerializer, deserializer: GridDeserializer, observer: Observer, device: torch.device):
         self.model = model
@@ -28,23 +25,20 @@ class SimpleEvaluator:
 
     @torch.no_grad()
     def evaluate_single(self, mini_task: dict[str, Any], gate_temperature: float) -> tuple[torch.Tensor, list[int]]:
-        """Evaluate a single mini-task (input-output pair) and return the predicted output grid."""
         input_grid = torch.tensor(mini_task['input'], device=self.device)
         h_in, w_in = input_grid.shape
-        max_new_tokens = int(h_in * w_in * 9) + 50 # Heuristic for max tokens
+        max_new_tokens = int(h_in * w_in * 9) + 50
 
         task_data_for_serializer = {'test': [mini_task]}
         prompt_ids = self.serializer.serialize_for_inference(task_data_for_serializer)
         prompt_tensor = torch.tensor([prompt_ids], dtype=torch.long, device=self.device)
 
-        # Greedy generation is sufficient for evaluation
         generated_tokens = self._greedy_generate(prompt_tensor, max_new_tokens, gate_temperature)
         pred_grid = self.deserializer.deserialize(generated_tokens)
 
         return pred_grid, generated_tokens
 
     def _greedy_generate(self, input_ids: torch.Tensor, max_new_tokens: int, gate_temperature: float) -> list[int]:
-        """Performs greedy generation without any logits warping or beam search."""
         tokens = input_ids.clone()
         past_key_values = None
 
@@ -55,7 +49,6 @@ class SimpleEvaluator:
             next_token = torch.argmax(next_token_logits, dim=-1).unsqueeze(-1)
             tokens = torch.cat([tokens, next_token], dim=-1)
 
-            # Stop on EOS token
             if next_token.item() == self.serializer.tokenizer.eos_token_id:
                 break
 
@@ -64,31 +57,28 @@ class SimpleEvaluator:
 
 
 class EvaluationStep:
-    """Orchestrates the 3-phase evaluation protocol."""
 
-    def __init__(self, model: ArcTransformer, serializer: GridSerializer, deserializer: GridDeserializer, observer: Observer, device: torch.device, train_dataset: Any):
+    def __init__(self, model: ArcTransformer, serializer: GridSerializer, deserializer: GridDeserializer, observer: Observer, device: torch.device, train_dataset: Any, config: TrainConfig):
         self.model = model
         self.train_dataset = train_dataset
         self.serializer = serializer
         self.deserializer = deserializer
         self.observer = observer
         self.device = device
+        self.config = config
         self.evaluator = SimpleEvaluator(self.model, self.serializer, self.deserializer, self.observer, self.device)
 
     def _run_eval_loop(self, loader: DataLoader, num_samples: int, title: str, global_step: int) -> tuple[int, int]:
-        """Core evaluation loop: run inference on a set of samples and count correct predictions."""
         total_correct, evaluated_count = 0, 0
         visualized_this_loop = False
 
         with Progress(console=self.observer.console, transient=True) as progress:
             task = progress.add_task(f"[cyan]{title}...", total=num_samples)
             for item in itertools.islice(loader, num_samples):
-                # In the new data format, each item is a single mini-task (input-output pair)
                 mini_task = item if isinstance(item, dict) else item[0]
                 target_grid_raw = torch.tensor(mini_task['output'], device=self.device)
 
-                # Use the same gate_temperature as training for consistency
-                pred_grid, generated_tokens = self.evaluator.evaluate_single(mini_task, gate_temperature=self.observer.config.gate_temperature)
+                pred_grid, generated_tokens = self.evaluator.evaluate_single(mini_task, self.config.gate_sigmoid_temperature)
 
                 is_correct = 0
                 if torch.equal(pred_grid.to(self.device), target_grid_raw):
@@ -106,11 +96,9 @@ class EvaluationStep:
         return total_correct, evaluated_count
 
     def run(self, eval_loader: Any, current_task_idx: int, global_step: int, verbose: bool = False) -> dict[str, float]:
-        """Runs the full 3-phase evaluation protocol."""
         self.model.eval()
         self.observer.console.print(f"\n[bold cyan]--- Running 3-Phase Evaluation @ Step {global_step} ---[/bold cyan]")
 
-        # Phase 1: Historical Task Sampling (Forgetting Check)
         num_historical = current_task_idx
         if num_historical == 0:
             self.observer.console.print("[yellow]Phase 1 skipped (no historical tasks to check for forgetting).[/yellow]")
@@ -125,8 +113,7 @@ class EvaluationStep:
                 self.model.train()
                 return {"eval_grid_acc": correct / total if total > 0 else 0}
             self.observer.console.print(f"[bold green]Phase 1 PASSED: No forgetting detected ({correct}/{total}).[/bold green]")
-        
-        # Phase 2: Quick Eval on Evaluation Set (Generalization Check 1)
+
         num_to_sample_quick = min(5, len(eval_loader.dataset))
         correct_quick, total_quick = self._run_eval_loop(eval_loader, num_to_sample_quick, "Phase 2: Quick Generalization", global_step)
         if correct_quick < total_quick:
@@ -135,10 +122,9 @@ class EvaluationStep:
             return {"eval_grid_acc": correct_quick / total_quick if total_quick > 0 else 0}
         self.observer.console.print(f"[bold green]Phase 2 PASSED: Quick generalization OK ({correct_quick}/{total_quick}). Proceeding to full evaluation.[/bold green]")
 
-        # Phase 3: Full Evaluation (Final Generalization Check)
         num_full = len(eval_loader.dataset)
         correct_full, total_full = self._run_eval_loop(eval_loader, num_full, "Phase 3: Full Evaluation", global_step)
-        
+
         final_acc = correct_full / total_full if total_full > 0 else 0
         metrics = {"eval_grid_acc": final_acc, "total_count": float(total_full)}
         self.observer.log_eval_summary(metrics, global_step)

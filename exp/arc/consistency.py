@@ -1,13 +1,13 @@
 from collections.abc import Callable
-from typing import List
 
 import torch
+
 
 class ConsistencyTools:
     @staticmethod
     @torch.jit.script
     def _jit_apply_color_transform(grids: torch.Tensor, color_map: torch.Tensor) -> torch.Tensor:
-        mapping = torch.arange(10, device=grids.device) 
+        mapping = torch.arange(10, device=grids.device)
         mapping[:10] = color_map
         return mapping[grids]
 

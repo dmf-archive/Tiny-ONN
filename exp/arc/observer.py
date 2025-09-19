@@ -21,7 +21,7 @@ class Observer:
         steps_per_sec = 1 / elapsed_time if elapsed_time > 0 else float('inf')
 
         table = Table(title=f"Epoch {epoch} | Step {step} | Task {task_idx}", show_header=True, header_style="bold magenta", expand=True)
-        
+
         table.add_column("Loss (M/P/G)", justify="center")
         table.add_column("Acc", justify="center")
         table.add_column("τ", justify="center")
@@ -48,7 +48,7 @@ class Observer:
             f"{int(metrics.get('seq_len', 0))} / {metrics.get('seq_entropy', 0.0):.2f}",
             f"{steps_per_sec:.2f}"
         )
-        
+
         self.console.print(table)
 
     def _create_grid_text(self, grid: torch.Tensor) -> Text:
@@ -81,7 +81,7 @@ class Observer:
 
         table.add_row(input_text, target_text, pred_text)
         self.console.print(table)
-        
+
         if pred_tokens:
             self.console.print(f"[bold]Generated Token Stream ({len(pred_tokens)} tokens):[/bold]", highlight=False)
             self.console.print(str(pred_tokens))
@@ -95,6 +95,7 @@ class Observer:
         eval_grid_acc = metrics.get('eval_grid_acc', 0.0)
         total_count = int(metrics.get('total_count', 0))
         summary_text = f"Avg Loss: {eval_loss:.4f} | Grid Accuracy: {eval_grid_acc:.4f} on {total_count} samples."
-        self.console.print(Padding(f"[bold yellow]===== EVALUATION COMPLETE (Step: {step}) =====\n"
-                                   f"{summary_text}\n"
-                                   f"=============================================[/bold yellow]", (1, 2)))
+        self.console.print(Padding(
+            f"[bold yellow]===== EVALUATION COMPLETE (Step: {step}) =====\n"
+            f"{summary_text}\n"
+            f"=============================================[/bold yellow]", (1, 2)))
