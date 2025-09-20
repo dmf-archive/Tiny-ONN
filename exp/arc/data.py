@@ -31,7 +31,8 @@ class GridSerializer:
 
         full_ids = prompt_part1 + prompt_part2 + output_grid_ids + [self.tokenizer.eos_token_id]
 
-        labels = full_ids
+        prompt_len = len(prompt_part1) + len(prompt_part2)
+        labels = [-100] * prompt_len + output_grid_ids + [self.tokenizer.eos_token_id]
 
         return full_ids, labels
 
@@ -49,10 +50,20 @@ class InMemoryArcDataset(Dataset):
         for path in file_paths:
             with open(path) as f:
                 task_data = json.load(f)
-            for pair in task_data['train']:
-                self.mini_tasks.append(pair)
-            for pair in task_data['test']:
-                self.mini_tasks.append(pair)
+            
+            if split == "training":
+                for pair in task_data['train']:
+                    self.mini_tasks.append(pair)
+                for pair in task_data['test']:
+                    self.mini_tasks.append(pair)
+            elif split == "evaluation":
+                for pair in task_data['train']:
+                    self.mini_tasks.append(pair)
+
+                if 'test' in task_data and task_data['test'] and 'output' in task_data['test']:
+                    for pair in task_data['test']:
+                        self.mini_tasks.append(pair)
+
 
         tokenizer_for_sorting = ArcColorTokenizer()
         serializer_for_sorting = GridSerializer(tokenizer_for_sorting)

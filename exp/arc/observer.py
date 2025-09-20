@@ -27,7 +27,7 @@ class Observer:
         table.add_column("τ", justify="center")
         table.add_column("PI", justify="center")
         table.add_column("Act % (L0/Mid/LN/Avg)", justify="center")
-        table.add_column("Avg Gate (Top10/All)", justify="center")
+        table.add_column("Gate (Top10/All/Max)", justify="center")
         table.add_column("Proto Norm", justify="center")
         table.add_column("Seq (L/E)", justify="center")
         table.add_column("Speed (st/s)", justify="center")
@@ -43,7 +43,7 @@ class Observer:
             f"{tau:.3f}",
             f"{metrics.get('pi_score', 0.0):.3f}",
             f"{act_l0:.1f}/{act_mid:.1f}/{act_ln:.1f}/{act_avg:.1f}%",
-            f"{metrics.get('top10_gate_mean', 0.0):.3f} / {metrics.get('avg_gate_val', 0.0):.3f}",
+            f"{metrics.get('top10_gate_mean', 0.0):.3f}/{metrics.get('avg_gate_val', 0.0):.3f}/{metrics.get('max_gate_val', 0.0):.3f}",
             f"{metrics.get('avg_proto_norm', 0.0):.2f}",
             f"{int(metrics.get('seq_len', 0))} / {metrics.get('seq_entropy', 0.0):.2f}",
             f"{steps_per_sec:.2f}"

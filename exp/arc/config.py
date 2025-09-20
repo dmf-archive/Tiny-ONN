@@ -25,14 +25,13 @@ class TrainConfig:
 
     w_proto: float = 1.0
     w_gate: float = 1.0
-    base_decay: float = 1e-4
-    num_epochs: int = 100
-    gate_sigmoid_temperature: float = 0.3
+    base_decay: float = 3e-2
+    num_epochs: int = 20
 
     device: str = "cuda"
     seed: int = 42
 
-    eval_interval: int = 38000
+    eval_interval: int = 1000
     log_interval: int = 10
     max_checkpoints: int = 3
 

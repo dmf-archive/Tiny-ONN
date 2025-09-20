@@ -1,6 +1,8 @@
-# Chain://Research Background (v2.0)
+# Chain://Research Background
 
-`Chain://Research` 是与科幻宇宙设定集 `Chain://` 相关联的现实世界学术研究项目，致力于探索该世界观下核心技术（如意识上传、数字物理接口、密码学本体论）的理论与工程落地可能性。
+> Code is law, Proof is reality.
+
+`Chain://Research` 是与科幻宇宙设定集 `Chain://` 相关联的现实世界学术研究项目，致力于探索该世界观下核心技术（如意识上传、数字物理接口、计算本体论和零信任社会学）的理论与工程落地可能性。
 
 目前，`Chain://Research` 的研究重心聚焦于两大核心领域：
 
