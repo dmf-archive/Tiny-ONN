@@ -20,19 +20,19 @@ class TrainConfig:
     model: ModelConfig = field(default_factory=ModelConfig)
     data: DataConfig = field(default_factory=DataConfig)
 
-    lr_main: float = 5e-4
-    lr_meta: float = 3e-3
+    lr_main: float = 3e-3
+    lr_meta: float = 5e-3
 
     w_proto: float = 1.0
     w_gate: float = 1.0
     base_decay: float = 1e-4
     num_epochs: int = 100
-    gate_sigmoid_temperature: float = 0.5
+    gate_sigmoid_temperature: float = 0.3
 
     device: str = "cuda"
     seed: int = 42
 
-    eval_interval: int = 20000
+    eval_interval: int = 38000
     log_interval: int = 10
     max_checkpoints: int = 3
 
