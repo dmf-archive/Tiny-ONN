@@ -24,7 +24,7 @@ class SimpleEvaluator:
         self.consistency_tools = ConsistencyTools()
 
     @torch.no_grad()
-    def evaluate_single(self, mini_task: dict[str, Any], gate_temperature: float) -> tuple[torch.Tensor, list[int]]:
+    def evaluate_single(self, mini_task: dict[str, Any]) -> tuple[torch.Tensor, list[int]]:
         input_grid = torch.tensor(mini_task['input'], device=self.device)
         h_in, w_in = input_grid.shape
         max_new_tokens = int(h_in * w_in * 9) + 50
@@ -33,18 +33,18 @@ class SimpleEvaluator:
         prompt_ids = self.serializer.serialize_for_inference(task_data_for_serializer)
         prompt_tensor = torch.tensor([prompt_ids], dtype=torch.long, device=self.device)
 
-        generated_tokens = self._greedy_generate(prompt_tensor, max_new_tokens, gate_temperature)
+        generated_tokens = self._greedy_generate(prompt_tensor, max_new_tokens)
         pred_grid = self.deserializer.deserialize(generated_tokens)
 
         return pred_grid, generated_tokens
 
-    def _greedy_generate(self, input_ids: torch.Tensor, max_new_tokens: int, gate_temperature: float) -> list[int]:
+    def _greedy_generate(self, input_ids: torch.Tensor, max_new_tokens: int) -> list[int]:
         tokens = input_ids.clone()
         past_key_values = None
 
         for _ in range(max_new_tokens):
             model_input = tokens if past_key_values is None else tokens[:, -1:]
-            logits, _, _, _, _, _, _, past_key_values = self.model(model_input, past_key_values=past_key_values, gate_temperature=gate_temperature)
+            logits, _, _, _, _, _, _, past_key_values = self.model(model_input, past_key_values=past_key_values)
             next_token_logits = logits[:, -1, :]
             next_token = torch.argmax(next_token_logits, dim=-1).unsqueeze(-1)
             tokens = torch.cat([tokens, next_token], dim=-1)
@@ -76,9 +76,14 @@ class EvaluationStep:
             task = progress.add_task(f"[cyan]{title}...", total=num_samples)
             for item in itertools.islice(loader, num_samples):
                 mini_task = item if isinstance(item, dict) else item[0]
+                
+                if 'output' not in mini_task:
+                    progress.update(task, advance=1)
+                    continue
+                    
                 target_grid_raw = torch.tensor(mini_task['output'], device=self.device)
 
-                pred_grid, generated_tokens = self.evaluator.evaluate_single(mini_task, self.config.gate_sigmoid_temperature)
+                pred_grid, generated_tokens = self.evaluator.evaluate_single(mini_task)
 
                 is_correct = 0
                 if torch.equal(pred_grid.to(self.device), target_grid_raw):

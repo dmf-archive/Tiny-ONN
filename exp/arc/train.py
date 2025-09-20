@@ -24,7 +24,7 @@ torch.autograd.set_detect_anomaly(True)
 class Trainer:
     def __init__(self, config: TrainConfig):
         self.config = config
-        self.dead_proto_threshold = 0.01
+        self.dead_proto_threshold = 0.1
         self.device = torch.device(config.device)
         torch.manual_seed(config.seed)
 
@@ -162,8 +162,7 @@ class Trainer:
             for module in all_spl_layers:
                 mu_weight, proto_weight, _, gate_param = self._get_spl_module_attributes(module)
 
-                proto_norms = torch.norm(proto_weight, p=2, dim=-1)
-                dead_mask = proto_norms < self.dead_proto_threshold
+                dead_mask = gate_param.data < 0.01
                 num_dead = torch.sum(dead_mask).item()
 
                 if num_dead > 0:
@@ -173,33 +172,28 @@ class Trainer:
                     device = proto_weight.device
                     dtype = proto_weight.dtype
 
-                    live_protos = proto_weight[~dead_mask]
+                    live_mask = ~dead_mask
+                    live_protos = proto_weight[live_mask]
+
                     if live_protos.numel() > 0:
                         center = live_protos.mean(dim=0, keepdim=True)
                         distances = torch.norm(live_protos - center, p=2, dim=-1)
                         avg_distance = distances.mean()
-                        
-                        frontier_scale = 2.0 * avg_distance
+                        frontier_scale = 2.0 * avg_distance if avg_distance > 1e-6 else 1.0
 
                         new_protos = torch.empty(num_dead, in_features, device=device, dtype=dtype)
                         for i in range(num_dead):
                             direction = torch.randn(in_features, device=device)
-                            direction = direction / torch.norm(direction) * frontier_scale
+                            direction = direction / (torch.norm(direction) + 1e-9) * frontier_scale
                             new_protos[i] = center.squeeze(0) + direction
                     else:
                         new_protos = torch.empty(num_dead, in_features, device=device, dtype=dtype)
                         nn.init.kaiming_uniform_(new_protos, a=math.sqrt(5))
-                    
+
                     proto_weight.data[dead_mask] = new_protos
 
                     new_mu = torch.empty_like(mu_weight.data[dead_mask])
-                    if live_protos.numel() > 0:
-                        nn.init.kaiming_uniform_(new_mu, a=math.sqrt(5))
-                        mu_norms = torch.norm(new_mu, p=2, dim=-1, keepdim=True)
-                        new_mu = new_mu / mu_norms * frontier_scale * 0.5
-                    else:
-                        nn.init.kaiming_uniform_(new_mu, a=math.sqrt(5))
-                    
+                    nn.init.kaiming_uniform_(new_mu, a=math.sqrt(5))
                     mu_weight.data[dead_mask] = new_mu
 
                     gate_param.data[dead_mask] = 0.1
@@ -235,6 +229,7 @@ class Trainer:
 
     def _calculate_meta_loss(
         self,
+        main_loss: float,
         proto_weights: list[torch.Tensor],
         gate_params: list[torch.Tensor],
         mu_grads: list[torch.Tensor],
@@ -246,7 +241,6 @@ class Trainer:
 
         device = proto_weights[0].device
         dtype = proto_weights[0].dtype
-
         total_proto_loss = torch.tensor(0.0, device=device, dtype=dtype)
         total_gate_loss = torch.tensor(0.0, device=device, dtype=dtype)
 
@@ -254,72 +248,79 @@ class Trainer:
             if mg is None:
                 continue
 
+            # 1. Calculate raw surprise
             surprise_norm = torch.linalg.vector_norm(mg.detach(), ord=2, dim=-1).float()
+            
+            # 2. Normalize and scale surprise to get a meaningful score
+            if surprise_norm.numel() > 1:
+                surprise_normalized = (surprise_norm - surprise_norm.mean()) / (surprise_norm.std() + 1e-9)
+                S_score = torch.sigmoid(surprise_normalized)
+            else:
+                S_score = torch.zeros_like(surprise_norm) # If only one expert, surprise is 0
+            
+            # 3. Use S_score for gate loss (lower S_score -> higher target gate)
+            target_gate = (self.config.gate_max_limit - main_loss) - S_score
+            total_gate_loss += F.mse_loss(gp, target_gate.to(dtype=gp.dtype))
 
-            total_elements = rw.numel()
-            activated_elements = (rw > 0).sum().float()
-            activation_rate = activated_elements / total_elements
-            num_experts = surprise_norm.numel()
+            # 4. Use S_score for prototype shaping (lower S_score -> good expert)
+            num_experts = S_score.numel()
+            k = max(1, math.ceil((rw > 0).sum().float() / rw.numel() * num_experts))
+            _, good_indices = torch.topk(S_score, k, largest=False)
+            
+            sbl_input_flat = si.detach().view(-1, si.shape[-1])
+            sbl_input_norm = F.normalize(sbl_input_flat, p=2.0, dim=-1)
+            
+            raw_weight_flat = rw.detach().view(-1, rw.shape[-1])
+            activation_mask_good = (raw_weight_flat[:, good_indices] > 0).to(sbl_input_norm.dtype)
+            
+            token_counts = activation_mask_good.sum(dim=0)
+            valid_protos_mask = token_counts > 0
+            if not valid_protos_mask.any():
+                continue
 
-            k = max(1, math.ceil(activation_rate * num_experts))
+            activation_mask_good = activation_mask_good[:, valid_protos_mask]
+            good_indices = good_indices[valid_protos_mask]
+            token_counts = token_counts[valid_protos_mask]
 
-            _, good_indices = torch.topk(surprise_norm, k, largest=False)
-            _, bad_indices = torch.topk(surprise_norm, k, largest=True)
+            weighted_sum_tokens = torch.matmul(sbl_input_norm.T, activation_mask_good)
+            C_main_all = F.normalize((weighted_sum_tokens / token_counts).T, p=2.0, dim=-1)
+            
+            sim_matrix = torch.matmul(C_main_all, sbl_input_norm.T)
+            masked_sim_matrix = torch.where(activation_mask_good.T > 0, sim_matrix, torch.full_like(sim_matrix, float('inf')))
+            dissent_indices = torch.argmin(masked_sim_matrix, dim=1)
+            C_dissent_all = sbl_input_norm[dissent_indices]
 
-            is_good = torch.zeros_like(surprise_norm, dtype=torch.bool).scatter_(0, good_indices, True)
-            is_bad = torch.zeros_like(surprise_norm, dtype=torch.bool).scatter_(0, bad_indices, True)
-
-            analog_target = 1.0 - surprise_norm.abs()
-            target_gate = torch.where(is_good, analog_target.to(dtype=gp.dtype), gp.detach())
-            gate_loss = F.mse_loss(gp, target_gate)
-            total_gate_loss += gate_loss
-
-            is_active = is_good | is_bad
-            if torch.sum(is_good) > 0 and torch.sum(is_bad) > 0:
-                active_protos = pw[is_active]
-                active_protos_normalized = F.normalize(active_protos, p=2.0, dim=-1)
-
-                sbl_input_flat = si.detach().view(-1, si.shape[-1])
-                raw_weight_flat = rw.detach().view(-1, rw.shape[-1])
-                activation_mask = (raw_weight_flat[:, is_active] > 0).to(sbl_input_flat.dtype)
-                token_counts = activation_mask.sum(dim=0)
-
-                if (token_counts > 0).all():
-                    weighted_sums = torch.matmul(activation_mask.t(), sbl_input_flat)
-                    local_anchors = weighted_sums / token_counts.unsqueeze(1)
-                    similarities = torch.einsum("ph,ph->p", active_protos_normalized, local_anchors)
-
-                    signs = torch.zeros_like(similarities)
-                    signs[is_good[is_active]] = -1.0
-                    signs[is_bad[is_active]] = 1.0
-
-                    differential_loss = torch.sum(signs * similarities)
-                    total_proto_loss += differential_loss
+            good_protos_norm = F.normalize(pw[good_indices], p=2.0, dim=-1)
+            sim_main = torch.einsum("ph,ph->p", good_protos_norm, C_main_all)
+            sim_dissent = torch.einsum("ph,ph->p", good_protos_norm, C_dissent_all)
+            
+            proto_loss_terms = torch.where(sim_dissent > sim_main, sim_dissent, sim_main)
+            total_proto_loss -= proto_loss_terms.sum()
 
             if si.shape[1] == pw.shape[1]:
-                x_norm = F.normalize(si.detach(), p=2.0, dim=-1)
-                proto_norm = F.normalize(pw, p=2.0, dim=-1)
-                scores = torch.matmul(x_norm, proto_norm.t()) 
-
-                potential_threshold = gp.detach().unsqueeze(0) 
-                missed_mask = (scores > potential_threshold) & (rw.detach().view(-1, rw.shape[-1]) <= 0)
-
+                scores = torch.matmul(sbl_input_norm, F.normalize(pw, p=2.0, dim=-1).t())
+                missed_mask = (scores > gp.detach().unsqueeze(0)) & (raw_weight_flat <= 0)
                 if missed_mask.any():
-                    missed_indices = missed_mask.nonzero(as_tuple=False)
+                    missed_indices = missed_mask.nonzero(as_tuple=True)
+                    token_idx, proto_idx = missed_indices
                     
-                    unique_missed_protos = missed_indices[:, 1].unique()
-                    for proto_idx in unique_missed_protos:
-                        relevant_tokens = missed_indices[missed_indices[:, 1] == proto_idx, 0]
-                        if relevant_tokens.numel() > 0:
-                            
-                            missed_token_center = x_norm[relevant_tokens].mean(dim=0, keepdim=True)
-                            missed_similarity = torch.einsum("ph,ph->p", F.normalize(pw[proto_idx:proto_idx+1], p=2.0, dim=-1), missed_token_center)
-                            
-                            total_proto_loss += missed_similarity.sum()
+                    num_protos = pw.shape[0]
+                    sum_vectors = torch.zeros(num_protos, sbl_input_norm.shape[1], device=device, dtype=dtype).index_add_(0, proto_idx, sbl_input_norm[token_idx])
+                    counts = torch.zeros(num_protos, device=device, dtype=dtype).index_add_(0, proto_idx, torch.ones_like(token_idx, dtype=dtype))
+                    
+                    valid_missed_protos = counts > 0
+                    if valid_missed_protos.any():
+                        missed_centers = F.normalize(sum_vectors[valid_missed_protos] / counts[valid_missed_protos].unsqueeze(1), p=2.0, dim=-1)
+                        missed_protos_norm = F.normalize(pw[valid_missed_protos], p=2.0, dim=-1)
+                        missed_sim = torch.einsum("ph,ph->p", missed_protos_norm, missed_centers)
+                        total_proto_loss -= missed_sim.sum()
 
         return total_proto_loss, total_gate_loss
 
     def _run_step(self, mini_task: dict[str, Any], view_idx: int, epoch: int, mini_task_idx: int):
+        
+        if self.global_step % self.config.log_interval == 0:
+            self.console.print(f"\n[bold magenta]Debugging Step {self.global_step}...[/bold magenta]")
 
         def _calculate_adaptive_decay(weights: list[torch.Tensor], gate_params: list[torch.Tensor]) -> torch.Tensor:
             w_plasticity = [F.relu(1.0 - gp.detach()) for gp in gate_params]
@@ -348,7 +349,7 @@ class Trainer:
         self.optimizer_main.zero_grad()
         self.optimizer_meta.zero_grad()
 
-        logits, tok_emb, _, _, all_effective_protos, all_sbl_inputs, all_block_raw_weights, _ = self.model(input_ids, gate_temperature=self.config.gate_sigmoid_temperature)
+        logits, tok_emb, _, _, all_effective_protos, all_sbl_inputs, all_block_raw_weights, _ = self.model(input_ids)
         main_loss = F.cross_entropy(logits[:, :-1, :].contiguous().view(-1, self.config.model.vocab_size), labels[:, 1:].contiguous().view(-1), ignore_index=-100)
 
         if not torch.isfinite(main_loss): return None, None, None, None
@@ -362,8 +363,6 @@ class Trainer:
             mu_weights.append(mu_weight)
             gate_params_for_mu.append(gate_param)
 
-        adaptive_decay_loss_main = _calculate_adaptive_decay(mu_weights, gate_params_for_mu)
-        main_loss += adaptive_decay_loss_main
 
         main_loss.backward(retain_graph=True)
 
@@ -389,6 +388,7 @@ class Trainer:
             active_raw_weights = [all_block_raw_weights[i] for i in mu_grad_indices]
 
             proto_loss_total, gate_loss_total = self._calculate_meta_loss(
+                main_loss.item(),
                 proto_weights,
                 gate_params,
                 mu_grads,
@@ -409,15 +409,52 @@ class Trainer:
         spl_module_type = type(self.model.blocks[0].attn.sbl_qkv)
         spl_layers = [m for m in self.model.modules() if isinstance(m, spl_module_type)]
 
-        for layer in spl_layers:
-            mu_weight, proto_weight, mu_bias, gate_param = self._get_spl_module_attributes(layer)
+        high_activation_threshold = 0.5
+        for i, layer in enumerate(spl_layers):
+            mu_weight, _, mu_bias, _ = self._get_spl_module_attributes(layer)
+            mu_grad = mu_grads_all[i]
 
-            if mu_weight.grad is not None:
-                w_plasticity = F.relu(1.0 - gate_param.detach())
+            if mu_grad is not None:
+                num_experts = mu_weight.shape[0]
+                raw_weights_for_layer = all_block_raw_weights[i].detach().view(-1, num_experts)
 
-                mu_weight.grad = mu_weight.grad * w_plasticity.unsqueeze(1)
+                is_expert_activated_at_all = (raw_weights_for_layer > 0).sum(dim=0) > 0
+                num_activated_experts = is_expert_activated_at_all.sum().item()
+
+                if num_activated_experts == 0:
+                    continue
+
+                layer_activation_rate = num_activated_experts / num_experts
+                plasticity_mask = torch.zeros(num_experts, device=mu_weight.device, dtype=torch.float)
+                
+                surprise_norm = torch.linalg.vector_norm(mu_grad.detach(), ord=2, dim=-1).float()
+                activated_indices_tuple = torch.where(is_expert_activated_at_all)
+                activated_indices = activated_indices_tuple[0]
+                surprise_activated = surprise_norm[activated_indices]
+
+                if self.global_step % self.config.log_interval == 0 and surprise_activated.numel() > 0:
+                    self.console.print(f"  [cyan]Layer {i}: Act Rate: {layer_activation_rate:.2%} ({num_activated_experts}/{num_experts})[/cyan]")
+                    self.console.print(f"    [green]Surprise (Activated): Min: {surprise_activated.min():.4f}, Mean: {surprise_activated.mean():.4f}, Max: {surprise_activated.max():.4f}[/green]")
+
+                if layer_activation_rate > high_activation_threshold:
+                    k = max(1, int(num_activated_experts * 0.2))
+                    if surprise_activated.numel() < k: k = surprise_activated.numel()
+
+                    if k > 0:
+                        top_k_vals, top_k_indices_local = torch.topk(surprise_activated, k, largest=False)
+                        top_k_indices_global = activated_indices[top_k_indices_local]
+                        plasticity_mask[top_k_indices_global] = 1.0
+                        if self.global_step % self.config.log_interval == 0:
+                             self.console.print(f"    [yellow]High activation branch: Kept {k} experts. Surprise range: [{top_k_vals.min():.4f}, {top_k_vals.max():.4f}][/yellow]")
+
+                else:
+                    plasticity_mask = is_expert_activated_at_all.float()
+                    if self.global_step % self.config.log_interval == 0:
+                        self.console.print(f"    [yellow]Low activation branch: Kept all {num_activated_experts} activated experts.[/yellow]")
+
+                mu_weight.grad *= plasticity_mask.unsqueeze(1)
                 if mu_bias.grad is not None:
-                    mu_bias.grad = mu_bias.grad * w_plasticity
+                    mu_bias.grad *= plasticity_mask
 
         torch.nn.utils.clip_grad_norm_([p for p in self.optimizer_main.param_groups[0]['params'] if p.grad is not None], 1.0)
         torch.nn.utils.clip_grad_norm_([p for p in self.optimizer_meta.param_groups[0]['params'] if p.grad is not None], 1.0)
@@ -453,17 +490,27 @@ class Trainer:
             num_spl_per_block = 4
             act_rate_l0, act_rate_l_mid, act_rate_ln = 0.0, 0.0, 0.0
             num_layers = self.config.model.num_layers
-            if all_block_raw_weights and len(all_block_raw_weights) == num_layers * num_spl_per_block:
-                first_block_weights = all_block_raw_weights[:num_spl_per_block]
-                act_rate_l0 = torch.cat([rw.view(-1) for rw in first_block_weights]).gt(0).float().mean().item()
+            if all_block_raw_weights:
+                num_weights = len(all_block_raw_weights)
+                
+                # Layer 0 Block
+                l0_weights = all_block_raw_weights[:num_spl_per_block]
+                if l0_weights:
+                    act_rate_l0 = torch.cat([rw.view(-1) for rw in l0_weights if rw.numel() > 0]).gt(0).float().mean().item() if any(rw.numel() > 0 for rw in l0_weights) else 0.0
 
-                mid_layer_start_idx = (num_layers // 2 - 1) * num_spl_per_block
-                mid_layer_end_idx = (num_layers // 2 + 1) * num_spl_per_block
-                mid_block_weights = all_block_raw_weights[mid_layer_start_idx:mid_layer_end_idx]
-                act_rate_l_mid = torch.cat([rw.view(-1) for rw in mid_block_weights]).gt(0).float().mean().item()
+                # Mid Block
+                mid_block_idx = num_layers // 2
+                mid_start = mid_block_idx * num_spl_per_block
+                mid_end = mid_start + num_spl_per_block
+                if num_weights >= mid_end:
+                    mid_weights = all_block_raw_weights[mid_start:mid_end]
+                    act_rate_l_mid = torch.cat([rw.view(-1) for rw in mid_weights if rw.numel() > 0]).gt(0).float().mean().item() if any(rw.numel() > 0 for rw in mid_weights) else 0.0
 
-                last_block_weights = all_block_raw_weights[-num_spl_per_block:]
-                act_rate_ln = torch.cat([rw.view(-1) for rw in last_block_weights]).gt(0).float().mean().item()
+                # Last Block
+                last_block_start = (num_layers - 1) * num_spl_per_block
+                if num_weights > last_block_start:
+                    ln_weights = all_block_raw_weights[last_block_start:]
+                    act_rate_ln = torch.cat([rw.view(-1) for rw in ln_weights if rw.numel() > 0]).gt(0).float().mean().item() if any(rw.numel() > 0 for rw in ln_weights) else 0.0
 
             all_proto_tensors = [p for block_protos in all_effective_protos for p in block_protos.values()]
             avg_proto_norm = torch.stack([torch.norm(p, p=2) for p in all_proto_tensors]).mean().item() if all_proto_tensors else 0.0
@@ -477,14 +524,15 @@ class Trainer:
                 top10_mask_norm = normalized_gates_flat >= top10_threshold_norm
                 top10_mean = normalized_gates_flat[top10_mask_norm].mean().item() if top10_mask_norm.any() else 0.0
                 avg_gate_val = normalized_gates_flat.mean().item()
+                max_gate_val = normalized_gates_flat.max().item()
             else:
-                top10_mean, avg_gate_val = 0.0, 0.0
+                top10_mean, avg_gate_val, max_gate_val = 0.0, 0.0, 0.0
 
             metrics = {
                 "main_loss": main_loss.item(),
                 "proto_loss": proto_loss_total.item(),
                 "gate_loss": gate_loss_total.item(),
-                "decay_loss": (adaptive_decay_loss_main + adaptive_decay_loss_meta).item(),
+                "decay_loss": adaptive_decay_loss_meta.item(),
                 "token_acc": token_acc, "pi_score": pi_score,
                 "activation_rate_avg": activation_rate_avg,
                 "activation_rate_l0": act_rate_l0,
@@ -496,6 +544,7 @@ class Trainer:
                 "avg_proto_norm": avg_proto_norm,
                 "avg_gate_val": avg_gate_val,
                 "top10_gate_mean": top10_mean,
+                "max_gate_val": max_gate_val,
             }
 
         elapsed_time = time.time() - start_time
@@ -537,6 +586,9 @@ class Trainer:
                         continue
 
                     if loss is not None and acc is not None and tau is not None and acc >= 1.0 and tau <= 0.01:
+                        if raw_weights is not None:
+                            view_last_raw_weights = raw_weights
+                        
                         if view_last_raw_weights:
                             flat_pattern = torch.cat([rw.view(-1) for rw in view_last_raw_weights]).gt(0)
                             overlap_info = " | Overlap: N/A"
