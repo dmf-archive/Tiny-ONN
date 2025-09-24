@@ -50,7 +50,7 @@ class InMemoryArcDataset(Dataset):
         for path in file_paths:
             with open(path) as f:
                 task_data = json.load(f)
-            
+
             if split == "training":
                 for pair in task_data['train']:
                     self.mini_tasks.append(pair)

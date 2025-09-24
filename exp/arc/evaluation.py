@@ -44,7 +44,7 @@ class SimpleEvaluator:
 
         for _ in range(max_new_tokens):
             model_input = tokens if past_key_values is None else tokens[:, -1:]
-            logits, _, _, _, _, _, _, past_key_values = self.model(model_input, past_key_values=past_key_values)
+            logits, _, _, _, _, _, _, _, past_key_values = self.model(model_input, past_key_values=past_key_values)
             next_token_logits = logits[:, -1, :]
             next_token = torch.argmax(next_token_logits, dim=-1).unsqueeze(-1)
             tokens = torch.cat([tokens, next_token], dim=-1)
@@ -76,11 +76,11 @@ class EvaluationStep:
             task = progress.add_task(f"[cyan]{title}...", total=num_samples)
             for item in itertools.islice(loader, num_samples):
                 mini_task = item if isinstance(item, dict) else item[0]
-                
+
                 if 'output' not in mini_task:
                     progress.update(task, advance=1)
                     continue
-                    
+
                 target_grid_raw = torch.tensor(mini_task['output'], device=self.device)
 
                 pred_grid, generated_tokens = self.evaluator.evaluate_single(mini_task)

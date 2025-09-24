@@ -49,7 +49,7 @@ class SparseProtoLinear(nn.Module):
         self.mu_weight = nn.Parameter(torch.empty(out_features, in_features, dtype=dtype))
         self.proto_weight = nn.Parameter(torch.empty(out_features, in_features, dtype=dtype))
         self.mu_bias = nn.Parameter(torch.empty(out_features, dtype=dtype))
-        self.gate_param = nn.Parameter(torch.empty(out_features, dtype=dtype))
+        self.gate_param = nn.Parameter(torch.empty(out_features, in_features, dtype=dtype))
 
         self.reset_parameters()
 
@@ -57,22 +57,25 @@ class SparseProtoLinear(nn.Module):
         nn.init.kaiming_uniform_(self.mu_weight, a=math.sqrt(5))
         nn.init.kaiming_uniform_(self.proto_weight, a=math.sqrt(5))
         nn.init.zeros_(self.mu_bias)
-        nn.init.constant_(self.gate_param, 0.0)
+        # Initialize gate_param to a higher positive value to allow for a natural "annealing" descent
+        # during training. This prevents premature protection of immature experts.
+        nn.init.kaiming_uniform_(self.gate_param, a=math.sqrt(5))
 
-    def forward(self, x: torch.Tensor, effective_proto: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor, effective_proto: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         x_norm = F.normalize(x, p=2.0, dim=-1)
         proto_norm = F.normalize(effective_proto, p=2.0, dim=-1)
-        scores = torch.matmul(x_norm, proto_norm.t())
+        match_values = F.linear(x_norm, proto_norm)
 
-        gated_cost = F.softmax(self.gate_param, dim=-1)
-        raw_weights = F.relu(F.softmax(scores, dim=-1) - gated_cost)
+        predicted_cost = torch.matmul(x, self.gate_param.t())
+
+        raw_weights = F.relu(match_values - predicted_cost)
         gate_binary = (raw_weights > 0).to(x.dtype)
         gated_raw_weights = ste(gate_binary, raw_weights)
-        
+
         computation_output = F.linear(x, self.mu_weight, self.mu_bias)
         gated_output = computation_output * gated_raw_weights
-        
-        return gated_output, computation_output, raw_weights
+
+        return gated_output, computation_output, raw_weights, predicted_cost
 
 class DynamicInfiniteHeadAttention(nn.Module):
     def __init__(self, config: ModelConfig, dtype: torch.dtype = torch.float32):
@@ -87,10 +90,10 @@ class DynamicInfiniteHeadAttention(nn.Module):
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         past_key_value: tuple[torch.Tensor, torch.Tensor] | None = None,
         effective_protos: dict[str, torch.Tensor] | None = None,
-    ) -> tuple[torch.Tensor, list[torch.Tensor], list[torch.Tensor], list[torch.Tensor], list[torch.Tensor], tuple[torch.Tensor, torch.Tensor]]:
+    ) -> tuple[torch.Tensor, list[torch.Tensor], list[torch.Tensor], list[torch.Tensor], list[torch.Tensor], list[torch.Tensor], tuple[torch.Tensor, torch.Tensor]]:
         if effective_protos is None:
             raise ValueError("effective_protos cannot be None")
-        m_qkv, c_qkv, rw_qkv = self.sbl_qkv(x, effective_protos["attn_qkv"])
+        m_qkv, c_qkv, rw_qkv, pc_qkv = self.sbl_qkv(x, effective_protos["attn_qkv"])
         q, k, v = torch.split(m_qkv, self.d_model, dim=-1)
 
         cos, sin = position_embeddings
@@ -106,14 +109,15 @@ class DynamicInfiniteHeadAttention(nn.Module):
         is_causal = past_key_value is None
         attn_out = F.scaled_dot_product_attention(q, k, v, is_causal=is_causal)
 
-        m_o, c_o, rw_o = self.sbl_o(attn_out, effective_protos["attn_o"])
+        m_o, c_o, rw_o, pc_o = self.sbl_o(attn_out, effective_protos["attn_o"])
 
         masked_outputs = [m_qkv, m_o]
         comp_outputs = [c_qkv, c_o]
         raw_weights = [rw_qkv, rw_o]
         sbl_inputs = [x, attn_out]
+        predicted_costs = [pc_qkv, pc_o]
 
-        return m_o, masked_outputs, comp_outputs, raw_weights, sbl_inputs, present_key_value
+        return m_o, masked_outputs, comp_outputs, raw_weights, sbl_inputs, predicted_costs, present_key_value
 
 class DynamicInfiniteExpert(nn.Module):
     def __init__(self, config: ModelConfig, dtype: torch.dtype = torch.float32):
@@ -122,19 +126,20 @@ class DynamicInfiniteExpert(nn.Module):
         self.sbl1 = SparseProtoLinear(config.hidden_size, d_ffn, dtype=dtype)
         self.sbl2 = SparseProtoLinear(d_ffn, config.hidden_size, dtype=dtype)
 
-    def forward(self, x: torch.Tensor, effective_protos: dict[str, torch.Tensor]) -> tuple[torch.Tensor, list[torch.Tensor], list[torch.Tensor], list[torch.Tensor], list[torch.Tensor]]:
+    def forward(self, x: torch.Tensor, effective_protos: dict[str, torch.Tensor]) -> tuple[torch.Tensor, list[torch.Tensor], list[torch.Tensor], list[torch.Tensor], list[torch.Tensor], list[torch.Tensor]]:
         if effective_protos is None:
             raise ValueError("effective_protos cannot be None")
-        m1, c1, rw1 = self.sbl1(x, effective_protos["ffn_sbl1"])
+        m1, c1, rw1, pc1 = self.sbl1(x, effective_protos["ffn_sbl1"])
         h_act = F.relu(m1)
-        m2, c2, rw2 = self.sbl2(h_act, effective_protos["ffn_sbl2"])
+        m2, c2, rw2, pc2 = self.sbl2(h_act, effective_protos["ffn_sbl2"])
 
         masked_outputs = [m1, m2]
         comp_outputs = [c1, c2]
         raw_weights = [rw1, rw2]
         sbl_inputs = [x, h_act]
+        predicted_costs = [pc1, pc2]
 
-        return m2, masked_outputs, comp_outputs, raw_weights, sbl_inputs
+        return m2, masked_outputs, comp_outputs, raw_weights, sbl_inputs, predicted_costs
 
 class MoIETransformerBlock(nn.Module):
     def __init__(self, config: ModelConfig, dtype: torch.dtype = torch.float32):
@@ -164,7 +169,7 @@ class MoIETransformerBlock(nn.Module):
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         past_key_value: tuple[torch.Tensor, torch.Tensor] | None = None,
         prev_protos: dict[str, torch.Tensor] | None = None,
-    ) -> tuple[torch.Tensor, list[torch.Tensor], list[torch.Tensor], list[torch.Tensor], list[torch.Tensor], tuple[torch.Tensor, torch.Tensor], dict[str, torch.Tensor]]:
+    ) -> tuple[torch.Tensor, list[torch.Tensor], list[torch.Tensor], list[torch.Tensor], list[torch.Tensor], list[torch.Tensor], tuple[torch.Tensor, torch.Tensor], dict[str, torch.Tensor]]:
 
         effective_protos = {}
         proto_residual_mapping = {
@@ -188,21 +193,22 @@ class MoIETransformerBlock(nn.Module):
                 effective_protos[name] = module.proto_weight
 
         attn_in = self.ln1(x)
-        attn_out, attn_m, attn_c, attn_rw, attn_inputs, present_key_value = self.attn(
+        attn_out, attn_m, attn_c, attn_rw, attn_inputs, attn_pc, present_key_value = self.attn(
             attn_in, position_embeddings, past_key_value, effective_protos=effective_protos
         )
         x = x + attn_out
 
         ffn_in = self.ln2(x)
-        ffn_out, ffn_m, ffn_c, ffn_rw, ffn_inputs = self.ffn(ffn_in, effective_protos=effective_protos)
+        ffn_out, ffn_m, ffn_c, ffn_rw, ffn_inputs, ffn_pc = self.ffn(ffn_in, effective_protos=effective_protos)
         x_out = x + ffn_out
 
         masked_outputs = attn_m + ffn_m
         comp_outputs = attn_c + ffn_c
         raw_weights = attn_rw + ffn_rw
         sbl_inputs = attn_inputs + ffn_inputs
+        predicted_costs = attn_pc + ffn_pc
 
-        return x_out, masked_outputs, comp_outputs, raw_weights, sbl_inputs, present_key_value, effective_protos
+        return x_out, masked_outputs, comp_outputs, raw_weights, sbl_inputs, predicted_costs, present_key_value, effective_protos
 
 class ArcTransformer(nn.Module):
     def __init__(self, config: ModelConfig, device: torch.device | str):
@@ -247,6 +253,7 @@ class ArcTransformer(nn.Module):
         all_sbl_inputs: list[torch.Tensor] = []
         all_block_raw_weights: list[torch.Tensor] = []
         all_effective_protos: list[dict[str, torch.Tensor]] = []
+        all_predicted_costs: list[torch.Tensor] = []
 
         prev_attn_qkv: torch.Tensor | None = None
         prev_attn_o: torch.Tensor | None = None
@@ -264,7 +271,7 @@ class ArcTransformer(nn.Module):
             if prev_ffn_sbl2 is not None:
                 prev_protos_for_block["ffn_sbl2"] = prev_ffn_sbl2
 
-            x, masked, comp, raw, sbl_inputs, present_key_value, effective_protos = block(
+            x, masked, comp, raw, sbl_inputs, pred_costs, present_key_value, effective_protos = block(
                 x, position_embeddings, past_key_values[i], prev_protos_for_block if prev_protos_for_block else None
             )
 
@@ -279,7 +286,8 @@ class ArcTransformer(nn.Module):
             all_sbl_inputs.extend(sbl_inputs)
             all_block_raw_weights.extend(raw)
             all_effective_protos.append(effective_protos)
+            all_predicted_costs.extend(pred_costs)
 
         logits = self.lm_head(x)
 
-        return logits, tok_emb, all_masked_outputs, all_comp_outputs, all_effective_protos, all_sbl_inputs, all_block_raw_weights, present_key_values
+        return logits, tok_emb, all_masked_outputs, all_comp_outputs, all_effective_protos, all_sbl_inputs, all_block_raw_weights, all_predicted_costs, present_key_values
