@@ -20,8 +20,9 @@ class TrainConfig:
     model: ModelConfig = field(default_factory=ModelConfig)
     data: DataConfig = field(default_factory=DataConfig)
 
-    lr_main: float = 3e-3
-    lr_meta: float = 5e-4
+    lr_mu: float = 3e-3
+    lr_proto: float = 1e-4
+    lr_gate: float = 5e-4
 
     ema_alpha_acc: float = 0.98
     w_gate: float = 1.0

@@ -1,8 +1,9 @@
 import os
 from pathlib import Path
 
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-import numpy as np
 import torch
 from rich.console import Console
 from rich.padding import Padding
@@ -11,7 +12,6 @@ from rich.text import Text
 from sklearn.decomposition import PCA
 
 from .config import TrainConfig
-from .model import SparseProtoLinear
 
 
 class Observer:
@@ -124,7 +124,7 @@ class Observer:
             for j, name in enumerate(proto_names):
                 ax = axes[i, j]
                 block_data = saps_data_per_block[i]
-                
+
                 if name not in block_data:
                     ax.text(0.5, 0.5, "N/A", ha='center', va='center')
                     ax.set_title(f"Block {i} - {name}")
@@ -134,7 +134,7 @@ class Observer:
 
                 protos = block_data[name]["protos"].detach().cpu().to(torch.float32).numpy()
                 statuses = block_data[name]["statuses"]
-                
+
                 if protos.shape[0] == 0:
                     ax.text(0.5, 0.5, "No Actives", ha='center', va='center')
                 else:
