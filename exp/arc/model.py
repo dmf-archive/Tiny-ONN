@@ -6,19 +6,20 @@ import torch.nn.functional as F
 
 from .config import ModelConfig
 
-@torch.jit.script
-def ste(gate: torch.Tensor, value: torch.Tensor) -> torch.Tensor:
-    return gate.detach() - value.detach() + value
 
 def rotate_half(x: torch.Tensor) -> torch.Tensor:
     x1 = x[..., : x.shape[-1] // 2]
     x2 = x[..., x.shape[-1] // 2 :]
     return torch.cat((-x2, x1), dim=-1)
 
-def apply_rotary_pos_emb(q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+
+def apply_rotary_pos_emb(
+    q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
     q_embed = (q * cos) + (rotate_half(q) * sin)
     k_embed = (k * cos) + (rotate_half(k) * sin)
     return q_embed, k_embed
+
 
 @torch.jit.script
 def spl_forward(
@@ -26,26 +27,41 @@ def spl_forward(
     effective_proto: torch.Tensor,
     mu_weight: torch.Tensor,
     mu_bias: torch.Tensor,
-    gate_param: torch.Tensor
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    x_norm = F.normalize(x, p=2.0, dim=-1)
-    proto_norm = F.normalize(effective_proto, p=2.0, dim=-1)
+    gate_param: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    model_dtype = mu_weight.dtype
+    x = x.to(model_dtype)
+    effective_proto = effective_proto.to(model_dtype)
+    gate_param = gate_param.to(model_dtype)
+
+    x_norms = torch.norm(x, p=2.0, dim=-1, keepdim=True)
+    x_norm = x / (x_norms + 1e-5)
+    proto_norms = torch.norm(effective_proto, p=2.0, dim=-1, keepdim=True)
+    proto_norm = effective_proto / (proto_norms + 1e-5)
+
     match_values = F.linear(x_norm, proto_norm)
-    predicted_cost = torch.abs(torch.matmul(x, gate_param.t()))
-    raw_weights = F.relu(match_values - predicted_cost)
-    gate_binary = (raw_weights > 0).to(x.dtype)
-    gated_raw_weights = ste(gate_binary, raw_weights)
+    gate_logit = torch.matmul(x, gate_param.t())
     computation_output = F.linear(x, mu_weight, mu_bias)
-    gated_output = computation_output * gated_raw_weights
-    return gated_output, computation_output, raw_weights, predicted_cost
+
+    return computation_output, match_values, gate_logit
+
 
 class RotaryEmbedding(nn.Module):
-    def __init__(self, dim: int, max_position_embeddings: int = 2048, base: int = 10000, device: torch.device | None = None, dtype: torch.dtype = torch.float32):
+    def __init__(
+        self,
+        dim: int,
+        max_position_embeddings: int = 2048,
+        base: int = 10000,
+        device: torch.device | None = None,
+        dtype: torch.dtype = torch.float32,
+    ):
         super().__init__()
         self.dim = dim
         self.max_position_embeddings = max_position_embeddings
         self.base = base
-        inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2, dtype=torch.float32, device=device) / self.dim))
+        inv_freq = 1.0 / (
+            self.base ** (torch.arange(0, self.dim, 2, dtype=torch.float32, device=device) / self.dim)
+        )
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
     def forward(self, x: torch.Tensor, seq_len: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -55,6 +71,7 @@ class RotaryEmbedding(nn.Module):
         cos = emb.cos().unsqueeze(0).to(dtype=x.dtype)
         sin = emb.sin().unsqueeze(0).to(dtype=x.dtype)
         return cos, sin
+
 
 class SparseProtoLinear(nn.Module):
     def __init__(self, in_features: int, out_features: int, dtype: torch.dtype = torch.float32):
@@ -71,36 +88,23 @@ class SparseProtoLinear(nn.Module):
         nn.init.kaiming_uniform_(self.mu_weight, a=math.sqrt(5))
         nn.init.kaiming_uniform_(self.proto_weight, a=math.sqrt(5))
         nn.init.zeros_(self.mu_bias)
-        nn.init.kaiming_uniform_(self.gate_param, a=math.sqrt(5))
+        nn.init.zeros_(self.gate_param)
 
-    def forward(self, x: torch.Tensor, effective_proto: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    def forward(
+        self, x: torch.Tensor, effective_proto: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         return spl_forward(x, effective_proto, self.mu_weight, self.mu_bias, self.gate_param)
+
 
 class DynamicInfiniteHeadAttention(nn.Module):
     def __init__(self, config: ModelConfig, dtype: torch.dtype = torch.float32):
         super().__init__()
         self.d_model = config.hidden_size
-        self.sbl_qkv = SparseProtoLinear(self.d_model, 3 * self.d_model, dtype=dtype)
+        self.sbl_q = SparseProtoLinear(self.d_model, self.d_model, dtype=dtype)
+        self.sbl_k = SparseProtoLinear(self.d_model, self.d_model, dtype=dtype)
+        self.sbl_v = SparseProtoLinear(self.d_model, self.d_model, dtype=dtype)
         self.sbl_o = SparseProtoLinear(self.d_model, self.d_model, dtype=dtype)
 
-    def forward(
-        self,
-        x: torch.Tensor,
-        position_embeddings: tuple[torch.Tensor, torch.Tensor],
-        past_key_value: tuple[torch.Tensor, torch.Tensor] | None = None,
-        effective_protos: dict[str, torch.Tensor] | None = None,
-    ) -> tuple[torch.Tensor, list, list, list, list, list, tuple]:
-        if effective_protos is None: raise ValueError("effective_protos cannot be None")
-        m_qkv, c_qkv, rw_qkv, pc_qkv = self.sbl_qkv(x, effective_protos["attn_qkv"])
-        q, k, v = torch.split(m_qkv, self.d_model, dim=-1)
-        cos, sin = position_embeddings
-        q, k = apply_rotary_pos_emb(q, k, cos, sin)
-        if past_key_value is not None:
-            k = torch.cat([past_key_value[0], k], dim=1)
-            v = torch.cat([past_key_value[1], v], dim=1)
-        attn_out = F.scaled_dot_product_attention(q, k, v, is_causal=past_key_value is None)
-        m_o, c_o, rw_o, pc_o = self.sbl_o(attn_out, effective_protos["attn_o"])
-        return m_o, [m_qkv, m_o], [c_qkv, c_o], [rw_qkv, rw_o], [x, attn_out], [pc_qkv, pc_o], (k, v)
 
 class DynamicInfiniteExpert(nn.Module):
     def __init__(self, config: ModelConfig, dtype: torch.dtype = torch.float32):
@@ -109,78 +113,203 @@ class DynamicInfiniteExpert(nn.Module):
         self.sbl1 = SparseProtoLinear(config.hidden_size, d_ffn, dtype=dtype)
         self.sbl2 = SparseProtoLinear(d_ffn, config.hidden_size, dtype=dtype)
 
-    def forward(self, x: torch.Tensor, effective_protos: dict[str, torch.Tensor]) -> tuple[torch.Tensor, list, list, list, list, list]:
-        if effective_protos is None: raise ValueError("effective_protos cannot be None")
-        m1, c1, rw1, pc1 = self.sbl1(x, effective_protos["ffn_sbl1"])
-        h_act = F.relu(m1)
-        m2, c2, rw2, pc2 = self.sbl2(h_act, effective_protos["ffn_sbl2"])
-        return m2, [m1, m2], [c1, c2], [rw1, rw2], [x, h_act], [pc1, pc2]
 
 class MoIETransformerBlock(nn.Module):
     def __init__(self, config: ModelConfig, dtype: torch.dtype = torch.float32):
         super().__init__()
-        self.ln1 = nn.LayerNorm(config.hidden_size, dtype=dtype)
+        self.ln1 = nn.LayerNorm(config.hidden_size, eps=1e-5)
         self.attn = DynamicInfiniteHeadAttention(config, dtype=dtype)
-        self.ln2 = nn.LayerNorm(config.hidden_size, dtype=dtype)
+        self.ln2 = nn.LayerNorm(config.hidden_size, eps=1e-5)
         self.ffn = DynamicInfiniteExpert(config, dtype=dtype)
         d_ffn = config.hidden_size * config.d_ffn_factor
-        self.proto_transforms = nn.ModuleDict({
-            "attn_qkv": nn.Linear(config.hidden_size, config.hidden_size, bias=False, dtype=dtype),
-            "attn_o": nn.Linear(config.hidden_size, config.hidden_size, bias=False, dtype=dtype),
-            "ffn_sbl1": nn.Linear(config.hidden_size, config.hidden_size, bias=False, dtype=dtype),
-            "ffn_sbl2": nn.Linear(d_ffn, d_ffn, bias=False, dtype=dtype),
-        })
-        self.proto_layernorms = nn.ModuleDict({
-            "attn_qkv": nn.LayerNorm(config.hidden_size, dtype=dtype),
-            "attn_o": nn.LayerNorm(config.hidden_size, dtype=dtype),
-            "ffn_sbl1": nn.LayerNorm(config.hidden_size, dtype=dtype),
-            "ffn_sbl2": nn.LayerNorm(d_ffn, dtype=dtype),
-        })
+        self.proto_transforms = nn.ModuleDict(
+            {
+                "attn_q": nn.Linear(config.hidden_size, config.hidden_size, bias=False, dtype=dtype),
+                "attn_k": nn.Linear(config.hidden_size, config.hidden_size, bias=False, dtype=dtype),
+                "attn_v": nn.Linear(config.hidden_size, config.hidden_size, bias=False, dtype=dtype),
+                "attn_o": nn.Linear(config.hidden_size, config.hidden_size, bias=False, dtype=dtype),
+                "ffn_sbl1": nn.Linear(config.hidden_size, config.hidden_size, bias=False, dtype=dtype),
+                "ffn_sbl2": nn.Linear(d_ffn, d_ffn, bias=False, dtype=dtype),
+            }
+        )
+        self.proto_layernorms = nn.ModuleDict(
+            {
+                "attn_q": nn.LayerNorm(config.hidden_size, eps=1e-5),
+                "attn_k": nn.LayerNorm(config.hidden_size, eps=1e-5),
+                "attn_v": nn.LayerNorm(config.hidden_size, eps=1e-5),
+                "attn_o": nn.LayerNorm(config.hidden_size, eps=1e-5),
+                "ffn_sbl1": nn.LayerNorm(config.hidden_size, eps=1e-5),
+                "ffn_sbl2": nn.LayerNorm(d_ffn, eps=1e-5),
+            }
+        )
 
-    def forward(self, x: torch.Tensor, pos_emb: tuple, past_kv: tuple | None = None, prev_protos: dict | None = None) -> tuple:
+    def forward(
+        self, x: torch.Tensor, pos_emb: tuple, past_kv: tuple | None = None, prev_protos: dict | None = None
+    ) -> tuple:
         effective_protos = {}
-        sbl_modules = {"attn_qkv": self.attn.sbl_qkv, "attn_o": self.attn.sbl_o, "ffn_sbl1": self.ffn.sbl1, "ffn_sbl2": self.ffn.sbl2}
+        sbl_modules = {
+            "attn_q": self.attn.sbl_q,
+            "attn_k": self.attn.sbl_k,
+            "attn_v": self.attn.sbl_v,
+            "attn_o": self.attn.sbl_o,
+            "ffn_sbl1": self.ffn.sbl1,
+            "ffn_sbl2": self.ffn.sbl2,
+        }
         for name, module in sbl_modules.items():
             if prev_protos is not None and name in prev_protos:
                 residual = self.proto_layernorms[name](self.proto_transforms[name](prev_protos[name]))
                 effective_protos[name] = module.proto_weight + residual
             else:
                 effective_protos[name] = module.proto_weight
+
+        ln1_out = self.ln1(x)
+        c_q, mv_q, pc_q = self.attn.sbl_q(ln1_out, effective_protos["attn_q"])
+        c_k, mv_k, pc_k = self.attn.sbl_k(ln1_out, effective_protos["attn_k"])
+        c_v, mv_v, pc_v = self.attn.sbl_v(ln1_out, effective_protos["attn_v"])
+
+        ln2_out = self.ln2(x)
+        c1, mv1, pc1 = self.ffn.sbl1(ln2_out, effective_protos["ffn_sbl1"])
+
+        dummy_h_act = torch.zeros(
+            ln2_out.shape[0],
+            ln2_out.shape[1],
+            self.ffn.sbl2.in_features,
+            device=x.device,
+            dtype=x.dtype,
+        )
+        _, _, pc2_pre = self.ffn.sbl2(dummy_h_act, effective_protos["ffn_sbl2"])
+
+        dummy_attn_out = torch.zeros_like(x)
+        _, _, pc_o_pre = self.attn.sbl_o(dummy_attn_out, effective_protos["attn_o"])
+
+        all_gate_logits = [pc_q, pc_k, pc_v, pc_o_pre, pc1, pc2_pre]
+        all_gate_logits_cat = torch.cat([pc.flatten() for pc in all_gate_logits])
+        max_cost = torch.max(all_gate_logits_cat).detach().clamp(min=1.0)
+
+        all_masked, all_comp, all_raw, all_routing_logits, all_sbl_inputs = [], [], [], [], []
+
+        comp_qkv, match_qkv, costs_qkv = [c_q, c_k, c_v], [mv_q, mv_k, mv_v], [pc_q, pc_k, pc_v]
+        q, k, v = torch.zeros_like(c_q), torch.zeros_like(c_k), torch.zeros_like(c_v)
         
-        attn_out, attn_m, attn_c, attn_rw, attn_in, attn_pc, present_kv = self.attn(self.ln1(x), pos_emb, past_kv, effective_protos)
-        x = x + attn_out
-        ffn_out, ffn_m, ffn_c, ffn_rw, ffn_in, ffn_pc = self.ffn(self.ln2(x), effective_protos)
-        x_out = x + ffn_out
-        
-        return x_out, attn_m + ffn_m, attn_c + ffn_c, attn_rw + ffn_rw, attn_in + ffn_in, attn_pc + ffn_pc, present_kv, effective_protos
+        for i in range(3):
+            cost_score = costs_qkv[i] / max_cost
+            routing_logits = match_qkv[i] - cost_score
+            raw_weights = F.relu(routing_logits)
+            binary_weights = raw_weights + ((raw_weights > 0).float() - raw_weights).detach()
+            masked = comp_qkv[i] * binary_weights
+            if i == 0: q = masked
+            elif i == 1: k = masked
+            else: v = masked
+            all_masked.append(masked)
+            all_comp.append(comp_qkv[i])
+            all_raw.append(raw_weights / (raw_weights.max() + 1e-6) if raw_weights.numel() > 0 and raw_weights.max() > 0 else raw_weights)
+            all_routing_logits.append(routing_logits)
+
+        cos, sin = pos_emb
+        q, k = apply_rotary_pos_emb(q, k, cos, sin)
+        if past_kv is not None:
+            k = torch.cat([past_kv[0], k], dim=1)
+            v = torch.cat([past_kv[1], v], dim=1)
+        present_kv = (k, v)
+        attn_out = F.scaled_dot_product_attention(q, k, v, is_causal=past_kv is None)
+
+        c_o, mv_o, pc_o = self.attn.sbl_o(attn_out, effective_protos["attn_o"])
+        cost_score_o = pc_o / max_cost
+        routing_logits_o = mv_o - cost_score_o
+        rw_o = F.relu(routing_logits_o)
+        bw_o = rw_o + ((rw_o > 0).float() - rw_o).detach()
+        m_o = c_o * bw_o
+        x = x + m_o
+
+        cost_score_f1 = pc1 / max_cost
+        routing_logits_f1 = mv1 - cost_score_f1
+        rw_f1 = F.relu(routing_logits_f1)
+        bw_f1 = rw_f1 + ((rw_f1 > 0).float() - rw_f1).detach()
+        m1 = c1 * bw_f1
+        h_act = F.relu(m1)
+
+        c2, mv2, pc2 = self.ffn.sbl2(h_act, effective_protos["ffn_sbl2"])
+        cost_score_f2 = pc2 / max_cost
+        routing_logits_f2 = mv2 - cost_score_f2
+        rw_f2 = F.relu(routing_logits_f2)
+        bw_f2 = rw_f2 + ((rw_f2 > 0).float() - rw_f2).detach()
+        m2 = c2 * bw_f2
+        x_out = x + m2
+
+        all_masked.extend([m_o, m1, m2])
+        all_comp.extend([c_o, c1, c2])
+        all_raw.extend([
+            rw_o / (rw_o.max() + 1e-6) if rw_o.numel() > 0 and rw_o.max() > 0 else rw_o,
+            rw_f1 / (rw_f1.max() + 1e-6) if rw_f1.numel() > 0 and rw_f1.max() > 0 else rw_f1,
+            rw_f2 / (rw_f2.max() + 1e-6) if rw_f2.numel() > 0 and rw_f2.max() > 0 else rw_f2,
+        ])
+        all_routing_logits.extend([routing_logits_o, routing_logits_f1, routing_logits_f2])
+        all_sbl_inputs.extend([ln1_out] * 3 + [attn_out, ln2_out, h_act])
+
+        return x_out, all_masked, all_comp, all_raw, all_sbl_inputs, all_routing_logits, present_kv, effective_protos
+
 
 class ArcTransformer(nn.Module):
     def __init__(self, config: ModelConfig, device: torch.device | str):
         super().__init__()
-        self.config, self.device, dtype = config, device, torch.bfloat16
+        self.config, self.device = config, device
+        dtype = torch.bfloat16
         self.embedding = nn.Embedding(config.vocab_size, config.hidden_size, dtype=dtype)
-        self.rotary_emb = RotaryEmbedding(dim=config.hidden_size, max_position_embeddings=config.max_position_embeddings, dtype=dtype, device=device)
+        self.rotary_emb = RotaryEmbedding(
+            dim=config.hidden_size, max_position_embeddings=config.max_position_embeddings, device=device, dtype=dtype
+        )
         self.blocks = nn.ModuleList([MoIETransformerBlock(config, dtype=dtype) for _ in range(config.num_layers)])
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, dtype=dtype)
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False, dtype=dtype)
 
-    def forward(self, input_ids: torch.Tensor, past_key_values: list | None = None):
+    def forward(self, input_ids: torch.Tensor, past_key_values: list | None = None, return_dict: bool = False):
         x = self.embedding(input_ids)
         pos_emb = self.rotary_emb(x, seq_len=input_ids.size(1))
         past_key_values = past_key_values if past_key_values is not None else [None] * len(self.blocks)
-        
-        all_masked, all_comp, all_sbl_in, all_raw, all_protos, all_pred_costs, presents = [], [], [], [], [], [], []
+
+        all_masked, all_comp, all_sbl_in, all_raw, all_protos, all_routing_logits, presents = (
+            [],
+            [],
+            [],
+            [],
+            [],
+            [],
+            [],
+        )
         prev_protos = None
-        
+
         for i, block in enumerate(self.blocks):
-            x, masked, comp, raw, sbl_inputs, pred_costs, present_kv, effective_protos = block(x, pos_emb, past_key_values[i], prev_protos)
+            (
+                x,
+                masked,
+                comp,
+                raw,
+                sbl_inputs,
+                routing_logits,
+                present_kv,
+                effective_protos,
+            ) = block(x, pos_emb, past_key_values[i], prev_protos)
             presents.append(present_kv)
             all_masked.extend(masked)
             all_comp.extend(comp)
             all_sbl_in.extend(sbl_inputs)
             all_raw.extend(raw)
             all_protos.append(effective_protos)
-            all_pred_costs.extend(pred_costs)
+            all_routing_logits.extend(routing_logits)
             prev_protos = effective_protos
 
         logits = self.lm_head(x)
-        return logits, x, all_masked, all_comp, all_protos, all_sbl_in, all_raw, all_pred_costs, presents
+
+        if not return_dict:
+            return logits, x, all_masked, all_comp, all_protos, all_sbl_in, all_raw, all_routing_logits, presents
+
+        return {
+            "logits": logits,
+            "hidden_states": x,
+            "masked_outputs": all_masked,
+            "computation_outputs": all_comp,
+            "proto_states": all_protos,
+            "sbl_inputs": all_sbl_in,
+            "raw_weights": all_raw,
+            "routing_logits": all_routing_logits,
+            "past_key_values": presents,
+        }
