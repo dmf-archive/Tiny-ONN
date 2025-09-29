@@ -84,6 +84,7 @@ class Observer:
             "token_acc": acc,
             "pi_score": pi_score,
             "route_kl_loss": signals.get("route_kl_loss", torch.tensor(0.0)).item(),
+            "sample_entropy": model_outputs.get("sample_entropy", torch.tensor(0.0)).mean().item(),
             "tau": (
                 -torch.sum(F.softmax(active_logits, dim=-1) * F.log_softmax(active_logits, dim=-1), dim=-1)
                 .mean()
@@ -96,6 +97,7 @@ class Observer:
             "activation_rate_l0": act_rates[0] if act_rates else 0.0,
             "activation_rate_l_mid": act_rates[num_layers // 2] if len(act_rates) > num_layers // 2 else 0.0,
             "activation_rate_ln": act_rates[-1] if act_rates else 0.0,
+            "act_rates": act_rates,
             "routing_failure_rate": routing_failure_rate,
             "identity_transform_rate": identity_transform_rate,
         }
@@ -114,11 +116,11 @@ class Observer:
         self,
         epoch: int,
         step: int,
-        task_idx: int,
+        task_idx: int | str,
         view_idx: int,
         metrics: dict[str, float],
         elapsed_time: float,
-        overlap: float | None,
+        consistency: dict[str, float] | None,
     ):
         steps_per_sec = 1 / elapsed_time if elapsed_time > 0 else float("inf")
         title = f"Epoch {epoch} | Step {step} | Task {task_idx}"
@@ -129,15 +131,20 @@ class Observer:
         table.add_column("Loss (Main/KL)", justify="center")
         table.add_column("Acc (Token)", justify="center")
         table.add_column("τ", justify="center")
+        table.add_column("H(x)", justify="center")
+        table.add_column("Seq Len", justify="center")
         table.add_column("PI", justify="center")
         table.add_column("Act % (Avg)", justify="center")
         table.add_column("Gate Logit (Top10/Avg/Max)", justify="center")
         table.add_column("Routing Fail % (True ID %)", justify="center")
-        table.add_column("Overlap", justify="center")
+        table.add_column("Consist (Cos/Euc)", justify="center")
         table.add_column("Speed (st/s)", justify="center")
 
-        act_avg = metrics.get('activation_rate_avg', 0.0) * 100
-        overlap_str = f"{overlap:.2%}" if overlap is not None else "N/A"
+        act_avg = metrics.get("activation_rate_avg", 0.0) * 100
+        if consistency:
+            consistency_str = f"{consistency.get('cos_sim', 0.0):.3f}/{consistency.get('euc_dist', 0.0):.3f}"
+        else:
+            consistency_str = "N/A"
         routing_fail_str = f"{metrics.get('routing_failure_rate', 0.0) * 100:.1f}%"
         identity_str = f"{metrics.get('identity_transform_rate', 0.0) * 100:.1f}%"
         
@@ -145,11 +152,13 @@ class Observer:
             f"{metrics.get('main_loss', 0.0):.3f}/{metrics.get('route_kl_loss', 0.0):.4f}",
             f"{metrics.get('token_acc', 0.0):.3f}",
             f"{metrics.get('tau', 0.0):.3f}",
+            f"{metrics.get('sample_entropy', 0.0):.3f}",
+            f"{int(metrics.get('seq_len', 0))}",
             f"{metrics.get('pi_score', 0.0):.3f}",
             f"{act_avg:.1f}%",
             f"{metrics.get('gate_logit_top10_avg', 0.0):.3f}/{metrics.get('gate_logit_avg', 0.0):.3f}/{metrics.get('gate_logit_max', 0.0):.3f}",
             f"{routing_fail_str} ({identity_str})",
-            overlap_str,
+            consistency_str,
             f"{steps_per_sec:.2f}",
         )
         self.console.print(table)
@@ -233,12 +242,14 @@ class Observer:
         eval_loader,
         current_task_idx: int,
         save_checkpoint_fn,
-        overlap: float | None,
+        consistency: dict[str, float] | None,
+        reinit_fn,
     ):
         if step % self.config.log_interval == 0:
-            self.log_step(epoch, step, task_idx, view_idx, metrics, elapsed_time, overlap)
+            self.log_step(epoch, step, task_idx, view_idx, metrics, elapsed_time, consistency)
             self.visualize_prototypes(signals, step)
             save_checkpoint_fn(task_idx, view_idx)
+            reinit_fn()
 
         if step > 0 and step % self.config.eval_interval == 0:
             evaluator.run(eval_loader, current_task_idx, step)

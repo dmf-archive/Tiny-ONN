@@ -7,7 +7,7 @@ class ModelConfig:
     hidden_size: int = 256
     num_layers: int = 8
     max_position_embeddings: int = 2048
-    d_ffn_factor: int = 2
+    d_ffn_factor: int = 1
 
 @dataclass
 class DataConfig:
@@ -29,7 +29,7 @@ class TrainConfig:
     device: str = "cuda"
     seed: int = 42
 
-    eval_interval: int = 10000
+    eval_interval: int = 2500
     log_interval: int = 10
     max_checkpoints: int = 3
 

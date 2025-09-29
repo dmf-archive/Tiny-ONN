@@ -25,7 +25,9 @@ class SimpleEvaluator:
 
     @torch.no_grad()
     def evaluate_single(self, mini_task: dict[str, Any]) -> tuple[torch.Tensor, list[int]]:
-        input_grid = torch.tensor(mini_task['input'], device=self.device)
+        # Ensure input data is converted to the model's dtype (bfloat16)
+        model_dtype = next(self.model.parameters()).dtype
+        input_grid = torch.tensor(mini_task['input'], device=self.device, dtype=model_dtype)
         h_in, w_in = input_grid.shape
         max_new_tokens = int(h_in * w_in * 9) + 50
 
@@ -42,15 +44,19 @@ class SimpleEvaluator:
         tokens = input_ids.clone()
         past_key_values = None
 
-        for _ in range(max_new_tokens):
-            model_input = tokens if past_key_values is None else tokens[:, -1:]
-            logits, _, _, _, _, _, _, _, past_key_values = self.model(model_input, past_key_values=past_key_values)
-            next_token_logits = logits[:, -1, :]
-            next_token = torch.argmax(next_token_logits, dim=-1).unsqueeze(-1)
-            tokens = torch.cat([tokens, next_token], dim=-1)
+        with torch.autocast(device_type=self.device.type, dtype=torch.bfloat16):
+            for _ in range(max_new_tokens):
+                model_input = tokens if past_key_values is None else tokens[:, -1:]
+                outputs = self.model(model_input, past_key_values=past_key_values, return_dict=True)
+                logits = outputs["logits"]
+                past_key_values = outputs["past_key_values"]
+                
+                next_token_logits = logits[:, -1, :]
+                next_token = torch.argmax(next_token_logits, dim=-1).unsqueeze(-1)
+                tokens = torch.cat([tokens, next_token], dim=-1)
 
-            if next_token.item() == self.serializer.tokenizer.eos_token_id:
-                break
+                if next_token.item() == self.serializer.tokenizer.eos_token_id:
+                    break
 
         prompt_len = input_ids.shape[1]
         return tokens[0, prompt_len:].tolist()

@@ -3,6 +3,8 @@ import os
 import time
 from pathlib import Path
 from typing import Any
+import collections
+import random
 
 import torch
 import torch.nn as nn
@@ -14,7 +16,7 @@ from .config import TrainConfig
 from .consistency import ConsistencyTools
 from .data import ArcCollator, GridDeserializer, GridSerializer, InMemoryArcDataset
 from .evaluation import EvaluationStep
-from .model import ArcTransformer
+from .model import ArcTransformer, mas_normalize
 from .observer import Observer
 from .tokenizer import ArcColorTokenizer
 
@@ -24,20 +26,35 @@ class LearningDynamics:
         self.model = model
         self.optimizer = optimizer
         self.config = config
-    
+
     @staticmethod
     @torch.jit.script
     def _calculate_mu_grads(
-        masked_output_grads: list[torch.Tensor | None], sbl_inputs: list[torch.Tensor | None]
+        computation_output_grads: list[torch.Tensor | None], sbl_inputs: list[torch.Tensor | None]
     ) -> list[torch.Tensor | None]:
         mu_grads_per_token: list[torch.Tensor | None] = []
-        for grad_act, sbl_in in zip(masked_output_grads, sbl_inputs):
+        for grad_act, sbl_in in zip(computation_output_grads, sbl_inputs):
             if grad_act is not None and sbl_in is not None:
                 per_token_grad = torch.einsum("bsd,bsh->bsdh", grad_act, sbl_in)
                 mu_grads_per_token.append(per_token_grad)
             else:
                 mu_grads_per_token.append(None)
         return mu_grads_per_token
+
+    def _compute_goodness_per_module(
+        self, mu_grads_per_token: torch.Tensor | None, computation_output_grads: torch.Tensor | None
+    ) -> torch.Tensor | None:
+        if mu_grads_per_token is None or computation_output_grads is None:
+            return None
+
+        surprise_vec = torch.norm(mu_grads_per_token, p=2, dim=(0, 1, 3)).detach()
+        importance_vec = torch.norm(computation_output_grads, p=2, dim=(0, 1)).detach()
+
+        norm_surprise = mas_normalize(surprise_vec)
+        norm_importance = mas_normalize(importance_vec)
+        
+        goodness = norm_importance - norm_surprise
+        return goodness
 
     def compute_and_apply_gradients(
         self, main_loss: torch.Tensor, model_outputs: dict, device: torch.device
@@ -54,47 +71,42 @@ class LearningDynamics:
         )
         masked_output_grads = main_loss_grads[: len(masked_outputs)]
         sbl_input_grads = main_loss_grads[len(masked_outputs) :]
+        
+        all_goodness = []
+        for masked_grad, sbl_in_grad in zip(masked_output_grads, sbl_input_grads):
+            if masked_grad is not None and sbl_in_grad is not None:
+                importance_vec = torch.norm(masked_grad, p=2, dim=(0, 1)).detach()
+                surprise_vec = torch.norm(sbl_in_grad, p=2, dim=(0, 1)).detach()
 
-        mu_grads_per_token = self._calculate_mu_grads(masked_output_grads, sbl_inputs)
-
-        goodness_scores = []
-        all_mu_surprises = []
-
-        for i in range(len(mu_grads_per_token)):
-            mu_grad_pt = mu_grads_per_token[i]
-            sbl_in_grad = sbl_input_grads[i]
-
-            if mu_grad_pt is not None and sbl_in_grad is not None:
-                mu_surprise_pt = torch.norm(mu_grad_pt, p=2, dim=-1).detach()
-                output_importance_pt = torch.norm(sbl_in_grad, p=2, dim=-1).detach()
+                norm_importance = mas_normalize(importance_vec)
+                norm_surprise = mas_normalize(surprise_vec)
                 
-                goodness_raw = output_importance_pt.unsqueeze(-1) / (mu_surprise_pt + 1e-9)
-                
-                max_goodness = torch.max(goodness_raw).detach()
-                goodness = goodness_raw / (max_goodness + 1e-9)
-                goodness_scores.append(goodness)
-                all_mu_surprises.append(mu_surprise_pt)
+                goodness = norm_importance - norm_surprise
+                all_goodness.append(goodness)
             else:
-                goodness_scores.append(torch.empty(0, device=device))
-                all_mu_surprises.append(torch.empty(0, device=device))
+                all_goodness.append(torch.empty(0, device=device))
 
-        total_route_kl_loss = torch.tensor(0.0, device=device)
+        total_route_jsd_loss = torch.tensor(0.0, device=device)
         num_valid_losses = 0
-        for logits, goodness in zip(routing_logits, goodness_scores, strict=True):
-            if logits.numel() > 0 and goodness.numel() > 0:
-                kl_loss = F.kl_div(
-                    F.log_softmax(logits, dim=-1),
-                    F.softmax(goodness, dim=-1),
-                    reduction="batchmean",
-                    log_target=False,
-                )
-                if torch.isfinite(kl_loss):
-                    total_route_kl_loss += kl_loss
+        for logits, goodness in zip(routing_logits, all_goodness, strict=True):
+            if logits.numel() > 0 and goodness.numel() > 0 and logits.shape[-1] == goodness.shape[-1]:
+                p_dist = mas_normalize(logits)
+                q_dist = mas_normalize(goodness).detach()
+
+                m_dist = 0.5 * (p_dist + q_dist)
+                
+                kl_p_m = torch.sum(p_dist * (torch.log(p_dist + 1e-9) - torch.log(m_dist + 1e-9)), dim=-1)
+                kl_q_m = torch.sum(q_dist * (torch.log(q_dist + 1e-9) - torch.log(m_dist + 1e-9)), dim=-1)
+
+                jsd_loss = (0.5 * kl_p_m + 0.5 * kl_q_m).mean()
+
+                if torch.isfinite(jsd_loss):
+                    total_route_jsd_loss += jsd_loss
                     num_valid_losses += 1
         
-        avg_route_kl_loss = total_route_kl_loss / num_valid_losses if num_valid_losses > 0 else torch.tensor(0.0, device=device)
+        avg_route_jsd_loss = total_route_jsd_loss / num_valid_losses if num_valid_losses > 0 else torch.tensor(0.0, device=device)
         
-        total_loss = main_loss + self.config.w_route_kl * avg_route_kl_loss
+        total_loss = main_loss + self.config.w_route_kl * avg_route_jsd_loss
         
         self.optimizer.zero_grad()
         total_loss.backward()
@@ -103,9 +115,9 @@ class LearningDynamics:
         proto_weights = [p.detach() for name, p in self.model.named_parameters() if 'proto_weight' in name]
         
         return {
-            "route_kl_loss": avg_route_kl_loss, 
-            "mu_surprises": all_mu_surprises,
-            "goodness_scores": goodness_scores,
+            "route_kl_loss": avg_route_jsd_loss,
+            "mu_surprises": sbl_input_grads,
+            "goodness_scores": all_goodness,
             "proto_weights": proto_weights,
         }
 
@@ -129,7 +141,7 @@ def data_driven_init(trainer: "Trainer"):
         return
 
     with torch.no_grad():
-        initial_embeddings = trainer.model.embedding(batch[0]).squeeze(0)
+        initial_embeddings = trainer.model.embedding(batch["input_ids"]).squeeze(0)
 
     for name, param in trainer.model.named_parameters():
         if "proto_weight" in name:
@@ -153,7 +165,7 @@ def data_driven_init(trainer: "Trainer"):
 
 def prepare_batch(
     mini_task: dict, view_idx: int, device: torch.device, serializer, consistency_tools, max_len
-) -> tuple[torch.Tensor, torch.Tensor] | None:
+) -> dict[str, torch.Tensor] | None:
     input_grid = torch.tensor(mini_task["input"], device=device)
     output_grid = torch.tensor(mini_task["output"], device=device)
     transform = consistency_tools.get_transforms()[view_idx]
@@ -161,9 +173,14 @@ def prepare_batch(
     ids, labels = serializer.serialize_mini_task(augmented)
     if len(ids) > max_len:
         return None
-    return torch.tensor([ids], dtype=torch.long, device=device), torch.tensor(
-        [labels], dtype=torch.long, device=device
-    )
+    
+    entropy = ArcCollator._calculate_sample_entropy(labels)
+    
+    return {
+        "input_ids": torch.tensor([ids], dtype=torch.long, device=device),
+        "labels": torch.tensor([labels], dtype=torch.long, device=device),
+        "sample_entropy": torch.tensor([entropy], dtype=torch.float32, device=device)
+    }
 
 
 class Trainer:
@@ -209,6 +226,9 @@ class Trainer:
         self.checkpoint_dir = Path(__file__).parent / "checkpoints"
         self.checkpoint_dir.mkdir(exist_ok=True)
         self.global_step, self.epoch, self.start_task_idx, self.start_view_idx = 0, 0, 0, 0
+        self.log_cycle_act_rates = []
+        self.replay_queue = collections.deque(maxlen=100)
+        self.new_sample_counter = 0
 
     def _run_step(
         self,
@@ -228,8 +248,8 @@ class Trainer:
             self.config.model.max_position_embeddings,
         )
         if not batch:
-            return None, None
-        input_ids, labels = batch
+            return None, None, None, None
+        input_ids, labels, sample_entropy = batch["input_ids"], batch["labels"], batch["sample_entropy"]
 
         self.model.train()
 
@@ -247,38 +267,34 @@ class Trainer:
 
         signals = self.dynamics.compute_and_apply_gradients(main_loss, model_outputs, self.device)
         model_outputs["labels"] = labels
-        
-        # Calculate KL divergence for observer log: last converged vs. current step
-        if last_view_routing_logits is not None:
-            all_kl_divs = []
-            for curr_logits, prev_logits in zip(model_outputs["routing_logits"], last_view_routing_logits, strict=True):
-                if curr_logits.numel() > 0 and prev_logits.numel() > 0:
-                    kl = F.kl_div(
-                        F.log_softmax(curr_logits, dim=-1),
-                        F.softmax(prev_logits.detach(), dim=-1),
-                        reduction="batchmean",
-                        log_target=False,
-                    )
-                    if torch.isfinite(kl):
-                        all_kl_divs.append(kl)
-            signals["routing_kl_vs_last_converged"] = torch.tensor(all_kl_divs).mean().item() if all_kl_divs else 0.0
+        model_outputs["sample_entropy"] = sample_entropy
         
         metrics = self.observer.calculate_metrics(main_loss, model_outputs, signals, input_ids, self.model)
+        if "act_rates" in metrics:
+            self.log_cycle_act_rates.append(metrics["act_rates"])
 
-        routing_consistency = None
+        consistency_metrics = None
         if last_view_routing_logits is not None:
-            all_kl_divs = []
+            all_cos_sims, all_euc_dists = [], []
             for curr_logits, prev_logits in zip(model_outputs["routing_logits"], last_view_routing_logits, strict=True):
                 if curr_logits.numel() > 0 and prev_logits.numel() > 0:
-                    kl = F.kl_div(
-                        F.log_softmax(curr_logits, dim=-1),
-                        F.softmax(prev_logits.detach(), dim=-1),
-                        reduction="batchmean",
-                        log_target=False,
-                    )
-                    if torch.isfinite(kl):
-                        all_kl_divs.append(kl)
-            routing_consistency = torch.tensor(all_kl_divs).mean().item() if all_kl_divs else 0.0
+                    # FIX: Use mas_normalize instead of softmax for consistency with the model's activation function
+                    curr_mean_dist = mas_normalize(curr_logits).mean(dim=1).squeeze(0)
+                    prev_mean_dist = mas_normalize(prev_logits).mean(dim=1).squeeze(0)
+                    
+                    if curr_mean_dist.shape != prev_mean_dist.shape: continue
+
+                    cos_sim = F.cosine_similarity(curr_mean_dist, prev_mean_dist, dim=0)
+                    euc_dist = torch.cdist(curr_mean_dist.unsqueeze(0).to(torch.float32), prev_mean_dist.unsqueeze(0).to(torch.float32))
+                    
+                    all_cos_sims.append(cos_sim)
+                    all_euc_dists.append(euc_dist)
+
+            if all_cos_sims:
+                consistency_metrics = {
+                    "cos_sim": torch.stack(all_cos_sims).mean().item(),
+                    "euc_dist": torch.stack(all_euc_dists).mean().item()
+                }
         
         signals["raw_weights"] = model_outputs["raw_weights"]
         self.observer.maybe_log_and_visualize(
@@ -293,12 +309,13 @@ class Trainer:
             self.eval_loader,
             task_idx,
             self._save_checkpoint,
-            routing_consistency,
+            consistency_metrics,
+            self._reinitialize_dead_prototypes_if_needed,
         )
 
         self.global_step += 1
         torch.cuda.empty_cache()
-        return metrics, model_outputs["raw_weights"]
+        return metrics, model_outputs["raw_weights"], model_outputs["routing_logits"], signals
 
     def _train_epoch(self, epoch: int):
         dataset = self.train_loader.dataset
@@ -310,61 +327,101 @@ class Trainer:
                 step, MAX_STEPS = 0, 500
                 view_last_raw_weights = None
                 while step < MAX_STEPS:
-                    metrics, raw_weights = self._run_step(
+                    metrics, raw_weights, routing_logits, signals = self._run_step(
                         mini_task, view_idx, epoch, task_idx, last_view_routing_logits
-                    )
+                    ) or (None, None, None, None)
+                    
                     if raw_weights:
                         view_last_raw_weights = raw_weights
                     if not metrics:
                         self.console.print(f"[yellow]Skipping task {task_idx} view {view_idx}.[/yellow]")
                         break
-                    if metrics.get("token_acc", 0.0) >= 1.0 and metrics.get("tau", 1.0) <= 0.015:
+                    if metrics.get("token_acc", 0.0) >= 1.0:
                         self.console.print(f"Task {task_idx} view {view_idx} converged in {step + 1} steps.")
                         if view_last_raw_weights:
-                            last_view_routing_logits = model_outputs["routing_logits"]
+                            last_view_routing_logits = routing_logits
+                        self.replay_queue.append((mini_task, view_idx, task_idx))
                         break
                     step += 1
                 if step == MAX_STEPS:
                     self.console.print(f"[red]Task {task_idx} view {view_idx} hit MAX_STEPS.[/red]")
-            reinit_count = self._reinitialize_dead_prototypes()
-            if reinit_count > 0:
-                self.console.print(
-                    f"[bold yellow]Reinitialized {reinit_count} dead prototypes after completing task {task_idx}.[/bold yellow]"
-                )
+
+                self.new_sample_counter += 1
+                if self.new_sample_counter % 7 == 0 and self.replay_queue:
+                    replay_task, replay_view_idx, replay_task_idx = random.choice(self.replay_queue)
+                    self.console.print(f"[cyan]--- Replaying sample (Task -{replay_task_idx} View {replay_view_idx}) ---[/cyan]")
+                    self._run_step(replay_task, replay_view_idx, epoch, f"-{replay_task_idx}", None)
+
             self.start_view_idx = 0
         self.start_task_idx = 0
+    
+    def _reinitialize_dead_prototypes_if_needed(self):
+        if not self.log_cycle_act_rates: return
 
-    def _reinitialize_dead_prototypes(
-        self, k: int = 2, proto_threshold: float = 0.99, mu_threshold: float = 0.99
-    ) -> int:
+        avg_act_rates = []
+        num_spl_layers = len(self.log_cycle_act_rates[0])
+        for i in range(num_spl_layers):
+            layer_rates = [step_rates[i] for step_rates in self.log_cycle_act_rates if i < len(step_rates)]
+            if layer_rates:
+                avg_act_rates.append(sum(layer_rates) / len(layer_rates))
+            else:
+                avg_act_rates.append(0.0)
+        
+        reinit_count = self._reinitialize_dead_prototypes(avg_act_rates)
+        if reinit_count > 0:
+            self.console.print(
+                f"[bold yellow]Reinitialized {reinit_count} dead prototypes at step {self.global_step}.[/bold yellow]"
+            )
+        self.log_cycle_act_rates = []
+
+    def _reinitialize_dead_prototypes(self, avg_act_rates: list[float], k: int = 1) -> int:
         reinitialized_count = 0
+        spl_layer_idx = 0
         with torch.no_grad():
             for block in self.model.blocks:
                 for module_name, module in block.named_modules():
                     if isinstance(module, torch.nn.Module) and hasattr(module, "proto_weight"):
+                        if spl_layer_idx >= len(avg_act_rates): continue
+                        
+                        act_rate = avg_act_rates[spl_layer_idx]
+                        proto_threshold = 0.99 * (1.0 - act_rate) + 0.01 * 0.90
+                        
                         proto_weight = module.proto_weight
                         mu_weight = module.mu_weight
                         num_experts = proto_weight.shape[0]
-
+                        
                         proto_sim = F.cosine_similarity(proto_weight.unsqueeze(1), proto_weight.unsqueeze(0), dim=-1)
-                        mu_sim = F.cosine_similarity(mu_weight.unsqueeze(1), mu_weight.unsqueeze(0), dim=-1)
-
-                        proto_redundant = (proto_sim > proto_threshold).float().sum(dim=1) > k
-                        mu_redundant = (mu_sim > mu_threshold).float().sum(dim=1) > k
-
-                        dead_mask = proto_redundant & mu_redundant
+                        
+                        dead_mask = torch.zeros(num_experts, dtype=torch.bool, device=self.device)
+                        visited = torch.zeros(num_experts, dtype=torch.bool, device=self.device)
+                        
+                        for i in range(num_experts):
+                            if visited[i]: continue
+                            
+                            similar_indices = torch.where(proto_sim[i] > proto_threshold)[0]
+                            
+                            if len(similar_indices) > k:
+                                survivor_idx = similar_indices[torch.randint(0, len(similar_indices), (1,)).item()]
+                                
+                                for idx in similar_indices:
+                                    if idx != survivor_idx:
+                                        dead_mask[idx] = True
+                                    visited[idx] = True
+                            else:
+                                visited[i] = True
+                        
                         num_dead = dead_mask.sum().item()
 
                         if num_dead > 0:
                             reinitialized_count += num_dead
                             live_mask = ~dead_mask
-
+                            
                             if live_mask.any():
                                 live_protos = proto_weight[live_mask]
                                 center = live_protos.mean(dim=0)
                                 distances = torch.norm(live_protos - center, p=2, dim=-1)
-                                radius = distances.mean()
-
+                                radius = distances.mean() if distances.numel() > 0 else 1.0
+                                
                                 new_protos = center + torch.randn_like(proto_weight[dead_mask]) * radius
                                 proto_weight.data[dead_mask] = new_protos
 
@@ -374,6 +431,8 @@ class Trainer:
                             else:
                                 torch.nn.init.kaiming_uniform_(proto_weight.data, a=math.sqrt(5))
                                 torch.nn.init.kaiming_uniform_(mu_weight.data, a=math.sqrt(5))
+                        
+                        spl_layer_idx += 1
 
         return reinitialized_count
 

@@ -22,6 +22,12 @@ def apply_rotary_pos_emb(
 
 
 @torch.jit.script
+def mas_normalize(logits: torch.Tensor) -> torch.Tensor:
+    max_abs_val = torch.max(torch.abs(logits), dim=-1, keepdim=True).values
+    scaled_logits = logits / (max_abs_val + 1e-9)
+    return F.relu(scaled_logits)
+
+@torch.jit.script
 def spl_forward(
     x: torch.Tensor,
     effective_proto: torch.Tensor,
@@ -194,15 +200,14 @@ class MoIETransformerBlock(nn.Module):
         for i in range(3):
             cost_score = costs_qkv[i] / max_cost
             routing_logits = match_qkv[i] - cost_score
-            raw_weights = F.relu(routing_logits)
-            binary_weights = raw_weights + ((raw_weights > 0).float() - raw_weights).detach()
-            masked = comp_qkv[i] * binary_weights
+            raw_weights = mas_normalize(routing_logits)
+            masked = comp_qkv[i] * raw_weights
             if i == 0: q = masked
             elif i == 1: k = masked
             else: v = masked
             all_masked.append(masked)
             all_comp.append(comp_qkv[i])
-            all_raw.append(raw_weights / (raw_weights.max() + 1e-6) if raw_weights.numel() > 0 and raw_weights.max() > 0 else raw_weights)
+            all_raw.append(raw_weights)
             all_routing_logits.append(routing_logits)
 
         cos, sin = pos_emb
@@ -216,33 +221,26 @@ class MoIETransformerBlock(nn.Module):
         c_o, mv_o, pc_o = self.attn.sbl_o(attn_out, effective_protos["attn_o"])
         cost_score_o = pc_o / max_cost
         routing_logits_o = mv_o - cost_score_o
-        rw_o = F.relu(routing_logits_o)
-        bw_o = rw_o + ((rw_o > 0).float() - rw_o).detach()
-        m_o = c_o * bw_o
+        rw_o = mas_normalize(routing_logits_o)
+        m_o = c_o * rw_o
         x = x + m_o
 
         cost_score_f1 = pc1 / max_cost
         routing_logits_f1 = mv1 - cost_score_f1
-        rw_f1 = F.relu(routing_logits_f1)
-        bw_f1 = rw_f1 + ((rw_f1 > 0).float() - rw_f1).detach()
-        m1 = c1 * bw_f1
+        rw_f1 = mas_normalize(routing_logits_f1)
+        m1 = c1 * rw_f1
         h_act = F.relu(m1)
 
         c2, mv2, pc2 = self.ffn.sbl2(h_act, effective_protos["ffn_sbl2"])
         cost_score_f2 = pc2 / max_cost
         routing_logits_f2 = mv2 - cost_score_f2
-        rw_f2 = F.relu(routing_logits_f2)
-        bw_f2 = rw_f2 + ((rw_f2 > 0).float() - rw_f2).detach()
-        m2 = c2 * bw_f2
+        rw_f2 = mas_normalize(routing_logits_f2)
+        m2 = c2 * rw_f2
         x_out = x + m2
 
         all_masked.extend([m_o, m1, m2])
         all_comp.extend([c_o, c1, c2])
-        all_raw.extend([
-            rw_o / (rw_o.max() + 1e-6) if rw_o.numel() > 0 and rw_o.max() > 0 else rw_o,
-            rw_f1 / (rw_f1.max() + 1e-6) if rw_f1.numel() > 0 and rw_f1.max() > 0 else rw_f1,
-            rw_f2 / (rw_f2.max() + 1e-6) if rw_f2.numel() > 0 and rw_f2.max() > 0 else rw_f2,
-        ])
+        all_raw.extend([rw_o, rw_f1, rw_f2])
         all_routing_logits.extend([routing_logits_o, routing_logits_f1, routing_logits_f2])
         all_sbl_inputs.extend([ln1_out] * 3 + [attn_out, ln2_out, h_act])
 
