@@ -4,8 +4,8 @@ from dataclasses import dataclass, field
 @dataclass
 class ModelConfig:
     vocab_size: int = 16
-    hidden_size: int = 256
-    num_layers: int = 8
+    hidden_size: int = 384
+    num_layers: int = 5
     max_position_embeddings: int = 2048
     d_ffn_factor: int = 1
 
@@ -21,9 +21,9 @@ class TrainConfig:
     data: DataConfig = field(default_factory=DataConfig)
 
     lr: float = 1e-3
-    
-    w_route_kl: float = 1.0
-    
+
+    w_route_jsd: float = 1.0
+
     num_epochs: int = 20
 
     device: str = "cuda"
@@ -36,3 +36,4 @@ class TrainConfig:
 @dataclass
 class GenerationConfig:
     max_new_tokens: int = 256
+    top_p: float = 0.5

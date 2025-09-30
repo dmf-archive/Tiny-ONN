@@ -87,13 +87,13 @@ class ArcCollator:
         self.tokenizer = tokenizer
         self.serializer = GridSerializer(tokenizer)
         self.max_len = max_len
-    
+
     @staticmethod
     def _calculate_sample_entropy(labels: list[int]) -> float:
         valid_labels = [l for l in labels if l != -100]
         if not valid_labels:
             return 0.0
-        
+
         counts = torch.bincount(torch.tensor(valid_labels))
         probs = counts.float() / len(valid_labels)
         probs = probs[probs > 0]
@@ -107,7 +107,7 @@ class ArcCollator:
 
             if len(input_ids) > self.max_len:
                 continue
-            
+
             entropy = self._calculate_sample_entropy(labels)
             all_entropies.append(entropy)
             all_input_ids.append(torch.tensor(input_ids, dtype=torch.long))
@@ -118,7 +118,7 @@ class ArcCollator:
 
         padded_input_ids = pad_sequence(all_input_ids, batch_first=True, padding_value=self.tokenizer.pad_token_id)
         padded_labels = pad_sequence(all_labels, batch_first=True, padding_value=-100)
-        
+
         return {
             "input_ids": padded_input_ids,
             "labels": padded_labels,

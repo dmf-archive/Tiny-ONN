@@ -1,10 +1,10 @@
+import collections
 import math
 import os
+import random
 import time
 from pathlib import Path
 from typing import Any
-import collections
-import random
 
 import torch
 import torch.nn as nn
@@ -12,13 +12,26 @@ import torch.nn.functional as F
 from rich.console import Console
 from torch.utils.data import DataLoader
 
-from .config import TrainConfig
+from .config import GenerationConfig, TrainConfig
 from .consistency import ConsistencyTools
 from .data import ArcCollator, GridDeserializer, GridSerializer, InMemoryArcDataset
 from .evaluation import EvaluationStep
-from .model import ArcTransformer, mas_normalize
+from .model import ArcTransformer, mas_normalize, mas_normalize_negative
 from .observer import Observer
 from .tokenizer import ArcColorTokenizer
+
+
+@torch.jit.script
+def _jsd_from_distributions(p_dist_unnorm: torch.Tensor, q_dist_unnorm: torch.Tensor) -> torch.Tensor:
+    epsilon = 1e-9
+    p_dist = p_dist_unnorm / (p_dist_unnorm.sum(dim=-1, keepdim=True) + epsilon)
+    q_dist = q_dist_unnorm / (q_dist_unnorm.sum(dim=-1, keepdim=True) + epsilon)
+
+    m_dist = 0.5 * (p_dist + q_dist)
+    kl_p_m = torch.sum(p_dist * (torch.log(p_dist + epsilon) - torch.log(m_dist + epsilon)), dim=-1)
+    kl_q_m = torch.sum(q_dist * (torch.log(q_dist + epsilon) - torch.log(m_dist + epsilon)), dim=-1)
+    jsd_loss = (0.5 * kl_p_m + 0.5 * kl_q_m).mean()
+    return jsd_loss
 
 
 class LearningDynamics:
@@ -29,158 +42,98 @@ class LearningDynamics:
 
     @staticmethod
     @torch.jit.script
+    def _calculate_jsd_loss(logits: torch.Tensor, goodness: torch.Tensor) -> torch.Tensor:
+        p_dist_unnorm = mas_normalize(logits)
+        q_dist_unnorm = mas_normalize(goodness).detach()
+        return _jsd_from_distributions(p_dist_unnorm, q_dist_unnorm)
+
+    @staticmethod
+    @torch.jit.script
     def _calculate_mu_grads(
-        computation_output_grads: list[torch.Tensor | None], sbl_inputs: list[torch.Tensor | None]
-    ) -> list[torch.Tensor | None]:
-        mu_grads_per_token: list[torch.Tensor | None] = []
-        for grad_act, sbl_in in zip(computation_output_grads, sbl_inputs):
-            if grad_act is not None and sbl_in is not None:
-                per_token_grad = torch.einsum("bsd,bsh->bsdh", grad_act, sbl_in)
-                mu_grads_per_token.append(per_token_grad)
-            else:
-                mu_grads_per_token.append(None)
+        computation_output_grads: list[torch.Tensor], spl_inputs: list[torch.Tensor]
+    ) -> list[torch.Tensor]:
+        mu_grads_per_token: list[torch.Tensor] = []
+        for grad_act, spl_in in zip(computation_output_grads, spl_inputs, strict=False):
+            per_token_grad = torch.einsum("bsd,bsh->bsdh", grad_act, spl_in)
+            mu_grads_per_token.append(per_token_grad)
         return mu_grads_per_token
-
-    def _compute_goodness_per_module(
-        self, mu_grads_per_token: torch.Tensor | None, computation_output_grads: torch.Tensor | None
-    ) -> torch.Tensor | None:
-        if mu_grads_per_token is None or computation_output_grads is None:
-            return None
-
-        surprise_vec = torch.norm(mu_grads_per_token, p=2, dim=(0, 1, 3)).detach()
-        importance_vec = torch.norm(computation_output_grads, p=2, dim=(0, 1)).detach()
-
-        norm_surprise = mas_normalize(surprise_vec)
-        norm_importance = mas_normalize(importance_vec)
-        
-        goodness = norm_importance - norm_surprise
-        return goodness
 
     def compute_and_apply_gradients(
         self, main_loss: torch.Tensor, model_outputs: dict, device: torch.device
     ) -> dict[str, Any]:
-        sbl_inputs = model_outputs["sbl_inputs"]
-        masked_outputs = model_outputs["masked_outputs"]
+        spl_inputs = model_outputs["spl_inputs"]
+        computation_outputs = model_outputs["computation_outputs"]
         routing_logits = model_outputs["routing_logits"]
+        raw_weights = model_outputs.get("raw_weights", [])
+        proto_weights = [p for name, p in self.model.named_parameters() if 'proto_weight' in name]
+        mu_weights = [p for name, p in self.model.named_parameters() if 'mu_weight' in name]
 
-        main_loss_grads = torch.autograd.grad(
-            main_loss,
-            masked_outputs + sbl_inputs,
-            retain_graph=True,
-            allow_unused=True,
+        all_tensors_to_grad = computation_outputs + proto_weights
+        all_grads = torch.autograd.grad(
+            main_loss, all_tensors_to_grad, retain_graph=True, allow_unused=True
         )
-        masked_output_grads = main_loss_grads[: len(masked_outputs)]
-        sbl_input_grads = main_loss_grads[len(masked_outputs) :]
-        
+
+        num_comp_outputs = len(computation_outputs)
+        computation_output_grads = all_grads[:num_comp_outputs]
+        proto_grads = all_grads[num_comp_outputs:]
+
+        # This is the theoretically correct implementation based on the original code.
+        clean_spl_inputs = [s for s in spl_inputs if s is not None]
+        clean_comp_grads = [g for g in computation_output_grads if g is not None]
+
+        mu_grads = self._calculate_mu_grads(clean_comp_grads, clean_spl_inputs)
+
         all_goodness = []
-        for masked_grad, sbl_in_grad in zip(masked_output_grads, sbl_input_grads):
-            if masked_grad is not None and sbl_in_grad is not None:
-                importance_vec = torch.norm(masked_grad, p=2, dim=(0, 1)).detach()
-                surprise_vec = torch.norm(sbl_in_grad, p=2, dim=(0, 1)).detach()
+        all_mu_surprises = []
+        for mu_grad, comp_grad in zip(mu_grads, clean_comp_grads, strict=False):
+            surprise_vec = torch.norm(mu_grad, p=2, dim=(0, 1, 3)).detach()
+            all_mu_surprises.append(surprise_vec)
+            importance_vec = torch.norm(comp_grad, p=2, dim=(0, 1)).detach()
 
-                norm_importance = mas_normalize(importance_vec)
-                norm_surprise = mas_normalize(surprise_vec)
-                
-                goodness = norm_importance - norm_surprise
-                all_goodness.append(goodness)
-            else:
-                all_goodness.append(torch.empty(0, device=device))
+            norm_surprise = mas_normalize(surprise_vec)
+            norm_importance = mas_normalize(importance_vec)
 
-        total_route_jsd_loss = torch.tensor(0.0, device=device)
-        num_valid_losses = 0
-        for logits, goodness in zip(routing_logits, all_goodness, strict=True):
-            if logits.numel() > 0 and goodness.numel() > 0 and logits.shape[-1] == goodness.shape[-1]:
-                p_dist = mas_normalize(logits)
-                q_dist = mas_normalize(goodness).detach()
+            goodness = norm_importance - norm_surprise
+            all_goodness.append(goodness)
 
-                m_dist = 0.5 * (p_dist + q_dist)
-                
-                kl_p_m = torch.sum(p_dist * (torch.log(p_dist + 1e-9) - torch.log(m_dist + 1e-9)), dim=-1)
-                kl_q_m = torch.sum(q_dist * (torch.log(q_dist + 1e-9) - torch.log(m_dist + 1e-9)), dim=-1)
+        act_rates = [rw.gt(0).float().mean().item() for rw in raw_weights]
 
-                jsd_loss = (0.5 * kl_p_m + 0.5 * kl_q_m).mean()
+        meta_losses = []
+        w_repel = 1.0
 
-                if torch.isfinite(jsd_loss):
-                    total_route_jsd_loss += jsd_loss
-                    num_valid_losses += 1
-        
-        avg_route_jsd_loss = total_route_jsd_loss / num_valid_losses if num_valid_losses > 0 else torch.tensor(0.0, device=device)
-        
-        total_loss = main_loss + self.config.w_route_kl * avg_route_jsd_loss
-        
+        for l, g, a in zip(routing_logits, all_goodness, act_rates, strict=False):
+            if not (l.numel() > 0 and g.numel() > 0 and l.shape[-1] == g.shape[-1]):
+                continue
+
+            num_experts = g.shape[-1]
+            if num_experts == 0: continue
+
+            k_good = math.floor((1 - a) * num_experts)
+            if k_good >= num_experts: k_good = max(0, num_experts - 1)
+            if k_good <= 0 : k_good = 1
+
+            _, indices = torch.sort(g, descending=True)
+            I_good, I_bad = indices[:k_good], indices[k_good:]
+
+            l_attract = self._calculate_jsd_loss(l, g)
+            meta_losses.append(l_attract)
+
+        avg_route_jsd_loss = torch.stack(meta_losses).mean() if meta_losses else torch.tensor(0.0, device=device)
+        total_loss = main_loss + self.config.w_route_jsd * avg_route_jsd_loss
+
         self.optimizer.zero_grad()
         total_loss.backward()
+
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
         self.optimizer.step()
-        
-        proto_weights = [p.detach() for name, p in self.model.named_parameters() if 'proto_weight' in name]
-        
+
         return {
-            "route_kl_loss": avg_route_jsd_loss,
-            "mu_surprises": sbl_input_grads,
+            "route_jsd_loss": avg_route_jsd_loss,
+            "mu_surprises": all_mu_surprises,
+            "proto_surprises": proto_grads,
             "goodness_scores": all_goodness,
-            "proto_weights": proto_weights,
+            "proto_weights": [p.detach() for p in proto_weights],
         }
-
-
-def data_driven_init(trainer: "Trainer"):
-    if hasattr(trainer.model, "is_data_initialized") and trainer.model.is_data_initialized:
-        return
-    trainer.console.print("[bold yellow]Performing one-time data-driven initialization...[/bold yellow]")
-
-    mini_task = trainer.train_loader.dataset[0]
-    batch = prepare_batch(
-        mini_task,
-        0,
-        trainer.device,
-        trainer.serializer,
-        trainer.consistency_tools,
-        trainer.config.model.max_position_embeddings,
-    )
-    if not batch:
-        trainer.console.print("[bold red]Failed to get a valid batch for init.[/bold red]")
-        return
-
-    with torch.no_grad():
-        initial_embeddings = trainer.model.embedding(batch["input_ids"]).squeeze(0)
-
-    for name, param in trainer.model.named_parameters():
-        if "proto_weight" in name:
-            num_experts, in_features = param.shape
-            new_data = torch.empty_like(param.data)
-
-            if in_features == initial_embeddings.shape[1]:
-                indices = torch.randint(0, initial_embeddings.shape[0], (num_experts,))
-                new_data = initial_embeddings[indices]
-            elif in_features > initial_embeddings.shape[1]:
-                num_repeats = (in_features + initial_embeddings.shape[1] - 1) // initial_embeddings.shape[1]
-                for i in range(num_experts):
-                    indices = torch.randint(0, initial_embeddings.shape[0], (num_repeats,))
-                    full_embed = torch.cat([initial_embeddings[idx] for idx in indices], dim=-1)
-                    new_data[i] = full_embed[:in_features]
-            param.data.copy_(new_data)
-
-    trainer.model.is_data_initialized = True
-    trainer.console.print("[bold green]Data-driven initialization complete.[/bold green]")
-
-
-def prepare_batch(
-    mini_task: dict, view_idx: int, device: torch.device, serializer, consistency_tools, max_len
-) -> dict[str, torch.Tensor] | None:
-    input_grid = torch.tensor(mini_task["input"], device=device)
-    output_grid = torch.tensor(mini_task["output"], device=device)
-    transform = consistency_tools.get_transforms()[view_idx]
-    augmented = {"input": transform(input_grid).cpu().tolist(), "output": transform(output_grid).cpu().tolist()}
-    ids, labels = serializer.serialize_mini_task(augmented)
-    if len(ids) > max_len:
-        return None
-    
-    entropy = ArcCollator._calculate_sample_entropy(labels)
-    
-    return {
-        "input_ids": torch.tensor([ids], dtype=torch.long, device=device),
-        "labels": torch.tensor([labels], dtype=torch.long, device=device),
-        "sample_entropy": torch.tensor([entropy], dtype=torch.float32, device=device)
-    }
 
 
 class Trainer:
@@ -194,128 +147,112 @@ class Trainer:
         self.serializer = GridSerializer(self.tokenizer)
         self.consistency_tools = ConsistencyTools()
 
-        train_dataset = InMemoryArcDataset(data_path=config.data.data_path, split="training")
-        eval_dataset = InMemoryArcDataset(data_path=config.data.data_path, split="evaluation")
-        collator = ArcCollator(self.tokenizer, max_len=config.model.max_position_embeddings)
-        self.train_loader = DataLoader(
-            train_dataset,
-            batch_size=config.data.batch_size,
-            collate_fn=collator,
-            num_workers=config.data.num_workers,
-            shuffle=False,
-        )
-        self.eval_loader = DataLoader(
-            eval_dataset, batch_size=1, collate_fn=collator, num_workers=config.data.num_workers, shuffle=False
-        )
-
-        self.config.model.vocab_size = self.tokenizer.vocab_size
-        self.model = ArcTransformer(self.config.model, device=self.device).to(self.device)
-
-        self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=config.lr)
-        self.dynamics = LearningDynamics(self.model, self.optimizer, config)
-        self.evaluator = EvaluationStep(
-            self.model,
-            self.serializer,
-            GridDeserializer(self.tokenizer),
-            self.observer,
-            self.device,
-            train_dataset,
-            self.config,
-        )
+        self._setup_data()
+        self._setup_model_and_optimizer()
 
         self.checkpoint_dir = Path(__file__).parent / "checkpoints"
         self.checkpoint_dir.mkdir(exist_ok=True)
         self.global_step, self.epoch, self.start_task_idx, self.start_view_idx = 0, 0, 0, 0
-        self.log_cycle_act_rates = []
+        self.log_cycle_goodness: list[list[torch.Tensor]] = []
+        self.log_cycle_act_rates: list[list[float]] = []
+        self.last_spl_inputs: list[torch.Tensor] = []
         self.replay_queue = collections.deque(maxlen=100)
         self.new_sample_counter = 0
 
-    def _run_step(
-        self,
-        mini_task: dict,
-        view_idx: int,
-        epoch: int,
-        task_idx: int,
-        last_view_routing_logits: list[torch.Tensor] | None,
-    ):
-        start_time = time.time()
-        batch = prepare_batch(
-            mini_task,
-            view_idx,
-            self.device,
-            self.serializer,
-            self.consistency_tools,
-            self.config.model.max_position_embeddings,
+    def _setup_data(self):
+        train_dataset = InMemoryArcDataset(data_path=self.config.data.data_path, split="training")
+        eval_dataset = InMemoryArcDataset(data_path=self.config.data.data_path, split="evaluation")
+        collator = ArcCollator(self.tokenizer, max_len=self.config.model.max_position_embeddings)
+        self.train_loader = DataLoader(
+            train_dataset, batch_size=self.config.data.batch_size, collate_fn=collator,
+            num_workers=self.config.data.num_workers, shuffle=False
         )
-        if not batch:
-            return None, None, None, None
-        input_ids, labels, sample_entropy = batch["input_ids"], batch["labels"], batch["sample_entropy"]
+        self.eval_loader = DataLoader(
+            eval_dataset, batch_size=1, collate_fn=collator,
+            num_workers=self.config.data.num_workers, shuffle=False
+        )
+
+    def _setup_model_and_optimizer(self):
+        self.config.model.vocab_size = self.tokenizer.vocab_size
+        self.model = ArcTransformer(self.config.model, device=self.device).to(self.device)
+        self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=self.config.lr)
+        self.dynamics = LearningDynamics(self.model, self.optimizer, self.config)
+        self.evaluator = EvaluationStep(
+            self.model, self.serializer, GridDeserializer(self.tokenizer),
+            self.observer, self.device, self.train_loader.dataset, self.config
+        )
+
+    @staticmethod
+    def _prepare_batch(mini_task: dict, view_idx: int, device: torch.device, serializer: GridSerializer,
+                       consistency_tools: ConsistencyTools, max_len: int) -> dict[str, torch.Tensor] | None:
+        input_grid = torch.tensor(mini_task["input"], device=device)
+        output_grid = torch.tensor(mini_task["output"], device=device)
+        transform = consistency_tools.get_transforms()[view_idx]
+        augmented = {"input": transform(input_grid).cpu().tolist(), "output": transform(output_grid).cpu().tolist()}
+        ids, labels = serializer.serialize_mini_task(augmented)
+        if len(ids) > max_len: return None
+
+        return {
+            "input_ids": torch.tensor([ids], dtype=torch.long, device=device),
+            "labels": torch.tensor([labels], dtype=torch.long, device=device),
+            "sample_entropy": torch.tensor([ArcCollator._calculate_sample_entropy(labels)], dtype=torch.float32, device=device)
+        }
+
+    def _run_step(self, mini_task: dict, view_idx: int, epoch: int, task_idx: int | str,
+                  last_view_routing_logits: list[torch.Tensor] | None) -> tuple | None:
+        start_time = time.time()
+        batch = self._prepare_batch(mini_task, view_idx, self.device, self.serializer, self.consistency_tools, self.config.model.max_position_embeddings)
+        if not batch: return None
 
         self.model.train()
-
         with torch.autocast(device_type=self.config.device, dtype=torch.bfloat16):
-            model_outputs = self.model(input_ids, return_dict=True)
-            main_loss = F.cross_entropy(
-                model_outputs["logits"][:, :-1, :].contiguous().view(-1, self.config.model.vocab_size),
-                labels[:, 1:].contiguous().view(-1),
-                ignore_index=-100,
-            )
+            model_outputs = self.model(batch["input_ids"], return_dict=True)
+            main_loss = F.cross_entropy(model_outputs["logits"][:, :-1, :].contiguous().view(-1, self.config.model.vocab_size),
+                                      batch["labels"][:, 1:].contiguous().view(-1), ignore_index=-100)
 
         if not torch.isfinite(main_loss):
             self.console.print(f"[bold red]NaN detected in main_loss at step {self.global_step}. Aborting step.[/bold red]")
-            return None, None
+            return None
 
         signals = self.dynamics.compute_and_apply_gradients(main_loss, model_outputs, self.device)
-        model_outputs["labels"] = labels
-        model_outputs["sample_entropy"] = sample_entropy
-        
-        metrics = self.observer.calculate_metrics(main_loss, model_outputs, signals, input_ids, self.model)
-        if "act_rates" in metrics:
-            self.log_cycle_act_rates.append(metrics["act_rates"])
+        model_outputs.update({"labels": batch["labels"], "sample_entropy": batch["sample_entropy"]})
+        metrics = self.observer.calculate_metrics(main_loss, model_outputs, signals, batch["input_ids"], self.model)
 
-        consistency_metrics = None
-        if last_view_routing_logits is not None:
-            all_cos_sims, all_euc_dists = [], []
-            for curr_logits, prev_logits in zip(model_outputs["routing_logits"], last_view_routing_logits, strict=True):
-                if curr_logits.numel() > 0 and prev_logits.numel() > 0:
-                    # FIX: Use mas_normalize instead of softmax for consistency with the model's activation function
-                    curr_mean_dist = mas_normalize(curr_logits).mean(dim=1).squeeze(0)
-                    prev_mean_dist = mas_normalize(prev_logits).mean(dim=1).squeeze(0)
-                    
-                    if curr_mean_dist.shape != prev_mean_dist.shape: continue
+        self._update_cycle_metrics(metrics, signals, model_outputs)
+        consistency_metrics = self._calculate_consistency_metrics(model_outputs.get("routing_logits"), last_view_routing_logits)
 
-                    cos_sim = F.cosine_similarity(curr_mean_dist, prev_mean_dist, dim=0)
-                    euc_dist = torch.cdist(curr_mean_dist.unsqueeze(0).to(torch.float32), prev_mean_dist.unsqueeze(0).to(torch.float32))
-                    
-                    all_cos_sims.append(cos_sim)
-                    all_euc_dists.append(euc_dist)
-
-            if all_cos_sims:
-                consistency_metrics = {
-                    "cos_sim": torch.stack(all_cos_sims).mean().item(),
-                    "euc_dist": torch.stack(all_euc_dists).mean().item()
-                }
-        
-        signals["raw_weights"] = model_outputs["raw_weights"]
+        signals["raw_weights"] = model_outputs.get("raw_weights")
         self.observer.maybe_log_and_visualize(
-            epoch,
-            self.global_step,
-            task_idx,
-            view_idx,
-            metrics,
-            time.time() - start_time,
-            signals,
-            self.evaluator,
-            self.eval_loader,
-            task_idx,
-            self._save_checkpoint,
-            consistency_metrics,
-            self._reinitialize_dead_prototypes_if_needed,
+            epoch, self.global_step, task_idx, view_idx, metrics, time.time() - start_time,
+            signals, self.evaluator, self.eval_loader, task_idx if isinstance(task_idx, int) else -1,
+            self._save_checkpoint, consistency_metrics, self._reinitialize_dead_prototypes_if_needed
         )
 
         self.global_step += 1
         torch.cuda.empty_cache()
-        return metrics, model_outputs["raw_weights"], model_outputs["routing_logits"], signals
+        return metrics, model_outputs.get("raw_weights"), model_outputs.get("routing_logits"), signals
+
+    def _update_cycle_metrics(self, metrics: dict, signals: dict, model_outputs: dict):
+        if "goodness_scores" in signals and signals["goodness_scores"]:
+            self.log_cycle_goodness.append(signals["goodness_scores"])
+        if "spl_inputs" in model_outputs and model_outputs["spl_inputs"]:
+            self.last_spl_inputs = [x.detach() for x in model_outputs["spl_inputs"] if x is not None]
+        if "act_rates" in metrics:
+            self.log_cycle_act_rates.append(metrics["act_rates"])
+
+    def _calculate_consistency_metrics(self, current_logits: list | None, prev_logits: list | None) -> dict | None:
+        if not current_logits or not prev_logits: return None
+
+        cos_sims, euc_dists = [], []
+        for curr, prev in zip(current_logits, prev_logits, strict=False):
+            if curr.numel() > 0 and prev.numel() > 0 and curr.shape == prev.shape:
+                curr_mean = mas_normalize(curr).mean(dim=1).squeeze(0)
+                prev_mean = mas_normalize(prev).mean(dim=1).squeeze(0)
+                cos_sims.append(F.cosine_similarity(curr_mean, prev_mean, dim=0))
+                euc_dists.append(torch.cdist(curr_mean.unsqueeze(0).float(), prev_mean.unsqueeze(0).float()))
+
+        if not cos_sims: return None
+        return {"cos_sim": torch.stack(cos_sims).mean().item(), "euc_dist": torch.stack(euc_dists).mean().item()}
 
     def _train_epoch(self, epoch: int):
         dataset = self.train_loader.dataset
@@ -324,26 +261,16 @@ class Trainer:
             last_view_routing_logits = None
             start_view = self.start_view_idx if task_idx == self.start_task_idx else 0
             for view_idx in range(start_view, 8):
-                step, MAX_STEPS = 0, 500
-                view_last_raw_weights = None
-                while step < MAX_STEPS:
-                    metrics, raw_weights, routing_logits, signals = self._run_step(
-                        mini_task, view_idx, epoch, task_idx, last_view_routing_logits
-                    ) or (None, None, None, None)
-                    
-                    if raw_weights:
-                        view_last_raw_weights = raw_weights
-                    if not metrics:
-                        self.console.print(f"[yellow]Skipping task {task_idx} view {view_idx}.[/yellow]")
-                        break
-                    if metrics.get("token_acc", 0.0) >= 1.0:
+                for step in range(500):
+                    result = self._run_step(mini_task, view_idx, epoch, task_idx, last_view_routing_logits)
+                    if not result: break
+                    metrics, _, routing_logits, _ = result
+                    if metrics["main_loss"] <= 0.01 and metrics["token_acc"] >= 1.0:
                         self.console.print(f"Task {task_idx} view {view_idx} converged in {step + 1} steps.")
-                        if view_last_raw_weights:
-                            last_view_routing_logits = routing_logits
+                        last_view_routing_logits = routing_logits
                         self.replay_queue.append((mini_task, view_idx, task_idx))
                         break
-                    step += 1
-                if step == MAX_STEPS:
+                else:
                     self.console.print(f"[red]Task {task_idx} view {view_idx} hit MAX_STEPS.[/red]")
 
                 self.new_sample_counter += 1
@@ -354,91 +281,87 @@ class Trainer:
 
             self.start_view_idx = 0
         self.start_task_idx = 0
-    
+
     def _reinitialize_dead_prototypes_if_needed(self):
-        if not self.log_cycle_act_rates: return
+        if not self.log_cycle_goodness or not self.last_spl_inputs or not self.log_cycle_act_rates:
+            self.console.print(f"[bold yellow]Reinitialization check: 0 reinitialized at step {self.global_step} (No data).[/bold yellow]")
+            return
 
-        avg_act_rates = []
-        num_spl_layers = len(self.log_cycle_act_rates[0])
-        for i in range(num_spl_layers):
-            layer_rates = [step_rates[i] for step_rates in self.log_cycle_act_rates if i < len(step_rates)]
-            if layer_rates:
-                avg_act_rates.append(sum(layer_rates) / len(layer_rates))
-            else:
-                avg_act_rates.append(0.0)
+        num_spl_modules = len(self.log_cycle_goodness[0])
+        num_layers = self.config.model.num_layers
+        spl_per_layer = num_spl_modules // num_layers
+
+        avg_goodness = [
+            torch.stack([g[i] for g in self.log_cycle_goodness if i < len(g) and g[i].numel() > 0]).mean(0)
+            if any(i < len(g) and g[i].numel() > 0 for g in self.log_cycle_goodness)
+            else torch.empty(0, device=self.device)
+            for i in range(num_spl_modules)
+        ]
+
+        layer_act_rates = [[step_rates[i] for step_rates in self.log_cycle_act_rates] for i in range(num_spl_modules)]
+        avg_act_rates = [sum(rates) / len(rates) if rates else 0.0 for rates in layer_act_rates]
+
+        reinit_count = self._reinitialize_dead_prototypes(avg_goodness, self.last_spl_inputs, avg_act_rates, spl_per_layer)
+        self.console.print(f"[bold yellow]Reinitialization check: {reinit_count} reinitialized at step {self.global_step}.[/bold yellow]")
+        self.log_cycle_goodness.clear()
+        self.log_cycle_act_rates.clear()
+
+    @staticmethod
+    def _find_redundant_mask(module: nn.Module, act_rate: float) -> torch.Tensor:
+        num_experts = module.proto_weight.shape[0]
+        dead_mask = torch.zeros(num_experts, dtype=torch.bool, device=module.proto_weight.device)
+        if num_experts < 2: return dead_mask
+
+        t_max, t_min = 0.999, 0.99
+        threshold = t_max - act_rate * (t_max - t_min)
+        sim_matrix = F.cosine_similarity(module.proto_weight.unsqueeze(1), module.proto_weight.unsqueeze(0), dim=-1)
         
-        reinit_count = self._reinitialize_dead_prototypes(avg_act_rates)
-        if reinit_count > 0:
-            self.console.print(
-                f"[bold yellow]Reinitialized {reinit_count} dead prototypes at step {self.global_step}.[/bold yellow]"
-            )
-        self.log_cycle_act_rates = []
+        visited = torch.zeros(num_experts, dtype=torch.bool, device=dead_mask.device)
+        for i in range(num_experts):
+            if visited[i]: continue
+            
+            similar_indices = torch.where(sim_matrix[i] > threshold)[0]
+            if len(similar_indices) > 1:
+                survivor_idx = similar_indices[torch.randint(0, len(similar_indices), (1,)).item()]
+                for idx in similar_indices:
+                    if idx != survivor_idx: dead_mask[idx] = True
+                    visited[idx] = True
+            else:
+                visited[i] = True
+        return dead_mask
 
-    def _reinitialize_dead_prototypes(self, avg_act_rates: list[float], k: int = 1) -> int:
-        reinitialized_count = 0
-        spl_layer_idx = 0
+    @staticmethod
+    def _respawn_prototypes(module: nn.Module, dead_mask: torch.Tensor, spl_inputs: torch.Tensor) -> int:
+        num_dead = dead_mask.sum().item()
+        if not num_dead: return 0
+
+        proto_weight, mu_weight = module.proto_weight, module.mu_weight
+        spl_input_flat = spl_inputs.reshape(-1, proto_weight.shape[1])
+        if spl_input_flat.shape[0] > 0:
+            indices = torch.randint(0, spl_input_flat.shape[0], (num_dead,))
+            new_protos = spl_input_flat[indices]
+            noise = torch.randn_like(new_protos) * spl_input_flat.std(0) * 0.1
+            proto_weight.data[dead_mask] = (new_protos + noise).to(proto_weight.dtype)
+
+            new_mu = torch.empty_like(mu_weight.data[dead_mask])
+            nn.init.kaiming_uniform_(new_mu, a=math.sqrt(5))
+            mu_weight.data[dead_mask] = new_mu.to(mu_weight.dtype)
+        return num_dead
+
+    def _reinitialize_dead_prototypes(self, avg_goodness: list[torch.Tensor], spl_inputs: list[torch.Tensor], avg_act_rates: list[float], spl_per_layer: int) -> int:
+        reinit_count, spl_idx = 0, 0
         with torch.no_grad():
-            for block in self.model.blocks:
-                for module_name, module in block.named_modules():
-                    if isinstance(module, torch.nn.Module) and hasattr(module, "proto_weight"):
-                        if spl_layer_idx >= len(avg_act_rates): continue
-                        
-                        act_rate = avg_act_rates[spl_layer_idx]
-                        proto_threshold = 0.99 * (1.0 - act_rate) + 0.01 * 0.90
-                        
-                        proto_weight = module.proto_weight
-                        mu_weight = module.mu_weight
-                        num_experts = proto_weight.shape[0]
-                        
-                        proto_sim = F.cosine_similarity(proto_weight.unsqueeze(1), proto_weight.unsqueeze(0), dim=-1)
-                        
-                        dead_mask = torch.zeros(num_experts, dtype=torch.bool, device=self.device)
-                        visited = torch.zeros(num_experts, dtype=torch.bool, device=self.device)
-                        
-                        for i in range(num_experts):
-                            if visited[i]: continue
-                            
-                            similar_indices = torch.where(proto_sim[i] > proto_threshold)[0]
-                            
-                            if len(similar_indices) > k:
-                                survivor_idx = similar_indices[torch.randint(0, len(similar_indices), (1,)).item()]
-                                
-                                for idx in similar_indices:
-                                    if idx != survivor_idx:
-                                        dead_mask[idx] = True
-                                    visited[idx] = True
-                            else:
-                                visited[i] = True
-                        
-                        num_dead = dead_mask.sum().item()
-
-                        if num_dead > 0:
-                            reinitialized_count += num_dead
-                            live_mask = ~dead_mask
-                            
-                            if live_mask.any():
-                                live_protos = proto_weight[live_mask]
-                                center = live_protos.mean(dim=0)
-                                distances = torch.norm(live_protos - center, p=2, dim=-1)
-                                radius = distances.mean() if distances.numel() > 0 else 1.0
-                                
-                                new_protos = center + torch.randn_like(proto_weight[dead_mask]) * radius
-                                proto_weight.data[dead_mask] = new_protos
-
-                                new_mu = torch.empty_like(mu_weight.data[dead_mask])
-                                torch.nn.init.kaiming_uniform_(new_mu, a=math.sqrt(5))
-                                mu_weight.data[dead_mask] = new_mu
-                            else:
-                                torch.nn.init.kaiming_uniform_(proto_weight.data, a=math.sqrt(5))
-                                torch.nn.init.kaiming_uniform_(mu_weight.data, a=math.sqrt(5))
-                        
-                        spl_layer_idx += 1
-
-        return reinitialized_count
+            for module in self.model.modules():
+                if "SparseProtoLinear" in module.__class__.__name__:
+                    if spl_idx < len(spl_inputs) and spl_idx < len(avg_act_rates):
+                        act_rate = avg_act_rates[spl_idx]
+                        dead_mask = self._find_redundant_mask(module, act_rate)
+                        reinit_count += self._respawn_prototypes(module, dead_mask, spl_inputs[spl_idx])
+                    spl_idx += 1
+        return reinit_count
 
     def train(self):
         self._load_checkpoint()
-        data_driven_init(self)
         self.console.print("[bold green]Starting Training...[/bold green]")
         for epoch in range(self.epoch, self.config.num_epochs):
             self.epoch = epoch
@@ -446,47 +369,40 @@ class Trainer:
         self.console.print("[bold green]Training Finished.[/bold green]")
 
     def _save_checkpoint(self, task_idx: int, view_idx: int):
-        state = {
-            "epoch": self.epoch,
-            "step": self.global_step,
-            "task_idx": task_idx,
-            "view_idx": view_idx,
-            "model_state_dict": self.model.state_dict(),
-            "optimizer_state_dict": self.optimizer.state_dict(),
-        }
+        state = {"epoch": self.epoch, "step": self.global_step, "task_idx": task_idx, "view_idx": view_idx,
+                 "model_state_dict": self.model.state_dict(), "optimizer_state_dict": self.optimizer.state_dict()}
         path = self.checkpoint_dir / f"checkpoint_{self.global_step}.pt"
         torch.save(state, path)
         ckpts = sorted(self.checkpoint_dir.glob("*.pt"), key=os.path.getmtime)
-        if len(ckpts) > self.config.max_checkpoints:
-            os.remove(ckpts[0])
+        if len(ckpts) > self.config.max_checkpoints: os.remove(ckpts[0])
 
     def _load_checkpoint(self):
         ckpts = sorted(self.checkpoint_dir.glob("*.pt"), key=os.path.getmtime, reverse=True)
-        if not ckpts:
-            self.console.print("[bold yellow]No checkpoint found.[/bold yellow]")
-            return
+        if not ckpts: self.console.print("[bold yellow]No checkpoint found.[/bold yellow]"); return
         for path in ckpts:
             try:
                 ckpt = torch.load(path, map_location=self.device)
-                self.model.load_state_dict(ckpt["model_state_dict"])
+
+                state_dict = ckpt["model_state_dict"]
+                converted_state_dict = {k.replace('.sbl', '.spl'): v for k, v in state_dict.items()}
+                self.model.load_state_dict(converted_state_dict)
+
                 self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-                self.global_step = ckpt["step"]
-                self.epoch = ckpt["epoch"]
-                self.start_task_idx = ckpt["task_idx"]
-                self.start_view_idx = ckpt["view_idx"]
+                self.global_step, self.epoch, self.start_task_idx, self.start_view_idx = \
+                    ckpt["step"], ckpt["epoch"], ckpt["task_idx"], ckpt["view_idx"]
                 self.console.print(f"[bold green]Loaded checkpoint from {path} at step {self.global_step}.[/bold green]")
                 return
             except Exception as e:
                 self.console.print(f"[bold red]Corrupted checkpoint {path}: {e}. Trying next.[/bold red]")
-                os.remove(path)
         self.console.print("[bold yellow]No valid checkpoint found.[/bold yellow]")
+
 
 
 def main():
     config = TrainConfig()
+    config.generation = GenerationConfig()
     trainer = Trainer(config)
     trainer.train()
-
 
 if __name__ == "__main__":
     main()

@@ -7,12 +7,14 @@ import torch.nn.functional as F
 from .config import ModelConfig
 
 
+@torch.jit.script
 def rotate_half(x: torch.Tensor) -> torch.Tensor:
     x1 = x[..., : x.shape[-1] // 2]
     x2 = x[..., x.shape[-1] // 2 :]
     return torch.cat((-x2, x1), dim=-1)
 
 
+@torch.jit.script
 def apply_rotary_pos_emb(
     q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -26,6 +28,12 @@ def mas_normalize(logits: torch.Tensor) -> torch.Tensor:
     max_abs_val = torch.max(torch.abs(logits), dim=-1, keepdim=True).values
     scaled_logits = logits / (max_abs_val + 1e-9)
     return F.relu(scaled_logits)
+
+
+@torch.jit.script
+def mas_normalize_negative(logits: torch.Tensor) -> torch.Tensor:
+    return -F.relu(-mas_normalize(logits))
+
 
 @torch.jit.script
 def spl_forward(
@@ -106,18 +114,18 @@ class DynamicInfiniteHeadAttention(nn.Module):
     def __init__(self, config: ModelConfig, dtype: torch.dtype = torch.float32):
         super().__init__()
         self.d_model = config.hidden_size
-        self.sbl_q = SparseProtoLinear(self.d_model, self.d_model, dtype=dtype)
-        self.sbl_k = SparseProtoLinear(self.d_model, self.d_model, dtype=dtype)
-        self.sbl_v = SparseProtoLinear(self.d_model, self.d_model, dtype=dtype)
-        self.sbl_o = SparseProtoLinear(self.d_model, self.d_model, dtype=dtype)
+        self.spl_q = SparseProtoLinear(self.d_model, self.d_model, dtype=dtype)
+        self.spl_k = SparseProtoLinear(self.d_model, self.d_model, dtype=dtype)
+        self.spl_v = SparseProtoLinear(self.d_model, self.d_model, dtype=dtype)
+        self.spl_o = SparseProtoLinear(self.d_model, self.d_model, dtype=dtype)
 
 
 class DynamicInfiniteExpert(nn.Module):
     def __init__(self, config: ModelConfig, dtype: torch.dtype = torch.float32):
         super().__init__()
         d_ffn = config.hidden_size * config.d_ffn_factor
-        self.sbl1 = SparseProtoLinear(config.hidden_size, d_ffn, dtype=dtype)
-        self.sbl2 = SparseProtoLinear(d_ffn, config.hidden_size, dtype=dtype)
+        self.spl1 = SparseProtoLinear(config.hidden_size, d_ffn, dtype=dtype)
+        self.spl2 = SparseProtoLinear(d_ffn, config.hidden_size, dtype=dtype)
 
 
 class MoIETransformerBlock(nn.Module):
@@ -134,8 +142,8 @@ class MoIETransformerBlock(nn.Module):
                 "attn_k": nn.Linear(config.hidden_size, config.hidden_size, bias=False, dtype=dtype),
                 "attn_v": nn.Linear(config.hidden_size, config.hidden_size, bias=False, dtype=dtype),
                 "attn_o": nn.Linear(config.hidden_size, config.hidden_size, bias=False, dtype=dtype),
-                "ffn_sbl1": nn.Linear(config.hidden_size, config.hidden_size, bias=False, dtype=dtype),
-                "ffn_sbl2": nn.Linear(d_ffn, d_ffn, bias=False, dtype=dtype),
+                "ffn_spl1": nn.Linear(config.hidden_size, config.hidden_size, bias=False, dtype=dtype),
+                "ffn_spl2": nn.Linear(d_ffn, d_ffn, bias=False, dtype=dtype),
             }
         )
         self.proto_layernorms = nn.ModuleDict(
@@ -144,8 +152,8 @@ class MoIETransformerBlock(nn.Module):
                 "attn_k": nn.LayerNorm(config.hidden_size, eps=1e-5),
                 "attn_v": nn.LayerNorm(config.hidden_size, eps=1e-5),
                 "attn_o": nn.LayerNorm(config.hidden_size, eps=1e-5),
-                "ffn_sbl1": nn.LayerNorm(config.hidden_size, eps=1e-5),
-                "ffn_sbl2": nn.LayerNorm(d_ffn, eps=1e-5),
+                "ffn_spl1": nn.LayerNorm(config.hidden_size, eps=1e-5),
+                "ffn_spl2": nn.LayerNorm(d_ffn, eps=1e-5),
             }
         )
 
@@ -153,15 +161,15 @@ class MoIETransformerBlock(nn.Module):
         self, x: torch.Tensor, pos_emb: tuple, past_kv: tuple | None = None, prev_protos: dict | None = None
     ) -> tuple:
         effective_protos = {}
-        sbl_modules = {
-            "attn_q": self.attn.sbl_q,
-            "attn_k": self.attn.sbl_k,
-            "attn_v": self.attn.sbl_v,
-            "attn_o": self.attn.sbl_o,
-            "ffn_sbl1": self.ffn.sbl1,
-            "ffn_sbl2": self.ffn.sbl2,
+        spl_modules = {
+            "attn_q": self.attn.spl_q,
+            "attn_k": self.attn.spl_k,
+            "attn_v": self.attn.spl_v,
+            "attn_o": self.attn.spl_o,
+            "ffn_spl1": self.ffn.spl1,
+            "ffn_spl2": self.ffn.spl2,
         }
-        for name, module in sbl_modules.items():
+        for name, module in spl_modules.items():
             if prev_protos is not None and name in prev_protos:
                 residual = self.proto_layernorms[name](self.proto_transforms[name](prev_protos[name]))
                 effective_protos[name] = module.proto_weight + residual
@@ -169,34 +177,34 @@ class MoIETransformerBlock(nn.Module):
                 effective_protos[name] = module.proto_weight
 
         ln1_out = self.ln1(x)
-        c_q, mv_q, pc_q = self.attn.sbl_q(ln1_out, effective_protos["attn_q"])
-        c_k, mv_k, pc_k = self.attn.sbl_k(ln1_out, effective_protos["attn_k"])
-        c_v, mv_v, pc_v = self.attn.sbl_v(ln1_out, effective_protos["attn_v"])
+        c_q, mv_q, pc_q = self.attn.spl_q(ln1_out, effective_protos["attn_q"])
+        c_k, mv_k, pc_k = self.attn.spl_k(ln1_out, effective_protos["attn_k"])
+        c_v, mv_v, pc_v = self.attn.spl_v(ln1_out, effective_protos["attn_v"])
 
         ln2_out = self.ln2(x)
-        c1, mv1, pc1 = self.ffn.sbl1(ln2_out, effective_protos["ffn_sbl1"])
+        c1, mv1, pc1 = self.ffn.spl1(ln2_out, effective_protos["ffn_spl1"])
 
         dummy_h_act = torch.zeros(
             ln2_out.shape[0],
             ln2_out.shape[1],
-            self.ffn.sbl2.in_features,
+            self.ffn.spl2.in_features,
             device=x.device,
             dtype=x.dtype,
         )
-        _, _, pc2_pre = self.ffn.sbl2(dummy_h_act, effective_protos["ffn_sbl2"])
+        _, _, pc2_pre = self.ffn.spl2(dummy_h_act, effective_protos["ffn_spl2"])
 
         dummy_attn_out = torch.zeros_like(x)
-        _, _, pc_o_pre = self.attn.sbl_o(dummy_attn_out, effective_protos["attn_o"])
+        _, _, pc_o_pre = self.attn.spl_o(dummy_attn_out, effective_protos["attn_o"])
 
         all_gate_logits = [pc_q, pc_k, pc_v, pc_o_pre, pc1, pc2_pre]
         all_gate_logits_cat = torch.cat([pc.flatten() for pc in all_gate_logits])
         max_cost = torch.max(all_gate_logits_cat).detach().clamp(min=1.0)
 
-        all_masked, all_comp, all_raw, all_routing_logits, all_sbl_inputs = [], [], [], [], []
+        all_masked, all_comp, all_raw, all_routing_logits, all_spl_inputs = [], [], [], [], []
 
         comp_qkv, match_qkv, costs_qkv = [c_q, c_k, c_v], [mv_q, mv_k, mv_v], [pc_q, pc_k, pc_v]
         q, k, v = torch.zeros_like(c_q), torch.zeros_like(c_k), torch.zeros_like(c_v)
-        
+
         for i in range(3):
             cost_score = costs_qkv[i] / max_cost
             routing_logits = match_qkv[i] - cost_score
@@ -218,7 +226,7 @@ class MoIETransformerBlock(nn.Module):
         present_kv = (k, v)
         attn_out = F.scaled_dot_product_attention(q, k, v, is_causal=past_kv is None)
 
-        c_o, mv_o, pc_o = self.attn.sbl_o(attn_out, effective_protos["attn_o"])
+        c_o, mv_o, pc_o = self.attn.spl_o(attn_out, effective_protos["attn_o"])
         cost_score_o = pc_o / max_cost
         routing_logits_o = mv_o - cost_score_o
         rw_o = mas_normalize(routing_logits_o)
@@ -231,7 +239,7 @@ class MoIETransformerBlock(nn.Module):
         m1 = c1 * rw_f1
         h_act = F.relu(m1)
 
-        c2, mv2, pc2 = self.ffn.sbl2(h_act, effective_protos["ffn_sbl2"])
+        c2, mv2, pc2 = self.ffn.spl2(h_act, effective_protos["ffn_spl2"])
         cost_score_f2 = pc2 / max_cost
         routing_logits_f2 = mv2 - cost_score_f2
         rw_f2 = mas_normalize(routing_logits_f2)
@@ -242,9 +250,9 @@ class MoIETransformerBlock(nn.Module):
         all_comp.extend([c_o, c1, c2])
         all_raw.extend([rw_o, rw_f1, rw_f2])
         all_routing_logits.extend([routing_logits_o, routing_logits_f1, routing_logits_f2])
-        all_sbl_inputs.extend([ln1_out] * 3 + [attn_out, ln2_out, h_act])
+        all_spl_inputs.extend([ln1_out] * 3 + [attn_out, ln2_out, h_act])
 
-        return x_out, all_masked, all_comp, all_raw, all_sbl_inputs, all_routing_logits, present_kv, effective_protos
+        return x_out, all_masked, all_comp, all_raw, all_spl_inputs, all_routing_logits, present_kv, effective_protos
 
 
 class ArcTransformer(nn.Module):
@@ -264,7 +272,7 @@ class ArcTransformer(nn.Module):
         pos_emb = self.rotary_emb(x, seq_len=input_ids.size(1))
         past_key_values = past_key_values if past_key_values is not None else [None] * len(self.blocks)
 
-        all_masked, all_comp, all_sbl_in, all_raw, all_protos, all_routing_logits, presents = (
+        all_masked, all_comp, all_spl_in, all_raw, all_protos, all_routing_logits, presents = (
             [],
             [],
             [],
@@ -281,7 +289,7 @@ class ArcTransformer(nn.Module):
                 masked,
                 comp,
                 raw,
-                sbl_inputs,
+                spl_inputs,
                 routing_logits,
                 present_kv,
                 effective_protos,
@@ -289,7 +297,7 @@ class ArcTransformer(nn.Module):
             presents.append(present_kv)
             all_masked.extend(masked)
             all_comp.extend(comp)
-            all_sbl_in.extend(sbl_inputs)
+            all_spl_in.extend(spl_inputs)
             all_raw.extend(raw)
             all_protos.append(effective_protos)
             all_routing_logits.extend(routing_logits)
@@ -298,7 +306,7 @@ class ArcTransformer(nn.Module):
         logits = self.lm_head(x)
 
         if not return_dict:
-            return logits, x, all_masked, all_comp, all_protos, all_sbl_in, all_raw, all_routing_logits, presents
+            return logits, x, all_masked, all_comp, all_protos, all_spl_in, all_raw, all_routing_logits, presents
 
         return {
             "logits": logits,
@@ -306,7 +314,7 @@ class ArcTransformer(nn.Module):
             "masked_outputs": all_masked,
             "computation_outputs": all_comp,
             "proto_states": all_protos,
-            "sbl_inputs": all_sbl_in,
+            "spl_inputs": all_spl_in,
             "raw_weights": all_raw,
             "routing_logits": all_routing_logits,
             "past_key_values": presents,

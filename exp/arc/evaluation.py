@@ -3,10 +3,11 @@ import random
 from typing import Any
 
 import torch
+import torch.nn.functional as F
 from rich.progress import Progress
 from torch.utils.data import DataLoader, Subset
 
-from .config import TrainConfig
+from .config import GenerationConfig, TrainConfig
 from .consistency import ConsistencyTools
 from .data import GridDeserializer, GridSerializer
 from .model import ArcTransformer
@@ -15,13 +16,14 @@ from .observer import Observer
 
 class SimpleEvaluator:
 
-    def __init__(self, model: ArcTransformer, serializer: GridSerializer, deserializer: GridDeserializer, observer: Observer, device: torch.device):
+    def __init__(self, model: ArcTransformer, serializer: GridSerializer, deserializer: GridDeserializer, observer: Observer, device: torch.device, generation_config: GenerationConfig):
         self.model = model
         self.serializer = serializer
         self.deserializer = deserializer
         self.observer = observer
         self.device = device
         self.consistency_tools = ConsistencyTools()
+        self.generation_config = generation_config
 
     @torch.no_grad()
     def evaluate_single(self, mini_task: dict[str, Any]) -> tuple[torch.Tensor, list[int]]:
@@ -29,18 +31,18 @@ class SimpleEvaluator:
         model_dtype = next(self.model.parameters()).dtype
         input_grid = torch.tensor(mini_task['input'], device=self.device, dtype=model_dtype)
         h_in, w_in = input_grid.shape
-        max_new_tokens = int(h_in * w_in * 9) + 50
+        max_new_tokens = self.generation_config.max_new_tokens
 
         task_data_for_serializer = {'test': [mini_task]}
         prompt_ids = self.serializer.serialize_for_inference(task_data_for_serializer)
         prompt_tensor = torch.tensor([prompt_ids], dtype=torch.long, device=self.device)
 
-        generated_tokens = self._greedy_generate(prompt_tensor, max_new_tokens)
+        generated_tokens = self._generate_with_topp(prompt_tensor, max_new_tokens, self.generation_config.top_p)
         pred_grid = self.deserializer.deserialize(generated_tokens)
 
         return pred_grid, generated_tokens
 
-    def _greedy_generate(self, input_ids: torch.Tensor, max_new_tokens: int) -> list[int]:
+    def _generate_with_topp(self, input_ids: torch.Tensor, max_new_tokens: int, top_p: float) -> list[int]:
         tokens = input_ids.clone()
         past_key_values = None
 
@@ -50,9 +52,22 @@ class SimpleEvaluator:
                 outputs = self.model(model_input, past_key_values=past_key_values, return_dict=True)
                 logits = outputs["logits"]
                 past_key_values = outputs["past_key_values"]
-                
+
                 next_token_logits = logits[:, -1, :]
-                next_token = torch.argmax(next_token_logits, dim=-1).unsqueeze(-1)
+
+                sorted_logits, sorted_indices = torch.sort(next_token_logits, descending=True)
+                cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+
+                sorted_indices_to_remove = cumulative_probs > top_p
+                sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+                sorted_indices_to_remove[..., 0] = 0
+
+                indices_to_remove = sorted_indices[sorted_indices_to_remove]
+                next_token_logits[:, indices_to_remove] = -float("Inf")
+
+                probs = F.softmax(next_token_logits, dim=-1)
+                next_token = torch.multinomial(probs, num_samples=1)
+
                 tokens = torch.cat([tokens, next_token], dim=-1)
 
                 if next_token.item() == self.serializer.tokenizer.eos_token_id:
@@ -72,7 +87,7 @@ class EvaluationStep:
         self.observer = observer
         self.device = device
         self.config = config
-        self.evaluator = SimpleEvaluator(self.model, self.serializer, self.deserializer, self.observer, self.device)
+        self.evaluator = SimpleEvaluator(self.model, self.serializer, self.deserializer, self.observer, self.device, self.config.generation)
 
     def _run_eval_loop(self, loader: DataLoader, num_samples: int, title: str, global_step: int) -> tuple[int, int]:
         total_correct, evaluated_count = 0, 0

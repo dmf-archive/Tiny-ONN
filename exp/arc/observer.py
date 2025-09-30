@@ -2,6 +2,7 @@ import os
 from pathlib import Path
 
 import matplotlib
+
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import torch
@@ -43,7 +44,7 @@ class Observer:
             if mask.any()
             else 0.0
         )
-        
+
         identity_transform_rate = 0.0
         if raw_weights:
             token_routing_failed_full = torch.stack([torch.all(rw == 0, dim=-1) for rw in raw_weights]).all(dim=0)
@@ -54,36 +55,30 @@ class Observer:
             if mask.sum() > 0:
                 identity_transform_rate = (true_identity_mask.sum() / mask.sum()).item()
 
-        mu_surp_flat = torch.cat(
-            [s.detach().float().view(-1) for s in signals.get("mu_surprises", []) if s.numel() > 0]
-        )
-        complexity_cost = mu_surp_flat.mean().item() if mu_surp_flat.numel() > 0 else 0.0
+        mu_surp_norms = [torch.norm(s.detach(), p=2).item() for s in signals.get("mu_surprises", []) if s.numel() > 0]
+        proto_surp_norms = [torch.norm(s.detach(), p=2).item() for s in signals.get("proto_surprises", []) if s.numel() > 0]
+
+        all_surp_norms = mu_surp_norms + proto_surp_norms
+        complexity_cost = sum(all_surp_norms) if all_surp_norms else 0.0
         pi_score = torch.exp(-1.0 * main_loss.detach() - 1.0 * complexity_cost).item()
 
-        num_spl, num_layers = 6, self.config.model.num_layers
-        act_rates = (
-            [
-                torch.cat([rw.view(-1) for rw in raw_weights[i * num_spl : (i + 1) * num_spl]])
-                .gt(0)
-                .float()
-                .mean()
-                .item()
-                for i in range(num_layers)
-            ]
-            if raw_weights
-            else [0.0] * num_layers
-        )
+        num_spl_modules = self.config.model.num_layers * 6
+        act_rates = [0.0] * num_spl_modules
+        if raw_weights:
+            act_rates = [rw.gt(0).float().mean().item() for rw in raw_weights]
+
+        num_layers = self.config.model.num_layers
 
         routing_failures = (
             [torch.all(rw == 0, dim=-1).float().mean().item() for rw in raw_weights] if raw_weights else [0.0]
         )
         routing_failure_rate = sum(routing_failures) / len(routing_failures) if routing_failures else 0.0
-        
+
         metrics = {
             "main_loss": main_loss.item(),
             "token_acc": acc,
             "pi_score": pi_score,
-            "route_kl_loss": signals.get("route_kl_loss", torch.tensor(0.0)).item(),
+            "route_jsd_loss": signals.get("route_jsd_loss", torch.tensor(0.0)).item(),
             "sample_entropy": model_outputs.get("sample_entropy", torch.tensor(0.0)).mean().item(),
             "tau": (
                 -torch.sum(F.softmax(active_logits, dim=-1) * F.log_softmax(active_logits, dim=-1), dim=-1)
@@ -94,14 +89,14 @@ class Observer:
             ),
             "seq_len": float(labels.shape[1]),
             "activation_rate_avg": sum(act_rates) / len(act_rates) if act_rates else 0.0,
-            "activation_rate_l0": act_rates[0] if act_rates else 0.0,
-            "activation_rate_l_mid": act_rates[num_layers // 2] if len(act_rates) > num_layers // 2 else 0.0,
-            "activation_rate_ln": act_rates[-1] if act_rates else 0.0,
+            "activation_rate_l0": sum(act_rates[:6]) / 6 if act_rates else 0.0,
+            "activation_rate_l_mid": sum(act_rates[num_layers * 3 : num_layers * 3 + 6]) / 6 if len(act_rates) > num_layers * 3 + 6 else 0.0,
+            "activation_rate_ln": sum(act_rates[-6:]) / 6 if act_rates else 0.0,
             "act_rates": act_rates,
             "routing_failure_rate": routing_failure_rate,
             "identity_transform_rate": identity_transform_rate,
         }
-        
+
         routing_logits = model_outputs.get("routing_logits", [])
         if routing_logits:
             flat_logits = torch.cat([rl.detach().float().view(-1) for rl in routing_logits if rl.numel() > 0])
@@ -128,7 +123,7 @@ class Observer:
             title += f" | View {view_idx}"
 
         table = Table(title=title, show_header=True, header_style="bold magenta", expand=True)
-        table.add_column("Loss (Main/KL)", justify="center")
+        table.add_column("Loss (Main/JSD)", justify="center")
         table.add_column("Acc (Token)", justify="center")
         table.add_column("τ", justify="center")
         table.add_column("H(x)", justify="center")
@@ -147,9 +142,9 @@ class Observer:
             consistency_str = "N/A"
         routing_fail_str = f"{metrics.get('routing_failure_rate', 0.0) * 100:.1f}%"
         identity_str = f"{metrics.get('identity_transform_rate', 0.0) * 100:.1f}%"
-        
+
         table.add_row(
-            f"{metrics.get('main_loss', 0.0):.3f}/{metrics.get('route_kl_loss', 0.0):.4f}",
+            f"{metrics.get('main_loss', 0.0):.3f}/{metrics.get('route_jsd_loss', 0.0):.4f}",
             f"{metrics.get('token_acc', 0.0):.3f}",
             f"{metrics.get('tau', 0.0):.3f}",
             f"{metrics.get('sample_entropy', 0.0):.3f}",
@@ -171,12 +166,10 @@ class Observer:
         if not proto_weights or not raw_weights or not goodness_scores:
             return
 
-        from sklearn.decomposition import PCA
-        import matplotlib.pyplot as plt
 
         num_spl = 6
         num_layers = self.config.model.num_layers
-        
+
         fig, axes = plt.subplots(num_layers, num_spl, figsize=(20, 5 * num_layers), squeeze=False)
         fig.suptitle(f"Prototype Goodness Distribution @ Step {global_step}", fontsize=16)
         color_map = {"good": "green", "bad": "red", "inactive": "grey"}
@@ -186,16 +179,16 @@ class Observer:
             for j in range(num_spl):
                 ax = axes[i, j]
                 idx = i * num_spl + j
-                
+
                 if idx >= len(proto_weights): continue
-                
+
                 protos = proto_weights[idx].cpu().to(torch.float32)
                 rw = raw_weights[idx].cpu().to(torch.float32)
                 goodness = goodness_scores[idx].cpu().to(torch.float32)
-                
+
                 num_activations = (rw > 0).float().sum(dim=(0, 1))
                 avg_goodness = (goodness * (rw > 0).float()).sum(dim=(0, 1)) / (num_activations + 1e-6)
-                
+
                 activated_goodness = avg_goodness[num_activations > 0]
                 threshold = torch.quantile(activated_goodness, 0.5) if activated_goodness.numel() > 0 else 0.0
 
@@ -215,10 +208,10 @@ class Observer:
                     ax.scatter(protos_2d[:, 0], protos_2d[:, 1], c=colors, alpha=0.7, s=10)
                 else:
                     ax.text(0.5, 0.5, "Not enough data", ha='center', va='center')
-                
+
                 ax.set_title(f"L{i} - {names[j]}")
                 ax.grid(True)
-        
+
         plt.tight_layout(rect=[0, 0.03, 1, 0.95])
         save_path = self.vis_dir / f"prototypes_step_{global_step}.png"
         plt.savefig(save_path)
