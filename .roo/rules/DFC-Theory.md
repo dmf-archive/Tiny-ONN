@@ -1,7 +1,6 @@
 # Dynamic Function Composition
 
-`Latest update: 2025-09-29`
-`Latest update: 2025-09-29`
+`Latest update: 2025-10-01`
 
 动态函数合成 (Dynamic Function Composition) 的核心思想是将神经网络的每一层从一个固定的、静态的变换器，升级为一个能够为每个输入动态地、内容感知地"合成"出专用计算函数的微型系统。这一思想的实现经历了从稀疏贝叶斯线性层 (Sparse Bayesian Linear, SBL) 到稀疏原型线性层 (Sparse Proto Linear, SPL) 的关键演进，最终形成了稳定、高效且具备记忆能力的自组织系统。
 
@@ -50,18 +49,26 @@ SBL 的概念诞生于对 Tiny-ONN 核心哲学——整合预测工作空间理
 
 **惊奇感知路由塑造 (Surprise-Aware Routing Shaping, SARS)** 是对早期理论的彻底颠覆和重构。它抛弃了所有启发式规则和分离的损失函数，将动态路由问题重新定义为一个基于信息论的**概率分布对齐问题**。
 
-### 3.1. 核心思想：KL 散度作为统一元学习目标
+### 3.1. 核心思想：双流优化与 JSD 分布对齐
 
-SARS 的核心思想是，路由决策本身就是一个需要优化的概率分布。
+SARS 的最终形态建立在两大基石之上：**严格的优化流分离** 和 **基于 JSD 的分布对齐**。
 
-- **理想专家效用分布 Q(utility|input)**: 我们定义“专家效用”或“**Goodness**”分数为 `Goodness = Importance / (Surprise + ε)`，其中 `Importance` 为输出梯度范数，`Surprise` 为计算梯度范数。所有专家的 `Goodness` 分数构成了理想的目标分布 `Q`。
+1. **双优化器框架 (Dual-Optimizer Framework)**: 为了解决“梯度信号纠缠”问题，我们将优化过程严格分离为两个独立的流程。
+   - **计算流 (Computation Stream)**: 主任务损失 `L_main` 的梯度**仅用于**更新计算参数（`mu_weight`、`embedding` 等）。
+   - **元学习流 (Meta-Learning Stream)**: 从计算流中**无损提取**的未裁剪梯度信号，用于构建元学习目标 `L_meta`。该损失的梯度**仅用于**更新路由参数（`proto_weight`、`gate_param`）。
+     这种架构确保了引导路由的元信号不会反向污染其赖以生成的计算梯度，保证了两个学习过程的正交性。
 
-- **模型路由激活分布 P(activation|input)**: 模型自身通过其 `routing_logits` 产生一个实际的激活分布 `P`。
+2. **JSD 分布对齐 (JSD Distribution Alignment)**: 元学习的核心目标，是让模型自身的路由激活分布 `P` (由 `routing_logits` 导出)，去拟合一个理想的专家效用分布 `Q` (由 `Goodness` 分数定义)。由于 `routing_logits` 和 `Goodness` 都是未归一化的原始分数而非严格的概率分布，我们采用**詹森-香农散度 (Jensen-Shannon Divergence, JSD)** 作为度量。与 KL 散度不同，JSD 是对称的，并且其标准实现能正确处理非归一化输入，是衡量此类分布相似性的更鲁棒的选择。
+   `L_meta_goodness = D_JSD( P || Q )`
 
-- **统一优化目标：最小化 KL 散度**: 学习的唯一元目标，就是让 `P` 逼近 `Q`。
-    `L_meta = D_KL( P || Q )`
+### 3.2. “净效用”模型：对 Goodness 的重构
 
-这个统一的损失函数通过一次反向传播，同时、协同地优化了所有与路由相关的参数，从根本上消除了梯度冲突。
+早期的“比率模型” `Goodness = Importance / (Surprise + ε)` 被证明存在根本缺陷：它通过独立的 `mas_normalize` 操作破坏了 `Importance` 和 `Surprise` 之间的绝对尺度关系，导致了激活率饱和。
+
+取而代之的是“**减法净效用 (Subtractive Net Utility)**”模型：
+`Goodness = F.relu(mas_normalize(Importance) - mas_normalize(Surprise))`
+
+其理论基础是：一个专家只有在其贡献的**潜在收益 (`Importance`)** 显著超过其引发的**系统扰动成本 (`Surprise`)** 时，才被认为是“好的”。这种明确的成本-效益分析，以及通过 `F.relu` 过滤掉负效用专家的做法，为元学习提供了更稳定、更具解释性的目标分布 `Q`。
 
 ### 3.2. 关键机制：最大绝对值缩放 (MAS)
 
@@ -71,9 +78,17 @@ SARS 的核心思想是，路由决策本身就是一个需要优化的概率分
 
 MAS 取代了 `softmax` 和 `sigmoid`，其优势在于**无信息失真**、**自适应无参数**和**有界输出**。
 
-### 3.3. 稳定性机制：协同 Adam 的动态抑制
+### 3.3. 稳定性机制：时间平滑正则化
 
-经典的 AWD (自适应权重衰减) 虽被移除，但其精神——保护核心知识、惩罚不稳定参数——通过一种更直接的机制得以保留和演进。我们不再间接地添加 L2 惩罚，而是直接修改 Adam 优化器的二阶矩估计 (`exp_avg_sq`)。对于那些梯度范数超过动态阈值、被判定为“不稳定”的 `μ` 权重，我们将其 `exp_avg_sq` 直接设置为全局最大值。这等同于在该学习步骤中极大地减小其有效学习率，从而实现了对核心知识的动态保护和对剧烈更新的精确抑制。
+“净效用”模型虽然解决了饱和问题，但引入了新的不稳定性——“**马太效应驱动的路由漂变**”。激活的专家更容易在未来被再次激活，形成正反馈，最终导致路由策略僵化。
+
+为了解决这个问题，我们引入了**时间平滑正则化 (Temporal Smoothing Regularization)**：
+`L_meta_stability = D_JSD(P(t) || P(t-1).detach())`
+
+该损失项惩罚当前时间步 `t` 的路由分布 `P(t)` 与上一步 `t-1` 的路由分布 `P(t-1)` 之间的剧烈变化。它为路由策略的演变引入了“惯性”，鼓励平滑、渐进的调整，而非剧烈振荡。这有效抑制了正反馈循环，保护了系统的探索能力和长期的动态稳定性。
+
+最终的元学习目标是上述两个 JSD 损失的加权和：
+`L_meta_total = w_jsd * L_meta_goodness + w_temporal * L_meta_stability`
 
 ---
 

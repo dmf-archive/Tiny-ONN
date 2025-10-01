@@ -82,3 +82,4 @@ exclude = ["ref", "exp", ".venv"]
 
 [tool.ruff.lint]
 select = ["W", "F", "I", "UP", "B", "NPY", "SIM", "ISC", "TID"]
+ignore = ["B905"]
