@@ -212,7 +212,7 @@ class Observer:
                 ax.set_title(f"L{i} - {names[j]}")
                 ax.grid(True)
 
-        plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+        plt.tight_layout(rect=(0, 0.03, 1, 0.95))
         save_path = self.vis_dir / f"prototypes_step_{global_step}.png"
         plt.savefig(save_path)
         plt.close(fig)
@@ -252,7 +252,7 @@ class Observer:
         h, w = grid.shape
         for r in range(h):
             for p in range(w):
-                pixel = grid[r, p].item()
+                pixel = int(grid[r, p].item())
                 color = self.ARC_COLORS[pixel] if 0 <= pixel < len(self.ARC_COLORS) else "white"
                 text.append("■ ", style=color)
             if r < h - 1:

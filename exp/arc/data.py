@@ -13,31 +13,38 @@ class GridSerializer:
     def __init__(self, tokenizer: ArcColorTokenizer):
         self.tokenizer = tokenizer
 
-    def _serialize_grid(self, grid: list[list[int]]) -> list[int]:
+    def _serialize_grid(self, grid: list[list[int]]) -> tuple[list[int], list[tuple[int, int]]]:
         tokens = []
+        coords = []
         for r, row in enumerate(grid):
             if r > 0:
                 tokens.append(self.tokenizer.row_sep_token_id)
-            for color in row:
+                coords.append((-1, -1))
+            for c, color in enumerate(row):
                 tokens.append(self.tokenizer.color_to_token_id(color))
-        return tokens
+                coords.append((r, c))
+        return tokens, coords
 
-    def serialize_mini_task(self, mini_task: dict[str, Any]) -> tuple[list[int], list[int]]:
-        input_grid_ids = self._serialize_grid(mini_task['input'])
-        output_grid_ids = self._serialize_grid(mini_task['output'])
+    def serialize_mini_task(self, mini_task: dict[str, Any]) -> tuple[list[int], list[int], list[tuple[int, int]]]:
+        input_grid_ids, input_coords = self._serialize_grid(mini_task["input"])
+        output_grid_ids, output_coords = self._serialize_grid(mini_task["output"])
 
         prompt_part1 = [self.tokenizer.bos_token_id, self.tokenizer.vocab["problem"]] + input_grid_ids
+        prompt_coords1 = [(-1, -1), (-1, -1)] + input_coords
+
         prompt_part2 = [self.tokenizer.vocab["solution"]]
+        prompt_coords2 = [(-1, -1)]
 
         full_ids = prompt_part1 + prompt_part2 + output_grid_ids + [self.tokenizer.eos_token_id]
+        full_coords = prompt_coords1 + prompt_coords2 + output_coords + [(-1, -1)]
 
         prompt_len = len(prompt_part1) + len(prompt_part2)
         labels = [-100] * prompt_len + output_grid_ids + [self.tokenizer.eos_token_id]
 
-        return full_ids, labels
+        return full_ids, labels, full_coords
 
     def serialize_for_inference(self, task_data: dict[str, Any]) -> list[int]:
-        test_input_grid_ids = self._serialize_grid(task_data['test'][0]['input'])
+        test_input_grid_ids, _ = self._serialize_grid(task_data['test'][0]['input'])
         prompt_ids = [self.tokenizer.bos_token_id, self.tokenizer.vocab["problem"]] + test_input_grid_ids + [self.tokenizer.vocab["solution"]]
         return prompt_ids
 
@@ -70,7 +77,7 @@ class InMemoryArcDataset(Dataset):
 
         tasks_with_lengths = []
         for mini_task in self.mini_tasks:
-            input_ids, _ = serializer_for_sorting.serialize_mini_task(mini_task)
+            input_ids, _, _ = serializer_for_sorting.serialize_mini_task(mini_task)
             tasks_with_lengths.append((mini_task, len(input_ids)))
 
         sorted_tasks = sorted(tasks_with_lengths, key=lambda x: x[1])
@@ -100,10 +107,10 @@ class ArcCollator:
         return -torch.sum(probs * torch.log2(probs)).item()
 
     def __call__(self, batch: list[dict[str, Any]]) -> dict[str, Any]:
-        all_input_ids, all_labels, all_entropies = [], [], []
+        all_input_ids, all_labels, all_coords, all_entropies = [], [], [], []
 
         for mini_task in batch:
-            input_ids, labels = self.serializer.serialize_mini_task(mini_task)
+            input_ids, labels, coords = self.serializer.serialize_mini_task(mini_task)
 
             if len(input_ids) > self.max_len:
                 continue
@@ -112,18 +119,21 @@ class ArcCollator:
             all_entropies.append(entropy)
             all_input_ids.append(torch.tensor(input_ids, dtype=torch.long))
             all_labels.append(torch.tensor(labels, dtype=torch.long))
+            all_coords.append(torch.tensor(coords, dtype=torch.long))
 
         if not all_input_ids:
             return {}
 
         padded_input_ids = pad_sequence(all_input_ids, batch_first=True, padding_value=self.tokenizer.pad_token_id)
         padded_labels = pad_sequence(all_labels, batch_first=True, padding_value=-100)
+        padded_coords = pad_sequence(all_coords, batch_first=True, padding_value=-1)
 
         return {
             "input_ids": padded_input_ids,
             "labels": padded_labels,
+            "coords": padded_coords,
             "task_data": batch,
-            "sample_entropy": torch.tensor(all_entropies, dtype=torch.float32)
+            "sample_entropy": torch.tensor(all_entropies, dtype=torch.float32),
         }
 
 class GridDeserializer:
@@ -132,7 +142,7 @@ class GridDeserializer:
 
     def deserialize(self, tokens: list[int]) -> torch.Tensor:
         grid_rows = []
-        current_row = []
+        current_row: list[int] = []
 
         for token_id in tokens:
             if token_id == self.tokenizer.row_sep_token_id:

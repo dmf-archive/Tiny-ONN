@@ -255,20 +255,43 @@ class MoIETransformerBlock(nn.Module):
         return x_out, all_masked, all_comp, all_raw, all_spl_inputs, all_routing_logits, present_kv, effective_protos
 
 
+class ArcEmbedding(nn.Module):
+    def __init__(self, config: ModelConfig, dtype: torch.dtype = torch.float32):
+        super().__init__()
+        self.color_embedding = nn.Embedding(config.vocab_size, config.hidden_size, dtype=dtype)
+        self.row_embedding = nn.Embedding(31, config.hidden_size, dtype=dtype)
+        self.col_embedding = nn.Embedding(31, config.hidden_size, dtype=dtype)
+
+    def forward(self, input_ids: torch.Tensor, coords: torch.Tensor) -> torch.Tensor:
+        color_embed = self.color_embedding(input_ids)
+        
+        row_coords = coords[..., 0]
+        col_coords = coords[..., 1]
+
+        row_embed = self.row_embedding(row_coords.clamp(min=0))
+        col_embed = self.col_embedding(col_coords.clamp(min=0))
+        
+        is_special_token = (coords[..., 0] == -1).unsqueeze(-1)
+        
+        pos_embed = row_embed + col_embed
+        final_embed = color_embed + torch.where(is_special_token, torch.zeros_like(pos_embed), pos_embed)
+        
+        return final_embed
+
 class ArcTransformer(nn.Module):
     def __init__(self, config: ModelConfig, device: torch.device | str):
         super().__init__()
         self.config, self.device = config, device
         dtype = torch.bfloat16
-        self.embedding = nn.Embedding(config.vocab_size, config.hidden_size, dtype=dtype)
+        self.embedding = ArcEmbedding(config, dtype=dtype)
         self.rotary_emb = RotaryEmbedding(
             dim=config.hidden_size, max_position_embeddings=config.max_position_embeddings, device=device, dtype=dtype
         )
         self.blocks = nn.ModuleList([MoIETransformerBlock(config, dtype=dtype) for _ in range(config.num_layers)])
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False, dtype=dtype)
 
-    def forward(self, input_ids: torch.Tensor, past_key_values: list | None = None, return_dict: bool = False):
-        x = self.embedding(input_ids)
+    def forward(self, input_ids: torch.Tensor, coords: torch.Tensor, past_key_values: list | None = None, return_dict: bool = False):
+        x = self.embedding(input_ids, coords)
         pos_emb = self.rotary_emb(x, seq_len=input_ids.size(1))
         past_key_values = past_key_values if past_key_values is not None else [None] * len(self.blocks)
 

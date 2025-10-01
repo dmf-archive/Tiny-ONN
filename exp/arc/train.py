@@ -172,7 +172,7 @@ class Trainer:
         self.log_cycle_goodness: list[list[torch.Tensor]] = []
         self.log_cycle_act_rates: list[list[float]] = []
         self.last_spl_inputs: list[torch.Tensor] = []
-        self.replay_queue = collections.deque(maxlen=100)
+        self.replay_queue: collections.deque = collections.deque(maxlen=100)
         self.new_sample_counter = 0
         self.last_routing_logits: list[torch.Tensor] | None = None
 
@@ -231,13 +231,14 @@ class Trainer:
         output_grid = torch.tensor(mini_task["output"], device=device)
         transform = consistency_tools.get_transforms()[view_idx]
         augmented = {"input": transform(input_grid).cpu().tolist(), "output": transform(output_grid).cpu().tolist()}
-        ids, labels = serializer.serialize_mini_task(augmented)
+        ids, labels, coords = serializer.serialize_mini_task(augmented)
         if len(ids) > max_len:
             return None
 
         return {
             "input_ids": torch.tensor([ids], dtype=torch.long, device=device),
             "labels": torch.tensor([labels], dtype=torch.long, device=device),
+            "coords": torch.tensor([coords], dtype=torch.long, device=device),
             "sample_entropy": torch.tensor(
                 [ArcCollator._calculate_sample_entropy(labels)], dtype=torch.float32, device=device
             ),
@@ -260,7 +261,7 @@ class Trainer:
 
         self.model.train()
         with torch.autocast(device_type=self.config.device, dtype=torch.bfloat16):
-            model_outputs = self.model(batch["input_ids"], return_dict=True)
+            model_outputs = self.model(batch["input_ids"], coords=batch["coords"], return_dict=True)
             main_loss = F.cross_entropy(
                 model_outputs["logits"][:, :-1, :].contiguous().view(-1, self.config.model.vocab_size),
                 batch["labels"][:, 1:].contiguous().view(-1),
@@ -286,7 +287,7 @@ class Trainer:
         self.observer.maybe_log_and_visualize(
             epoch,
             self.global_step,
-            task_idx,
+            task_idx if isinstance(task_idx, int) else -1,
             view_idx,
             metrics,
             time.time() - start_time,
