@@ -79,6 +79,7 @@ class Observer:
             "token_acc": acc,
             "pi_score": pi_score,
             "route_jsd_loss": signals.get("route_jsd_loss", torch.tensor(0.0)).item(),
+            "carc_loss": signals.get("carc_loss", torch.tensor(0.0)).item(),
             "sample_entropy": model_outputs.get("sample_entropy", torch.tensor(0.0)).mean().item(),
             "tau": (
                 -torch.sum(F.softmax(active_logits, dim=-1) * F.log_softmax(active_logits, dim=-1), dim=-1)
@@ -123,7 +124,7 @@ class Observer:
             title += f" | View {view_idx}"
 
         table = Table(title=title, show_header=True, header_style="bold magenta", expand=True)
-        table.add_column("Loss (Main/JSD)", justify="center")
+        table.add_column("Loss (Main/JSD/CARC)", justify="center")
         table.add_column("Acc (Token)", justify="center")
         table.add_column("τ", justify="center")
         table.add_column("H(x)", justify="center")
@@ -132,19 +133,19 @@ class Observer:
         table.add_column("Act % (Avg)", justify="center")
         table.add_column("Gate Logit (Top10/Avg/Max)", justify="center")
         table.add_column("Routing Fail % (True ID %)", justify="center")
-        table.add_column("Consist (Cos/Euc)", justify="center")
+        table.add_column("Consist (SimP/SimX)", justify="center")
         table.add_column("Speed (st/s)", justify="center")
 
         act_avg = metrics.get("activation_rate_avg", 0.0) * 100
         if consistency:
-            consistency_str = f"{consistency.get('cos_sim', 0.0):.3f}/{consistency.get('euc_dist', 0.0):.3f}"
+            consistency_str = f"{consistency.get('sim_p', 0.0):.3f}/{consistency.get('sim_x', 0.0):.3f}"
         else:
             consistency_str = "N/A"
         routing_fail_str = f"{metrics.get('routing_failure_rate', 0.0) * 100:.1f}%"
         identity_str = f"{metrics.get('identity_transform_rate', 0.0) * 100:.1f}%"
 
         table.add_row(
-            f"{metrics.get('main_loss', 0.0):.3f}/{metrics.get('route_jsd_loss', 0.0):.4f}",
+            f"{metrics.get('main_loss', 0.0):.3f}/{metrics.get('route_jsd_loss', 0.0):.4f}/{metrics.get('carc_loss', 0.0):.4f}",
             f"{metrics.get('token_acc', 0.0):.3f}",
             f"{metrics.get('tau', 0.0):.3f}",
             f"{metrics.get('sample_entropy', 0.0):.3f}",

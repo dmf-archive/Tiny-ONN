@@ -72,6 +72,7 @@ class LearningDynamics:
         model_outputs: dict,
         device: torch.device,
         last_routing_logits: list[torch.Tensor] | None,
+        last_spl_inputs: list[torch.Tensor] | None,
     ) -> dict[str, Any]:
         self.optimizer_comp.zero_grad()
         self.optimizer_route.zero_grad()
@@ -113,23 +114,29 @@ class LearningDynamics:
 
         total_meta_loss = self.config.w_route_jsd * avg_route_jsd_loss
 
-        temporal_jsd_losses = []
-        if last_routing_logits is not None:
-            for current_logit, last_logit in zip(model_outputs["routing_logits"], last_routing_logits):
+        carc_losses = []
+        if last_routing_logits is not None and last_spl_inputs is not None:
+            for curr_l, last_l, curr_in, last_in in zip(
+                model_outputs["routing_logits"], last_routing_logits, clean_spl_inputs, last_spl_inputs
+            ):
                 if not (
-                    current_logit is not None
-                    and last_logit is not None
-                    and current_logit.numel() > 0
-                    and last_logit.numel() > 0
-                    and current_logit.shape == last_logit.shape
+                    curr_l is not None
+                    and last_l is not None
+                    and curr_in is not None
+                    and last_in is not None
+                    and curr_l.shape == last_l.shape
+                    and curr_in.shape == last_in.shape
                 ):
                     continue
-                temporal_jsd_losses.append(self._calculate_jsd_loss(current_logit, last_logit.detach()))
 
-        avg_temporal_jsd_loss = torch.tensor(0.0, device=device)
-        if temporal_jsd_losses:
-            avg_temporal_jsd_loss = torch.stack(temporal_jsd_losses).mean()
-            total_meta_loss += self.config.w_temporal_jsd * avg_temporal_jsd_loss
+                sim_p = F.cosine_similarity(curr_l.mean(dim=1), last_l.mean(dim=1), dim=-1).mean()
+                sim_x = F.cosine_similarity(curr_in.mean(dim=1), last_in.mean(dim=1), dim=-1).mean()
+                carc_losses.append(torch.abs(sim_p - sim_x.detach()))
+
+        avg_carc_loss = torch.tensor(0.0, device=device)
+        if carc_losses:
+            avg_carc_loss = torch.stack(carc_losses).mean()
+            total_meta_loss += self.config.w_carc * avg_carc_loss
 
         if total_meta_loss > 0:
             meta_grads = torch.autograd.grad(total_meta_loss, self.routing_params, allow_unused=True)
@@ -145,7 +152,7 @@ class LearningDynamics:
 
         return {
             "route_jsd_loss": avg_route_jsd_loss,
-            "temporal_jsd_loss": avg_temporal_jsd_loss,
+            "carc_loss": avg_carc_loss,
             "mu_surprises": [torch.norm(g, p=2, dim=(0, 1, 3)) for g in mu_grads_unclipped],
             "goodness_scores": all_goodness,
             "proto_weights": [p.detach() for name, p in self.routing_params_with_names if "proto_weight" in name],
@@ -171,7 +178,7 @@ class Trainer:
         self.global_step, self.epoch, self.start_task_idx, self.start_view_idx = 0, 0, 0, 0
         self.log_cycle_goodness: list[list[torch.Tensor]] = []
         self.log_cycle_act_rates: list[list[float]] = []
-        self.last_spl_inputs: list[torch.Tensor] = []
+        self.last_spl_inputs: list[torch.Tensor] | None = None
         self.replay_queue: collections.deque = collections.deque(maxlen=100)
         self.new_sample_counter = 0
         self.last_routing_logits: list[torch.Tensor] | None = None
@@ -273,14 +280,17 @@ class Trainer:
             return None
 
         signals = self.dynamics.compute_and_apply_gradients(
-            main_loss, model_outputs, self.device, self.last_routing_logits
+            main_loss, model_outputs, self.device, self.last_routing_logits, self.last_spl_inputs
         )
         model_outputs.update({"labels": batch["labels"], "sample_entropy": batch["sample_entropy"]})
         metrics = self.observer.calculate_metrics(main_loss, model_outputs, signals, batch["input_ids"], self.model)
 
         self._update_cycle_metrics(metrics, signals, model_outputs)
         consistency_metrics = self._calculate_consistency_metrics(
-            model_outputs.get("routing_logits"), last_view_routing_logits
+            model_outputs.get("routing_logits"),
+            last_view_routing_logits,
+            model_outputs.get("spl_inputs"),
+            self.last_spl_inputs,
         )
 
         signals["raw_weights"] = model_outputs.get("raw_weights")
@@ -304,32 +314,40 @@ class Trainer:
         routing_logits = model_outputs.get("routing_logits")
         if routing_logits:
             self.last_routing_logits = [r.detach() for r in routing_logits if r is not None]
+        spl_inputs = model_outputs.get("spl_inputs")
+        if spl_inputs:
+            self.last_spl_inputs = [s.detach() for s in spl_inputs if s is not None]
         torch.cuda.empty_cache()
         return metrics, model_outputs.get("raw_weights"), routing_logits, signals
 
     def _update_cycle_metrics(self, metrics: dict, signals: dict, model_outputs: dict):
         if "goodness_scores" in signals and signals["goodness_scores"]:
             self.log_cycle_goodness.append(signals["goodness_scores"])
-        if "spl_inputs" in model_outputs and model_outputs["spl_inputs"]:
-            self.last_spl_inputs = [x.detach() for x in model_outputs["spl_inputs"] if x is not None]
         if "act_rates" in metrics:
             self.log_cycle_act_rates.append(metrics["act_rates"])
 
-    def _calculate_consistency_metrics(self, current_logits: list | None, prev_logits: list | None) -> dict | None:
-        if not current_logits or not prev_logits:
+    def _calculate_consistency_metrics(
+        self,
+        current_logits: list | None,
+        prev_logits: list | None,
+        current_inputs: list | None,
+        prev_inputs: list | None,
+    ) -> dict | None:
+        if not all([current_logits, prev_logits, current_inputs, prev_inputs]):
             return None
 
-        cos_sims, euc_dists = [], []
-        for curr, prev in zip(current_logits, prev_logits):
-            if curr.numel() > 0 and prev.numel() > 0 and curr.shape == prev.shape:
-                curr_mean = mas_normalize(curr).mean(dim=1).squeeze(0)
-                prev_mean = mas_normalize(prev).mean(dim=1).squeeze(0)
-                cos_sims.append(F.cosine_similarity(curr_mean, prev_mean, dim=0))
-                euc_dists.append(torch.cdist(curr_mean.unsqueeze(0).float(), prev_mean.unsqueeze(0).float()))
+        sim_ps, sim_xs = [], []
+        for curr_l, prev_l, curr_in, prev_in in zip(
+            current_logits, prev_logits, current_inputs, prev_inputs  # type: ignore[arg-type]
+        ):
+            if curr_l is not None and prev_l is not None and curr_l.shape == prev_l.shape:
+                sim_ps.append(F.cosine_similarity(curr_l.mean(dim=1), prev_l.mean(dim=1), dim=-1).mean())
+            if curr_in is not None and prev_in is not None and curr_in.shape == prev_in.shape:
+                sim_xs.append(F.cosine_similarity(curr_in.mean(dim=1), prev_in.mean(dim=1), dim=-1).mean())
 
-        if not cos_sims:
+        if not sim_ps or not sim_xs:
             return None
-        return {"cos_sim": torch.stack(cos_sims).mean().item(), "euc_dist": torch.stack(euc_dists).mean().item()}
+        return {"sim_p": torch.stack(sim_ps).mean().item(), "sim_x": torch.stack(sim_xs).mean().item()}
 
     def _train_epoch(self, epoch: int):
         dataset = self.train_loader.dataset

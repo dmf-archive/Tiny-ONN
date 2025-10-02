@@ -27,50 +27,59 @@ class SimpleEvaluator:
 
     @torch.no_grad()
     def evaluate_single(self, mini_task: dict[str, Any]) -> tuple[torch.Tensor, list[int]]:
-        # Ensure input data is converted to the model's dtype (bfloat16)
         model_dtype = next(self.model.parameters()).dtype
-        input_grid = torch.tensor(mini_task['input'], device=self.device, dtype=model_dtype)
-        h_in, w_in = input_grid.shape
+        input_grid = torch.tensor(mini_task["input"], device=self.device, dtype=model_dtype)
         max_new_tokens = self.generation_config.max_new_tokens
 
-        task_data_for_serializer = {'test': [mini_task]}
-        prompt_ids = self.serializer.serialize_for_inference(task_data_for_serializer)
+        task_data_for_serializer = {"test": [mini_task]}
+        prompt_ids, prompt_coords = self.serializer.serialize_for_inference(task_data_for_serializer)
         prompt_tensor = torch.tensor([prompt_ids], dtype=torch.long, device=self.device)
+        prompt_coords_tensor = torch.tensor([prompt_coords], dtype=torch.long, device=self.device)
 
-        generated_tokens = self._generate_with_topp(prompt_tensor, max_new_tokens, self.generation_config.top_p)
+        generated_tokens = self._generate_greedy(prompt_tensor, prompt_coords_tensor, max_new_tokens)
         pred_grid = self.deserializer.deserialize(generated_tokens)
 
         return pred_grid, generated_tokens
 
-    def _generate_with_topp(self, input_ids: torch.Tensor, max_new_tokens: int, top_p: float) -> list[int]:
+    def _generate_greedy(self, input_ids: torch.Tensor, input_coords: torch.Tensor, max_new_tokens: int) -> list[int]:
         tokens = input_ids.clone()
+        coords = input_coords.clone()
         past_key_values = None
+
+        last_r, last_c = -1, -1
+        for r_val, c_val in reversed(input_coords.tolist()[0]):
+            if r_val != -1:
+                last_r, last_c = r_val, c_val
+                break
+        current_r, current_c = (last_r, last_c) if last_r != -1 else (0, 0)
 
         with torch.autocast(device_type=self.device.type, dtype=torch.bfloat16):
             for _ in range(max_new_tokens):
                 model_input = tokens if past_key_values is None else tokens[:, -1:]
-                outputs = self.model(model_input, past_key_values=past_key_values, return_dict=True)
+                coords_input = coords if past_key_values is None else coords[:, -1:]
+                outputs = self.model(model_input, coords=coords_input, past_key_values=past_key_values, return_dict=True)
                 logits = outputs["logits"]
                 past_key_values = outputs["past_key_values"]
 
                 next_token_logits = logits[:, -1, :]
-
-                sorted_logits, sorted_indices = torch.sort(next_token_logits, descending=True)
-                cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
-
-                sorted_indices_to_remove = cumulative_probs > top_p
-                sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
-                sorted_indices_to_remove[..., 0] = 0
-
-                indices_to_remove = sorted_indices[sorted_indices_to_remove]
-                next_token_logits[:, indices_to_remove] = -float("Inf")
-
-                probs = F.softmax(next_token_logits, dim=-1)
-                next_token = torch.multinomial(probs, num_samples=1)
-
+                next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True)
                 tokens = torch.cat([tokens, next_token], dim=-1)
 
-                if next_token.item() == self.serializer.tokenizer.eos_token_id:
+                next_token_item = next_token.item()
+                if self.serializer.tokenizer.token_id_to_color(next_token_item) is not None:
+                    current_c += 1
+                    next_coord_tuple = (current_r, current_c)
+                elif next_token_item == self.serializer.tokenizer.row_sep_token_id:
+                    current_r += 1
+                    current_c = 0
+                    next_coord_tuple = (current_r, current_c)
+                else:
+                    next_coord_tuple = (-1, -1)
+
+                next_coord = torch.tensor([[next_coord_tuple]], dtype=torch.long, device=self.device)
+                coords = torch.cat([coords, next_coord], dim=1)
+
+                if next_token_item == self.serializer.tokenizer.eos_token_id:
                     break
 
         prompt_len = input_ids.shape[1]

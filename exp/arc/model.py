@@ -268,8 +268,8 @@ class ArcEmbedding(nn.Module):
         row_coords = coords[..., 0]
         col_coords = coords[..., 1]
 
-        row_embed = self.row_embedding(row_coords.clamp(min=0))
-        col_embed = self.col_embedding(col_coords.clamp(min=0))
+        row_embed = self.row_embedding(row_coords.clamp(min=0, max=30))
+        col_embed = self.col_embedding(col_coords.clamp(min=0, max=30))
         
         is_special_token = (coords[..., 0] == -1).unsqueeze(-1)
         
@@ -283,7 +283,7 @@ class ArcTransformer(nn.Module):
         super().__init__()
         self.config, self.device = config, device
         dtype = torch.bfloat16
-        self.embedding = ArcEmbedding(config, dtype=dtype)
+        self.embedding = torch.jit.script(ArcEmbedding(config, dtype=dtype))
         self.rotary_emb = RotaryEmbedding(
             dim=config.hidden_size, max_position_embeddings=config.max_position_embeddings, device=device, dtype=dtype
         )

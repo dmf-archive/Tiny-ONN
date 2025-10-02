@@ -43,10 +43,11 @@ class GridSerializer:
 
         return full_ids, labels, full_coords
 
-    def serialize_for_inference(self, task_data: dict[str, Any]) -> list[int]:
-        test_input_grid_ids, _ = self._serialize_grid(task_data['test'][0]['input'])
+    def serialize_for_inference(self, task_data: dict[str, Any]) -> tuple[list[int], list[tuple[int, int]]]:
+        test_input_grid_ids, test_input_coords = self._serialize_grid(task_data["test"][0]["input"])
         prompt_ids = [self.tokenizer.bos_token_id, self.tokenizer.vocab["problem"]] + test_input_grid_ids + [self.tokenizer.vocab["solution"]]
-        return prompt_ids
+        prompt_coords = [(-1, -1), (-1, -1)] + test_input_coords + [(-1, -1)]
+        return prompt_ids, prompt_coords
 
 class InMemoryArcDataset(Dataset):
     def __init__(self, data_path: str, split: str = "training"):
