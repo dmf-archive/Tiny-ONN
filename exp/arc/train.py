@@ -32,27 +32,23 @@ def _jsd_from_distributions(p_dist_unnorm: torch.Tensor, q_dist_unnorm: torch.Te
     return (0.5 * kl_p_m + 0.5 * kl_q_m).mean()
 
 
-def _get_task_representation(tensors: list[torch.Tensor], n_components: int = 16) -> torch.Tensor | None:
+def _get_task_representation(tensors: list[torch.Tensor]) -> torch.Tensor | None:
     if not tensors or any(t.ndim != 3 for t in tensors) or tensors[0].shape[0] > 1:
         return None
 
-    device, dtype = tensors[0].device, tensors[0].dtype
-    matrix_for_pca = torch.cat(tensors, dim=2).squeeze(0)
+    matrix = torch.cat(tensors, dim=2).squeeze(0).float()
 
-    if matrix_for_pca.shape[0] < n_components or matrix_for_pca.shape[1] < n_components:
-        return torch.zeros(n_components, device=device, dtype=dtype)
+    if matrix.numel() == 0:
+        return None
 
-    try:
-        matrix_float = matrix_for_pca.float()
-        q = min(n_components * 2, min(matrix_float.shape) -1)
-        if q < n_components:
-            return torch.zeros(n_components, device=device, dtype=dtype)
+    if matrix.shape[0] < 2:
+        mean_vec = matrix.mean(dim=0)
+        std_vec = torch.zeros_like(mean_vec)
+    else:
+        mean_vec = matrix.mean(dim=0)
+        std_vec = matrix.std(dim=0, unbiased=False)
 
-        _, _, V = torch.pca_lowrank(matrix_float, q=q, center=True)
-        projected = torch.matmul(matrix_float, V[:, :n_components])
-        return projected.mean(dim=0)
-    except (torch.linalg.LinAlgError, IndexError):
-        return torch.zeros(n_components, device=device, dtype=dtype)
+    return torch.cat([mean_vec, std_vec], dim=0)
 
 
 class LearningDynamics:
@@ -80,10 +76,20 @@ class LearningDynamics:
 
     @staticmethod
     @torch.jit.script
-    def _calculate_mu_grads(
+    def _calculate_mu_surprise_norms(
         computation_output_grads: list[torch.Tensor], spl_inputs: list[torch.Tensor]
     ) -> list[torch.Tensor]:
-        return [torch.einsum("bsd,bsh->bsdh", grad_act, spl_in) for grad_act, spl_in in zip(computation_output_grads, spl_inputs)]
+        mu_surprise_norms = []
+        for grad_act, spl_in in zip(computation_output_grads, spl_inputs):
+            grad_act_sq = torch.sum(grad_act**2, dim=(0, 1))
+            spl_in_sq = torch.sum(spl_in**2, dim=(0, 1))
+            
+            term1 = (spl_in_sq * grad_act_sq.sum()).sqrt()
+            term2 = (grad_act_sq * spl_in_sq.sum()).sqrt()
+            
+            norm = (term1 + term2) / 2.0
+            mu_surprise_norms.append(norm)
+        return mu_surprise_norms
 
     def compute_and_apply_gradients(
         self, main_loss: torch.Tensor, model_outputs: dict, device: torch.device, last_routing_logits: list[torch.Tensor] | None, last_spl_inputs: list[torch.Tensor] | None
@@ -104,12 +110,12 @@ class LearningDynamics:
                     param.grad = grad.clone()
 
         valid_intermediate_grads = [g for g in intermediate_grads if g is not None]
-        mu_grads_unclipped = self._calculate_mu_grads(valid_intermediate_grads, clean_spl_inputs)
+        mu_surprise_norms = self._calculate_mu_surprise_norms(valid_intermediate_grads, clean_spl_inputs)
         
         with torch.no_grad():
             all_goodness = [
-                F.relu(mas_normalize(torch.norm(output_grad, p=2, dim=(0, 1))) - mas_normalize(torch.norm(mu_grad, p=2, dim=(0, 1, 3))))
-                for mu_grad, output_grad in zip(mu_grads_unclipped, valid_intermediate_grads)
+                F.relu(mas_normalize(torch.norm(output_grad, p=2, dim=(0, 1))) - mas_normalize(mu_surprise))
+                for mu_surprise, output_grad in zip(mu_surprise_norms, valid_intermediate_grads)
             ]
 
         meta_losses = [
@@ -145,7 +151,7 @@ class LearningDynamics:
         self.optimizer_route.step()
 
         return {
-            "route_jsd_loss": avg_route_jsd_loss, "carc_loss": avg_carc_loss, "mu_surprises": [torch.norm(g, p=2, dim=(0, 1, 3)) for g in mu_grads_unclipped],
+            "route_jsd_loss": avg_route_jsd_loss, "carc_loss": avg_carc_loss, "mu_surprises": mu_surprise_norms,
             "goodness_scores": all_goodness, "proto_weights": [p.detach() for name, p in self.routing_params_with_names if "proto_weight" in name],
         }
 
@@ -204,16 +210,13 @@ class Trainer:
             "sample_entropy": torch.tensor([ArcCollator._calculate_sample_entropy(labels)], dtype=torch.float32, device=device),
         }
 
-    def _run_step(self, mini_task: dict, view_idx: int, epoch: int, task_idx: int | str, last_view_routing_logits: list | None) -> tuple | None:
+    def _train_step(self, batch: dict, epoch: int, task_idx: int | str, view_idx: int, last_view_routing_logits: list | None) -> tuple | None:
         start_time = time.time()
-        batch = self._prepare_batch(mini_task, view_idx, self.device, self.serializer, self.consistency_tools, self.config.model.max_position_embeddings)
-        if not batch: return None
-
         self.model.train()
         with torch.autocast(device_type=self.config.device, dtype=torch.bfloat16):
             model_outputs = self.model(batch["input_ids"], coords=batch["coords"], return_dict=True)
             main_loss = F.cross_entropy(model_outputs["logits"][:, :-1, :].contiguous().view(-1, self.config.model.vocab_size), batch["labels"][:, 1:].contiguous().view(-1), ignore_index=-100)
-        
+
         if not torch.isfinite(main_loss):
             self.console.print(f"[bold red]NaN detected in main_loss at step {self.global_step}. Aborting step.[/bold red]")
             return None
@@ -221,12 +224,12 @@ class Trainer:
         signals = self.dynamics.compute_and_apply_gradients(main_loss, model_outputs, self.device, self.last_routing_logits, self.last_spl_inputs)
         model_outputs.update({"labels": batch["labels"], "sample_entropy": batch["sample_entropy"]})
         metrics = self.observer.calculate_metrics(main_loss, model_outputs, signals, batch["input_ids"], self.model)
-        
+
         if "goodness_scores" in signals and signals["goodness_scores"]: self.log_cycle_goodness.append(signals["goodness_scores"])
         if "act_rates" in metrics: self.log_cycle_act_rates.append(metrics["act_rates"])
-        
+
         consistency_metrics = self._calculate_consistency_metrics(model_outputs.get("routing_logits"), last_view_routing_logits, model_outputs.get("spl_inputs"), self.last_spl_inputs)
-        
+
         signals["raw_weights"] = model_outputs.get("raw_weights")
         self.observer.maybe_log_and_visualize(
             epoch, self.global_step, task_idx if isinstance(task_idx, int) else -1, view_idx, metrics, time.time() - start_time,
@@ -253,8 +256,13 @@ class Trainer:
             start_view = self.start_view_idx if task_idx == self.start_task_idx else 0
             for view_idx in range(start_view, 8):
                 converged = False
+                batch = self._prepare_batch(mini_task, view_idx, self.device, self.serializer, self.consistency_tools, self.config.model.max_position_embeddings)
+                if not batch:
+                    self.console.print(f"[yellow]Skipping Task {task_idx} View {view_idx} due to excessive length.[/yellow]")
+                    continue
+
                 for step in range(500):
-                    result = self._run_step(mini_task, view_idx, epoch, task_idx, last_view_routing_logits)
+                    result = self._train_step(batch, epoch, task_idx, view_idx, last_view_routing_logits)
                     if not result: break
                     metrics, _, routing_logits, _ = result
                     if metrics["main_loss"] <= 0.01 and metrics["token_acc"] >= 1.0:
@@ -269,7 +277,9 @@ class Trainer:
                 if self.new_sample_counter % 7 == 0 and self.replay_queue:
                     replay_task, replay_view_idx, replay_task_idx = random.choice(self.replay_queue)
                     self.console.print(f"[cyan]--- Replaying sample (Task -{replay_task_idx} View {replay_view_idx}) ---[/cyan]")
-                    self._run_step(replay_task, replay_view_idx, epoch, f"-{replay_task_idx}", None)
+                    replay_batch = self._prepare_batch(replay_task, replay_view_idx, self.device, self.serializer, self.consistency_tools, self.config.model.max_position_embeddings)
+                    if replay_batch:
+                        self._train_step(replay_batch, epoch, f"-{replay_task_idx}", replay_view_idx, None)
 
             self.start_view_idx = 0
         self.start_task_idx = 0
