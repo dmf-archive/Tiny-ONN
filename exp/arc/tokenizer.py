@@ -10,6 +10,8 @@ class ArcColorTokenizer:
             "problem": 3,
             "solution": 4,
             "\n": 5,
+            "<im_start>": 6,
+            "<im_end>": 7,
         }
 
         self.color_token_offset = len(self.control_tokens)

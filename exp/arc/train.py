@@ -198,11 +198,32 @@ class Trainer:
         self.evaluator = EvaluationStep(self.model, self.serializer, GridDeserializer(self.tokenizer), self.observer, self.device, self.train_loader.dataset, self.config)
 
     @staticmethod
-    def _prepare_batch(mini_task: dict, view_idx: int, device: torch.device, serializer: GridSerializer, consistency_tools: ConsistencyTools, max_len: int) -> dict[str, torch.Tensor] | None:
-        input_grid, output_grid = torch.tensor(mini_task["input"], device=device), torch.tensor(mini_task["output"], device=device)
+    def _prepare_batch(task_data: dict, view_idx: int, device: torch.device, serializer: GridSerializer, consistency_tools: ConsistencyTools, max_len: int) -> dict[str, torch.Tensor] | None:
+        
+        original_train = task_data["train"]
+        original_test = task_data["test"]
+        
+        transformed_train = []
+        for pair in original_train:
+            input_grid = torch.tensor(pair["input"], device=device)
+            output_grid = torch.tensor(pair["output"], device=device)
+            transform = consistency_tools.get_transforms()[view_idx]
+            transformed_train.append({
+                "input": transform(input_grid).cpu().tolist(),
+                "output": transform(output_grid).cpu().tolist(),
+            })
+
+        test_input_grid = torch.tensor(original_test[0]["input"], device=device)
+        test_output_grid = torch.tensor(original_test[0]["output"], device=device)
         transform = consistency_tools.get_transforms()[view_idx]
-        augmented = {"input": transform(input_grid).cpu().tolist(), "output": transform(output_grid).cpu().tolist()}
-        ids, labels, coords = serializer.serialize_mini_task(augmented)
+        transformed_test = [{
+            "input": transform(test_input_grid).cpu().tolist(),
+            "output": transform(test_output_grid).cpu().tolist(),
+        }]
+
+        augmented_task = {"train": transformed_train, "test": transformed_test}
+        
+        ids, labels, coords = serializer.serialize_task(augmented_task)
         if len(ids) > max_len: return None
         return {
             "input_ids": torch.tensor([ids], dtype=torch.long, device=device), "labels": torch.tensor([labels], dtype=torch.long, device=device),
@@ -235,6 +256,7 @@ class Trainer:
             epoch, self.global_step, task_idx if isinstance(task_idx, int) else -1, view_idx, metrics, time.time() - start_time,
             signals, self.evaluator, self.eval_loader, task_idx if isinstance(task_idx, int) else -1, self._save_checkpoint,
             {k: v for k, v in (consistency_metrics or {}).items() if isinstance(v, (float, int))}, self._reinitialize_dead_prototypes_if_needed
+            {k: v for k, v in (consistency_metrics or {}).items() if isinstance(v, (float, int))},
         )
 
         self.global_step += 1
@@ -252,11 +274,11 @@ class Trainer:
     def _train_epoch(self, epoch: int):
         dataset = self.train_loader.dataset
         for task_idx in range(self.start_task_idx, len(dataset)):
-            mini_task, last_view_routing_logits = dataset[task_idx], None
+            task_data, last_view_routing_logits = dataset[task_idx], None
             start_view = self.start_view_idx if task_idx == self.start_task_idx else 0
             for view_idx in range(start_view, 8):
                 converged = False
-                batch = self._prepare_batch(mini_task, view_idx, self.device, self.serializer, self.consistency_tools, self.config.model.max_position_embeddings)
+                batch = self._prepare_batch(task_data, view_idx, self.device, self.serializer, self.consistency_tools, self.config.model.max_position_embeddings)
                 if not batch:
                     self.console.print(f"[yellow]Skipping Task {task_idx} View {view_idx} due to excessive length.[/yellow]")
                     continue
@@ -268,7 +290,7 @@ class Trainer:
                     if metrics["main_loss"] <= 0.01 and metrics["token_acc"] >= 1.0:
                         self.console.print(f"Task {task_idx} view {view_idx} converged in {step + 1} steps.")
                         last_view_routing_logits = [r.detach() for r in routing_logits if r is not None]
-                        self.replay_queue.append((mini_task, view_idx, task_idx))
+                        self.replay_queue.append((task_data, view_idx, task_idx))
                         converged = True
                         break
                 if not converged: self.console.print(f"[red]Task {task_idx} view {view_idx} hit MAX_STEPS.[/red]")
@@ -284,73 +306,6 @@ class Trainer:
             self.start_view_idx = 0
         self.start_task_idx = 0
 
-    def _reinitialize_dead_prototypes_if_needed(self):
-        if not self.log_cycle_goodness or not self.last_spl_inputs or not self.log_cycle_act_rates:
-            self.console.print(f"[bold yellow]Reinitialization check: 0 reinitialized at step {self.global_step} (No data).[/bold yellow]")
-            return
-
-        num_spl_modules = len(next(iter(self.log_cycle_goodness), []))
-        avg_goodness = [
-            torch.stack([g[i] for g in self.log_cycle_goodness if i < len(g) and g[i].numel() > 0]).mean(0)
-            if any(i < len(g) and g[i].numel() > 0 for g in self.log_cycle_goodness) else torch.empty(0, device=self.device)
-            for i in range(num_spl_modules)
-        ]
-        layer_act_rates = [[step_rates[i] for step_rates in self.log_cycle_act_rates] for i in range(num_spl_modules)]
-        avg_act_rates = [sum(rates) / len(rates) if rates else 0.0 for rates in layer_act_rates]
-
-        reinit_count = self._reinitialize_dead_prototypes(avg_goodness, self.last_spl_inputs, avg_act_rates)
-        self.console.print(f"[bold yellow]Reinitialization check: {reinit_count} reinitialized at step {self.global_step}.[/bold yellow]")
-        self.log_cycle_goodness.clear()
-        self.log_cycle_act_rates.clear()
-
-    def _reinitialize_dead_prototypes(self, avg_goodness: list[torch.Tensor], spl_inputs: list[torch.Tensor], avg_act_rates: list[float]) -> int:
-        reinit_count, spl_idx = 0, 0
-        with torch.no_grad():
-            for module in self.model.modules():
-                if "SparseProtoLinear" in module.__class__.__name__:
-                    if spl_idx < len(spl_inputs) and spl_idx < len(avg_act_rates):
-                        dead_mask = self._find_redundant_mask(module, avg_act_rates[spl_idx])
-                        reinit_count += self._respawn_prototypes(module, dead_mask, spl_inputs[spl_idx])
-                    spl_idx += 1
-        return reinit_count
-
-    @staticmethod
-    def _find_redundant_mask(module: nn.Module, act_rate: float) -> torch.Tensor:
-        num_experts = module.proto_weight.shape[0]
-        dead_mask = torch.zeros(num_experts, dtype=torch.bool, device=module.proto_weight.device)
-        if num_experts < 2: return dead_mask
-
-        threshold = 0.999 - act_rate * (0.999 - 0.99)
-        sim_matrix = F.cosine_similarity(module.proto_weight.unsqueeze(1), module.proto_weight.unsqueeze(0), dim=-1)
-        visited = torch.zeros(num_experts, dtype=torch.bool, device=dead_mask.device)
-        for i in range(num_experts):
-            if visited[i]: continue
-            similar_indices = torch.where(sim_matrix[i] > threshold)[0]
-            if len(similar_indices) > 1:
-                survivor_idx = similar_indices[torch.randint(0, len(similar_indices), (1,)).item()]
-                for idx in similar_indices:
-                    if idx != survivor_idx: dead_mask[idx] = True
-                    visited[idx] = True
-            else:
-                visited[i] = True
-        return dead_mask
-
-    @staticmethod
-    def _respawn_prototypes(module: nn.Module, dead_mask: torch.Tensor, spl_inputs: torch.Tensor) -> int:
-        num_dead = dead_mask.sum().item()
-        if not num_dead: return 0
-        
-        proto_weight, mu_weight = module.proto_weight, module.mu_weight
-        spl_input_flat = spl_inputs.reshape(-1, proto_weight.shape[1])
-        if spl_input_flat.shape[0] > 0:
-            indices = torch.randint(0, spl_input_flat.shape[0], (num_dead,))
-            new_protos = spl_input_flat[indices]
-            noise = torch.randn_like(new_protos) * spl_input_flat.std(0) * 0.1
-            proto_weight.data[dead_mask] = (new_protos + noise).to(proto_weight.dtype)
-            new_mu = torch.empty_like(mu_weight.data[dead_mask])
-            nn.init.kaiming_uniform_(new_mu, a=math.sqrt(5))
-            mu_weight.data[dead_mask] = new_mu.to(mu_weight.dtype)
-        return num_dead
 
     def train(self):
         self._load_checkpoint()

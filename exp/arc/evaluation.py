@@ -26,13 +26,10 @@ class SimpleEvaluator:
         self.generation_config = generation_config
 
     @torch.no_grad()
-    def evaluate_single(self, mini_task: dict[str, Any]) -> tuple[torch.Tensor, list[int]]:
-        model_dtype = next(self.model.parameters()).dtype
-        input_grid = torch.tensor(mini_task["input"], device=self.device, dtype=model_dtype)
+    def evaluate_single(self, task_data: dict[str, Any]) -> tuple[torch.Tensor, list[int]]:
         max_new_tokens = self.generation_config.max_new_tokens
 
-        task_data_for_serializer = {"test": [mini_task]}
-        prompt_ids, prompt_coords = self.serializer.serialize_for_inference(task_data_for_serializer)
+        prompt_ids, prompt_coords = self.serializer.serialize_for_inference(task_data)
         prompt_tensor = torch.tensor([prompt_ids], dtype=torch.long, device=self.device)
         prompt_coords_tensor = torch.tensor([prompt_coords], dtype=torch.long, device=self.device)
 
@@ -46,12 +43,7 @@ class SimpleEvaluator:
         coords = input_coords.clone()
         past_key_values = None
 
-        last_r, last_c = -1, -1
-        for r_val, c_val in reversed(input_coords.tolist()[0]):
-            if r_val != -1:
-                last_r, last_c = r_val, c_val
-                break
-        current_r, current_c = (last_r, last_c) if last_r != -1 else (0, 0)
+        current_r, current_c = 0, -1
 
         with torch.autocast(device_type=self.device.type, dtype=torch.bfloat16):
             for _ in range(max_new_tokens):
@@ -72,14 +64,14 @@ class SimpleEvaluator:
                 elif next_token_item == self.serializer.tokenizer.row_sep_token_id:
                     current_r += 1
                     current_c = 0
-                    next_coord_tuple = (current_r, current_c)
+                    next_coord_tuple = (current_r, 0)
                 else:
                     next_coord_tuple = (-1, -1)
 
                 next_coord = torch.tensor([[next_coord_tuple]], dtype=torch.long, device=self.device)
                 coords = torch.cat([coords, next_coord], dim=1)
 
-                if next_token_item == self.serializer.tokenizer.eos_token_id:
+                if next_token_item == self.serializer.tokenizer.eos_token_id or next_token_item == self.serializer.tokenizer.vocab["<im_end>"]:
                     break
 
         prompt_len = input_ids.shape[1]
@@ -105,22 +97,22 @@ class EvaluationStep:
         with Progress(console=self.observer.console, transient=True) as progress:
             task = progress.add_task(f"[cyan]{title}...", total=num_samples)
             for item in itertools.islice(loader, num_samples):
-                mini_task = item if isinstance(item, dict) else item[0]
+                task_data = item if isinstance(item, dict) else item[0]
 
-                if 'output' not in mini_task:
+                if 'output' not in task_data["test"][0]:
                     progress.update(task, advance=1)
                     continue
 
-                target_grid_raw = torch.tensor(mini_task['output'], device=self.device)
+                target_grid_raw = torch.tensor(task_data['test'][0]['output'], device=self.device)
 
-                pred_grid, generated_tokens = self.evaluator.evaluate_single(mini_task)
+                pred_grid, generated_tokens = self.evaluator.evaluate_single(task_data)
 
                 is_correct = 0
                 if torch.equal(pred_grid.to(self.device), target_grid_raw):
                     is_correct = 1
 
                 if not visualized_this_loop:
-                    input_grid_raw = torch.tensor(mini_task['input'])
+                    input_grid_raw = torch.tensor(task_data['test'][0]['input'])
                     self.observer.visualize_evaluation_sample(input_grid_raw, target_grid_raw, pred_grid, generated_tokens, global_step)
                     visualized_this_loop = True
 

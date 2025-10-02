@@ -25,34 +25,71 @@ class GridSerializer:
                 coords.append((r, c))
         return tokens, coords
 
-    def serialize_mini_task(self, mini_task: dict[str, Any]) -> tuple[list[int], list[int], list[tuple[int, int]]]:
-        input_grid_ids, input_coords = self._serialize_grid(mini_task["input"])
-        output_grid_ids, output_coords = self._serialize_grid(mini_task["output"])
+    def serialize_task(self, task_data: dict[str, Any]) -> tuple[list[int], list[int], list[tuple[int, int]]]:
+        full_ids: list[int] = [self.tokenizer.bos_token_id]
+        full_coords: list[tuple[int, int]] = [(-1, -1)]
+        labels: list[int] = [-100]
 
-        prompt_part1 = [self.tokenizer.bos_token_id, self.tokenizer.vocab["problem"]] + input_grid_ids
-        prompt_coords1 = [(-1, -1), (-1, -1)] + input_coords
+        im_start_id = self.tokenizer.vocab["<im_start>"]
+        im_end_id = self.tokenizer.vocab["<im_end>"]
 
-        prompt_part2 = [self.tokenizer.vocab["solution"]]
-        prompt_coords2 = [(-1, -1)]
+        for pair in task_data["train"]:
+            input_ids, input_coords = self._serialize_grid(pair["input"])
+            output_ids, output_coords = self._serialize_grid(pair["output"])
 
-        full_ids = prompt_part1 + prompt_part2 + output_grid_ids + [self.tokenizer.eos_token_id]
-        full_coords = prompt_coords1 + prompt_coords2 + output_coords + [(-1, -1)]
+            full_ids.extend([im_start_id] + input_ids + [im_end_id])
+            full_coords.extend([(-1, -1)] + input_coords + [(-1, -1)])
+            labels.extend([-100] * (len(input_ids) + 2))
 
-        prompt_len = len(prompt_part1) + len(prompt_part2)
-        labels = [-100] * prompt_len + output_grid_ids + [self.tokenizer.eos_token_id]
+            full_ids.extend([im_start_id] + output_ids + [im_end_id])
+            full_coords.extend([(-1, -1)] + output_coords + [(-1, -1)])
+            labels.extend([-100] * (len(output_ids) + 2))
+
+        test_input_ids, test_input_coords = self._serialize_grid(task_data["test"][0]["input"])
+        test_output_ids, test_output_coords = self._serialize_grid(task_data["test"][0]["output"])
+
+        full_ids.extend([im_start_id] + test_input_ids + [im_end_id])
+        full_coords.extend([(-1, -1)] + test_input_coords + [(-1, -1)])
+        labels.extend([-100] * (len(test_input_ids) + 2))
+
+        full_ids.extend([im_start_id] + test_output_ids + [im_end_id])
+        full_coords.extend([(-1, -1)] + test_output_coords + [(-1, -1)])
+        labels.extend([-100] + test_output_ids + [-100])
+
+        full_ids.append(self.tokenizer.eos_token_id)
+        full_coords.append((-1, -1))
+        labels.append(self.tokenizer.eos_token_id)
 
         return full_ids, labels, full_coords
 
     def serialize_for_inference(self, task_data: dict[str, Any]) -> tuple[list[int], list[tuple[int, int]]]:
-        test_input_grid_ids, test_input_coords = self._serialize_grid(task_data["test"][0]["input"])
-        prompt_ids = [self.tokenizer.bos_token_id, self.tokenizer.vocab["problem"]] + test_input_grid_ids + [self.tokenizer.vocab["solution"]]
-        prompt_coords = [(-1, -1), (-1, -1)] + test_input_coords + [(-1, -1)]
+        prompt_ids: list[int] = [self.tokenizer.bos_token_id]
+        prompt_coords: list[tuple[int, int]] = [(-1, -1)]
+
+        im_start_id = self.tokenizer.vocab["<im_start>"]
+        im_end_id = self.tokenizer.vocab["<im_end>"]
+
+        for pair in task_data["train"]:
+            input_ids, input_coords = self._serialize_grid(pair["input"])
+            output_ids, output_coords = self._serialize_grid(pair["output"])
+
+            prompt_ids.extend([im_start_id] + input_ids + [im_end_id])
+            prompt_coords.extend([(-1, -1)] + input_coords + [(-1, -1)])
+
+            prompt_ids.extend([im_start_id] + output_ids + [im_end_id])
+            prompt_coords.extend([(-1, -1)] + output_coords + [(-1, -1)])
+
+        test_input_ids, test_input_coords = self._serialize_grid(task_data["test"][0]["input"])
+        prompt_ids.extend([im_start_id] + test_input_ids + [im_end_id, im_start_id])
+        prompt_coords.extend([(-1, -1)] + test_input_coords + [(-1, -1), (-1, -1)])
+
         return prompt_ids, prompt_coords
+
 
 class InMemoryArcDataset(Dataset):
     def __init__(self, data_path: str, split: str = "training"):
         self.data_path = Path(data_path) / split
-        self.mini_tasks = []
+        self.tasks = []
 
         file_paths = sorted(list(self.data_path.glob("*.json")))
         for path in file_paths:
@@ -60,35 +97,29 @@ class InMemoryArcDataset(Dataset):
                 task_data = json.load(f)
 
             if split == "training":
-                for pair in task_data['train']:
-                    self.mini_tasks.append(pair)
-                for pair in task_data['test']:
-                    self.mini_tasks.append(pair)
+                if "test" in task_data and task_data["test"] and "output" in task_data["test"][0]:
+                    self.tasks.append(task_data)
             elif split == "evaluation":
-                for pair in task_data['train']:
-                    self.mini_tasks.append(pair)
-
-                if 'test' in task_data and task_data['test'] and 'output' in task_data['test']:
-                    for pair in task_data['test']:
-                        self.mini_tasks.append(pair)
-
+                if "test" in task_data and task_data["test"] and "output" in task_data["test"][0]:
+                    self.tasks.append(task_data)
 
         tokenizer_for_sorting = ArcColorTokenizer()
         serializer_for_sorting = GridSerializer(tokenizer_for_sorting)
 
         tasks_with_lengths = []
-        for mini_task in self.mini_tasks:
-            input_ids, _, _ = serializer_for_sorting.serialize_mini_task(mini_task)
-            tasks_with_lengths.append((mini_task, len(input_ids)))
+        for task in self.tasks:
+            input_ids, _, _ = serializer_for_sorting.serialize_task(task)
+            tasks_with_lengths.append((task, len(input_ids)))
 
         sorted_tasks = sorted(tasks_with_lengths, key=lambda x: x[1])
-        self.mini_tasks = [task for task, length in sorted_tasks]
+        self.tasks = [task for task, length in sorted_tasks]
 
     def __len__(self) -> int:
-        return len(self.mini_tasks)
+        return len(self.tasks)
 
     def __getitem__(self, idx: int) -> dict[str, Any]:
-        return self.mini_tasks[idx]
+        return self.tasks[idx]
+
 
 class ArcCollator:
     def __init__(self, tokenizer: ArcColorTokenizer, max_len: int):
@@ -110,8 +141,8 @@ class ArcCollator:
     def __call__(self, batch: list[dict[str, Any]]) -> dict[str, Any]:
         all_input_ids, all_labels, all_coords, all_entropies = [], [], [], []
 
-        for mini_task in batch:
-            input_ids, labels, coords = self.serializer.serialize_mini_task(mini_task)
+        for task_data in batch:
+            input_ids, labels, coords = self.serializer.serialize_task(task_data)
 
             if len(input_ids) > self.max_len:
                 continue
@@ -137,6 +168,7 @@ class ArcCollator:
             "sample_entropy": torch.tensor(all_entropies, dtype=torch.float32),
         }
 
+
 class GridDeserializer:
     def __init__(self, tokenizer: ArcColorTokenizer):
         self.tokenizer = tokenizer
@@ -145,7 +177,17 @@ class GridDeserializer:
         grid_rows = []
         current_row: list[int] = []
 
+        clean_tokens = []
         for token_id in tokens:
+            if token_id in [
+                self.tokenizer.vocab["<im_start>"],
+                self.tokenizer.vocab["<im_end>"],
+                self.tokenizer.eos_token_id,
+            ]:
+                continue
+            clean_tokens.append(token_id)
+
+        for token_id in clean_tokens:
             if token_id == self.tokenizer.row_sep_token_id:
                 if current_row:
                     grid_rows.append(current_row)

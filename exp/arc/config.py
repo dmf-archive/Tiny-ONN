@@ -6,7 +6,7 @@ class ModelConfig:
     vocab_size: int = 16
     hidden_size: int = 512
     num_layers: int = 8
-    max_position_embeddings: int = 2048
+    max_position_embeddings: int = 4096
     d_ffn_factor: int = 1
 
 @dataclass
