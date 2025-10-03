@@ -130,6 +130,7 @@ class MoIETransformerBlock(nn.Module):
         self.attn = DynamicInfiniteHeadAttention(config, dtype=dtype)
         self.ln2 = nn.LayerNorm(config.hidden_size, eps=1e-5)
         self.ffn = DynamicInfiniteExpert(config, dtype=dtype)
+        self.routing_gain = config.routing_gain
         d_ffn = config.hidden_size * config.d_ffn_factor
         self.proto_transforms = nn.ModuleDict(
             {
@@ -191,9 +192,6 @@ class MoIETransformerBlock(nn.Module):
         dummy_attn_out = torch.zeros_like(x)
         _, _, pc_o_pre = self.attn.spl_o(dummy_attn_out, effective_protos["attn_o"])
 
-        all_gate_logits = [pc_q, pc_k, pc_v, pc_o_pre, pc1, pc2_pre]
-        all_gate_logits_cat = torch.cat([pc.flatten() for pc in all_gate_logits])
-        max_cost = torch.max(all_gate_logits_cat).detach().clamp(min=1.0)
 
         all_masked, all_comp, all_raw, all_routing_logits, all_spl_inputs = [], [], [], [], []
 
@@ -201,8 +199,8 @@ class MoIETransformerBlock(nn.Module):
         q, k, v = torch.zeros_like(c_q), torch.zeros_like(c_k), torch.zeros_like(c_v)
 
         for i in range(3):
-            cost_score = costs_qkv[i] / max_cost
-            routing_logits = match_qkv[i] - cost_score
+            cost_score = mas_normalize(costs_qkv[i])
+            routing_logits = (match_qkv[i] - cost_score) * self.routing_gain
             raw_weights = mas_normalize(routing_logits)
             masked = comp_qkv[i] * raw_weights
             if i == 0: q = masked
@@ -222,21 +220,21 @@ class MoIETransformerBlock(nn.Module):
         attn_out = F.scaled_dot_product_attention(q, k, v, is_causal=past_kv is None)
 
         c_o, mv_o, pc_o = self.attn.spl_o(attn_out, effective_protos["attn_o"])
-        cost_score_o = pc_o / max_cost
-        routing_logits_o = mv_o - cost_score_o
+        cost_score_o = mas_normalize(pc_o)
+        routing_logits_o = (mv_o - cost_score_o) * self.routing_gain
         rw_o = mas_normalize(routing_logits_o)
         m_o = c_o * rw_o
         x = x + m_o
 
-        cost_score_f1 = pc1 / max_cost
-        routing_logits_f1 = mv1 - cost_score_f1
+        cost_score_f1 = mas_normalize(pc1)
+        routing_logits_f1 = (mv1 - cost_score_f1) * self.routing_gain
         rw_f1 = mas_normalize(routing_logits_f1)
         m1 = c1 * rw_f1
         h_act = F.relu(m1)
 
         c2, mv2, pc2 = self.ffn.spl2(h_act, effective_protos["ffn_spl2"])
-        cost_score_f2 = pc2 / max_cost
-        routing_logits_f2 = mv2 - cost_score_f2
+        cost_score_f2 = mas_normalize(pc2)
+        routing_logits_f2 = (mv2 - cost_score_f2) * self.routing_gain
         rw_f2 = mas_normalize(routing_logits_f2)
         m2 = c2 * rw_f2
         x_out = x + m2

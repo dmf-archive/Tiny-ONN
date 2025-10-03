@@ -6,8 +6,7 @@ import torch
 from rich.progress import Progress
 from torch.utils.data import DataLoader, Subset
 
-from .config import GenerationConfig, TrainConfig
-from .consistency import ConsistencyTools
+from .config import TrainConfig
 from .data import GridDeserializer, GridSerializer
 from .model import ArcTransformer
 from .observer import Observer
@@ -15,14 +14,12 @@ from .observer import Observer
 
 class SimpleEvaluator:
 
-    def __init__(self, model: ArcTransformer, serializer: GridSerializer, deserializer: GridDeserializer, observer: Observer, device: torch.device, generation_config: GenerationConfig):
+    def __init__(self, model: ArcTransformer, serializer: GridSerializer, deserializer: GridDeserializer, observer: Observer, device: torch.device):
         self.model = model
         self.serializer = serializer
         self.deserializer = deserializer
         self.observer = observer
         self.device = device
-        self.consistency_tools = ConsistencyTools()
-        self.generation_config = generation_config
 
     @torch.no_grad()
     def evaluate_single(self, task_data: dict[str, Any]) -> tuple[torch.Tensor, list[int]]:
@@ -89,7 +86,7 @@ class EvaluationStep:
         self.observer = observer
         self.device = device
         self.config = config
-        self.evaluator = SimpleEvaluator(self.model, self.serializer, self.deserializer, self.observer, self.device, self.config.generation)
+        self.evaluator = SimpleEvaluator(self.model, self.serializer, self.deserializer, self.observer, self.device)
 
     def _run_eval_loop(self, loader: DataLoader, num_samples: int, title: str, global_step: int) -> tuple[int, int]:
         total_correct, evaluated_count = 0, 0
@@ -114,7 +111,8 @@ class EvaluationStep:
 
                 if not visualized_this_loop:
                     input_grid_raw = torch.tensor(task_data['test'][0]['input'])
-                    self.observer.visualize_evaluation_sample(input_grid_raw, target_grid_raw, pred_grid, generated_tokens, global_step)
+                    decoded_tokens = self.serializer.tokenizer.decode(generated_tokens)
+                    self.observer.visualize_evaluation_sample(input_grid_raw, target_grid_raw, pred_grid, decoded_tokens, global_step)
                     visualized_this_loop = True
 
                 total_correct += is_correct

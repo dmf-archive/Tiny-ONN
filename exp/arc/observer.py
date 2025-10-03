@@ -137,11 +137,10 @@ class Observer:
     def visualize_prototypes(self, signals: dict, global_step: int):
         proto_weights = signals.get("proto_weights", [])
         raw_weights = signals.get("raw_weights", [])
-        goodness_scores = signals.get("goodness_scores", [])
+        goodness_logits = signals.get("goodness_logits", [])
 
-        if not proto_weights or not raw_weights or not goodness_scores:
+        if not proto_weights or not raw_weights or not goodness_logits:
             return
-
 
         num_spl = 6
         num_layers = self.config.model.num_layers
@@ -149,7 +148,7 @@ class Observer:
         fig, axes = plt.subplots(num_layers, num_spl, figsize=(20, 5 * num_layers), squeeze=False)
         fig.suptitle(f"Prototype Goodness Distribution @ Step {global_step}", fontsize=16)
         color_map = {"good": "green", "bad": "red", "inactive": "grey"}
-        names = ["attn_q", "attn_k", "attn_v", "attn_o", "ffn_sbl1", "ffn_sbl2"]
+        names = ["attn_q", "attn_k", "attn_v", "attn_o", "ffn_spl1", "ffn_spl2"]
 
         for i in range(num_layers):
             for j in range(num_spl):
@@ -160,19 +159,15 @@ class Observer:
 
                 protos = proto_weights[idx].cpu().to(torch.float32)
                 rw = raw_weights[idx].cpu().to(torch.float32)
-                goodness = goodness_scores[idx].cpu().to(torch.float32)
+                logits = goodness_logits[idx].cpu().to(torch.float32)
 
                 num_activations = (rw > 0).float().sum(dim=(0, 1))
-                avg_goodness = (goodness * (rw > 0).float()).sum(dim=(0, 1)) / (num_activations + 1e-6)
-
-                activated_goodness = avg_goodness[num_activations > 0]
-                threshold = torch.quantile(activated_goodness, 0.5) if activated_goodness.numel() > 0 else 0.0
 
                 statuses = []
-                for k in range(avg_goodness.shape[0]):
+                for k in range(logits.shape[0]):
                     if num_activations[k] == 0:
                         statuses.append("inactive")
-                    elif avg_goodness[k] >= threshold:
+                    elif logits[k] > 0:
                         statuses.append("good")
                     else:
                         statuses.append("bad")
@@ -237,7 +232,7 @@ class Observer:
         input_grid: torch.Tensor,
         target_grid: torch.Tensor,
         pred_grid: torch.Tensor | None,
-        pred_tokens: list[int] | None,
+        pred_tokens_decoded: str | None,
         step: int,
     ):
         self.console.print()
@@ -258,9 +253,10 @@ class Observer:
         table.add_row(input_text, target_text, pred_text)
         self.console.print(table)
 
-        if pred_tokens:
-            self.console.print(f"[bold]Generated Token Stream ({len(pred_tokens)} tokens):[/bold]", highlight=False)
-            self.console.print(str(pred_tokens))
+        if pred_tokens_decoded:
+            num_tokens = len(pred_tokens_decoded.split())
+            self.console.print(f"[bold]Generated Token Stream ({num_tokens} tokens):[/bold]", highlight=False)
+            self.console.print(pred_tokens_decoded)
         else:
             self.console.print("[bold]Generated Token Stream:[/bold] [red]N/A[/red]")
 

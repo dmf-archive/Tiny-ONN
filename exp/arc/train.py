@@ -1,4 +1,3 @@
-import collections
 import os
 import random
 import time
@@ -11,8 +10,7 @@ import torch.nn.functional as F
 from rich.console import Console
 from torch.utils.data import DataLoader
 
-from .config import GenerationConfig, TrainConfig
-from .consistency import ConsistencyTools
+from .config import TrainConfig
 from .data import ArcCollator, GridDeserializer, GridSerializer, InMemoryArcDataset
 from .evaluation import EvaluationStep
 from .model import ArcTransformer, mas_normalize
@@ -50,16 +48,42 @@ def _get_task_representation(tensors: list[torch.Tensor]) -> torch.Tensor | None
     return torch.cat([mean_vec, std_vec], dim=0)
 
 
+@torch.jit.script
+def _augment_and_map_kernel(grids: list[torch.Tensor], transform_idx: int, color_map: torch.Tensor) -> list[torch.Tensor]:
+    transformed_grids = []
+    for x in grids:
+        if transform_idx == 0:
+            transformed_x = x
+        elif transform_idx == 1:
+            transformed_x = torch.rot90(x, 1, [0, 1])
+        elif transform_idx == 2:
+            transformed_x = torch.rot90(x, 2, [0, 1])
+        elif transform_idx == 3:
+            transformed_x = torch.rot90(x, 3, [0, 1])
+        elif transform_idx == 4:
+            transformed_x = torch.flip(x, [0])
+        elif transform_idx == 5:
+            transformed_x = torch.flip(x, [1])
+        elif transform_idx == 6:
+            transformed_x = torch.transpose(x, 0, 1)
+        else:
+            transformed_x = torch.rot90(torch.flip(x, [0]), 1, [0, 1])
+        transformed_grids.append(color_map[transformed_x])
+    return transformed_grids
+
+
 class LearningDynamics:
     def __init__(
         self,
         config: TrainConfig,
+        model: nn.Module,
         computation_params: list,
         routing_params_with_names: list[tuple[str, nn.Parameter]],
         optimizer_comp: torch.optim.Optimizer,
         optimizer_route: torch.optim.Optimizer,
     ):
         self.config = config
+        self.model = model
         self.computation_params = computation_params
         self.routing_params_with_names = routing_params_with_names
         self.routing_params = [p for _, p in routing_params_with_names]
@@ -69,26 +93,9 @@ class LearningDynamics:
     @staticmethod
     @torch.jit.script
     def _calculate_jsd_loss(p_logits: torch.Tensor, q_logits: torch.Tensor) -> torch.Tensor:
-        p_dist_unnorm = mas_normalize(p_logits)
+        p_dist_unnorm = F.relu(mas_normalize(p_logits))
         q_dist_unnorm = mas_normalize(q_logits).detach()
         return _jsd_from_distributions(p_dist_unnorm, q_dist_unnorm)
-
-    @staticmethod
-    @torch.jit.script
-    def _calculate_mu_surprise_norms(
-        computation_output_grads: list[torch.Tensor], spl_inputs: list[torch.Tensor]
-    ) -> list[torch.Tensor]:
-        mu_surprise_norms = []
-        for grad_act, spl_in in zip(computation_output_grads, spl_inputs):
-            grad_act_sq = torch.sum(grad_act**2, dim=(0, 1))
-            spl_in_sq = torch.sum(spl_in**2, dim=(0, 1))
-
-            term1 = (spl_in_sq * grad_act_sq.sum()).sqrt()
-            term2 = (grad_act_sq * spl_in_sq.sum()).sqrt()
-
-            norm = (term1 + term2) / 2.0
-            mu_surprise_norms.append(norm)
-        return mu_surprise_norms
 
     def compute_and_apply_gradients(
         self, main_loss: torch.Tensor, model_outputs: dict, device: torch.device, last_routing_logits: list[torch.Tensor] | None, last_spl_inputs: list[torch.Tensor] | None
@@ -97,25 +104,48 @@ class LearningDynamics:
         self.optimizer_route.zero_grad()
 
         computation_outputs = model_outputs["computation_outputs"]
-        clean_spl_inputs = [s for s in model_outputs["spl_inputs"] if s is not None]
+        masked_outputs = model_outputs["masked_outputs"]
+        mu_weights = []
+        for i in range(self.config.model.num_layers):
+            block = self.model.blocks[i]
+            mu_weights.extend([
+                block.attn.spl_q.mu_weight, block.attn.spl_k.mu_weight, block.attn.spl_v.mu_weight,
+                block.attn.spl_o.mu_weight, block.ffn.spl1.mu_weight, block.ffn.spl2.mu_weight,
+            ])
 
-        params_to_grad = self.computation_params + computation_outputs
+        params_to_grad = self.computation_params + computation_outputs + mu_weights
         all_grads = torch.autograd.grad(main_loss, params_to_grad, retain_graph=True, allow_unused=True)
-        comp_grads, intermediate_grads = all_grads[: len(self.computation_params)], all_grads[len(self.computation_params) :]
+
+        len_comp = len(self.computation_params)
+        len_comp_out = len(computation_outputs)
+        comp_grads = all_grads[:len_comp]
+        intermediate_grads = all_grads[len_comp : len_comp + len_comp_out]
+        mu_weight_grads = all_grads[len_comp + len_comp_out :]
+
+        c_output_grads = [g for g in intermediate_grads if g is not None]
+        c_output_norms = [torch.norm(g, p=2, dim=(0, 1)) for g in c_output_grads]
+        c_param_norms = [torch.norm(g, p=2, dim=-1) for g in mu_weight_grads if g is not None]
+        i_effective_norms = [torch.norm(mo, p=2, dim=(0, 1)) for mo in masked_outputs if mo is not None]
+
+        with torch.no_grad():
+            all_goodness = []
+            all_goodness_logits = []
+            num_modules = min(len(i_effective_norms), len(c_output_norms), len(c_param_norms))
+            for i in range(num_modules):
+                i_eff, c_out, c_param = i_effective_norms[i], c_output_norms[i], c_param_norms[i]
+                if not (i_eff.shape == c_out.shape == c_param.shape): continue
+                benefit_eff = mas_normalize(i_eff)
+                benefit_rel = mas_normalize(c_out)
+                synergistic_benefit = mas_normalize(benefit_eff * benefit_rel)
+                learning_cost = mas_normalize(c_param)
+                goodness_logits = synergistic_benefit / (learning_cost + 1e-9)
+                all_goodness_logits.append(goodness_logits)
+                all_goodness.append(F.relu(goodness_logits))
 
         with torch.no_grad():
             for param, grad in zip(self.computation_params, comp_grads):
                 if grad is not None:
                     param.grad = grad.clone()
-
-        valid_intermediate_grads = [g for g in intermediate_grads if g is not None]
-        mu_surprise_norms = self._calculate_mu_surprise_norms(valid_intermediate_grads, clean_spl_inputs)
-
-        with torch.no_grad():
-            all_goodness = [
-                F.relu(mas_normalize(torch.norm(output_grad, p=2, dim=(0, 1))) - mas_normalize(mu_surprise))
-                for mu_surprise, output_grad in zip(mu_surprise_norms, valid_intermediate_grads)
-            ]
 
         meta_losses = [
             self._calculate_jsd_loss(logit, good)
@@ -135,13 +165,16 @@ class LearningDynamics:
                         param.grad = grad.clone()
 
         torch.nn.utils.clip_grad_norm_(self.computation_params, max_norm=1.0)
-        torch.nn.utils.clip_grad_norm_(self.routing_params, max_norm=1.0)
         self.optimizer_comp.step()
         self.optimizer_route.step()
 
         return {
-            "route_jsd_loss": avg_route_jsd_loss, "carc_loss": avg_carc_loss, "mu_surprises": mu_surprise_norms,
-            "goodness_scores": all_goodness, "proto_weights": [p.detach() for name, p in self.routing_params_with_names if "proto_weight" in name],
+            "route_jsd_loss": avg_route_jsd_loss,
+            "carc_loss": avg_carc_loss,
+            "mu_surprises": c_param_norms,
+            "goodness_scores": all_goodness,
+            "goodness_logits": all_goodness_logits,
+            "proto_weights": [p.detach() for name, p in self.routing_params_with_names if "proto_weight" in name],
         }
 
 
@@ -152,7 +185,6 @@ class Trainer:
         self.console = Console()
         self.observer = Observer(self.console, config)
         self.tokenizer, self.serializer = ArcColorTokenizer(), GridSerializer(ArcColorTokenizer())
-        self.consistency_tools = ConsistencyTools()
         self._setup_data()
         self._setup_model_and_optimizer()
         self.checkpoint_dir = Path(__file__).parent / "checkpoints"
@@ -160,18 +192,16 @@ class Trainer:
         self.global_step, self.epoch, self.start_task_idx, self.start_view_idx = 0, 0, 0, 0
         self.last_spl_inputs: list[torch.Tensor] | None = None
         self.last_routing_logits: list[torch.Tensor] | None = None
-        self.replay_queue: collections.deque = collections.deque(maxlen=100)
-        self.new_sample_counter = 0
 
     def _setup_data(self):
         collator = ArcCollator(self.tokenizer, max_len=self.config.model.max_position_embeddings)
         self.train_loader = DataLoader(
             InMemoryArcDataset(data_path=self.config.data.data_path, split="training"),
-            batch_size=self.config.data.batch_size, collate_fn=collator, num_workers=self.config.data.num_workers, shuffle=False,
+            batch_size=self.config.data.batch_size, collate_fn=collator, num_workers=self.config.data.num_workers, shuffle=False, pin_memory=True,
         )
         self.eval_loader = DataLoader(
             InMemoryArcDataset(data_path=self.config.data.data_path, split="evaluation"),
-            batch_size=1, collate_fn=collator, num_workers=self.config.data.num_workers, shuffle=False,
+            batch_size=1, collate_fn=collator, num_workers=self.config.data.num_workers, shuffle=False, pin_memory=True,
         )
 
     def _setup_model_and_optimizer(self):
@@ -181,41 +211,53 @@ class Trainer:
         routing_params_with_names = [(name, p) for name, p in self.model.named_parameters() if "proto_weight" in name or "gate_param" in name]
         self.optimizer_comp = torch.optim.AdamW(computation_params, lr=self.config.lr)
         self.optimizer_route = torch.optim.AdamW([p for _, p in routing_params_with_names], lr=self.config.lr)
-        self.dynamics = LearningDynamics(self.config, computation_params, routing_params_with_names, self.optimizer_comp, self.optimizer_route)
+        self.dynamics = LearningDynamics(self.config, self.model, computation_params, routing_params_with_names, self.optimizer_comp, self.optimizer_route)
         self.evaluator = EvaluationStep(self.model, self.serializer, GridDeserializer(self.tokenizer), self.observer, self.device, self.train_loader.dataset, self.config)
 
-    @staticmethod
-    def _prepare_batch(task_data: dict, view_idx: int, device: torch.device, serializer: GridSerializer, consistency_tools: ConsistencyTools, max_len: int) -> dict[str, torch.Tensor] | None:
+    def _prepare_batch(self, task_data: dict, view_idx: int, max_len: int) -> dict[str, torch.Tensor] | None:
+        all_colors = set()
+        grids_cpu_lists = []
+        for pair in task_data["train"]:
+            grids_cpu_lists.extend([pair["input"], pair["output"]])
+            for row in pair["input"]:
+                all_colors.update(row)
+            for row in pair["output"]:
+                all_colors.update(row)
 
-        original_train = task_data["train"]
-        original_test = task_data["test"]
+        grids_cpu_lists.extend([task_data["test"][0]["input"], task_data["test"][0]["output"]])
+        for row in task_data["test"][0]["input"]:
+            all_colors.update(row)
+        if "output" in task_data["test"][0]:
+            for row in task_data["test"][0]["output"]:
+                all_colors.update(row)
 
-        transformed_train = []
-        for pair in original_train:
-            input_grid = torch.tensor(pair["input"], device=device)
-            output_grid = torch.tensor(pair["output"], device=device)
-            transform = consistency_tools.get_transforms()[view_idx]
-            transformed_train.append({
-                "input": transform(input_grid).cpu().tolist(),
-                "output": transform(output_grid).cpu().tolist(),
-            })
+        active_colors = [c for c in all_colors if c != 0]
+        color_map_cpu = torch.arange(10, dtype=torch.long)
+        if len(active_colors) >= 2:
+            c1, c2 = random.sample(active_colors, 2)
+            color_map_cpu[c1], color_map_cpu[c2] = c2, c1
 
-        test_input_grid = torch.tensor(original_test[0]["input"], device=device)
-        test_output_grid = torch.tensor(original_test[0]["output"], device=device)
-        transform = consistency_tools.get_transforms()[view_idx]
-        transformed_test = [{
-            "input": transform(test_input_grid).cpu().tolist(),
-            "output": transform(test_output_grid).cpu().tolist(),
-        }]
+        grids_cpu_tensors = [torch.tensor(g, dtype=torch.long) for g in grids_cpu_lists]
+        augmented_grids = _augment_and_map_kernel(grids_cpu_tensors, view_idx, color_map_cpu)
+        augmented_grids_list = [g.tolist() for g in augmented_grids]
 
+        transformed_train, ptr = [], 0
+        for _ in task_data["train"]:
+            transformed_train.append({"input": augmented_grids_list[ptr], "output": augmented_grids_list[ptr + 1]})
+            ptr += 2
+
+        transformed_test = [{"input": augmented_grids_list[ptr], "output": augmented_grids_list[ptr + 1]}]
         augmented_task = {"train": transformed_train, "test": transformed_test}
 
-        ids, labels, coords = serializer.serialize_task(augmented_task)
-        if len(ids) > max_len: return None
+        ids, labels, coords = self.serializer.serialize_task(augmented_task)
+        if len(ids) > max_len:
+            return None
+
         return {
-            "input_ids": torch.tensor([ids], dtype=torch.long, device=device), "labels": torch.tensor([labels], dtype=torch.long, device=device),
-            "coords": torch.tensor([coords], dtype=torch.long, device=device),
-            "sample_entropy": torch.tensor([ArcCollator._calculate_sample_entropy(labels)], dtype=torch.float32, device=device),
+            "input_ids": torch.tensor([ids], dtype=torch.long),
+            "labels": torch.tensor([labels], dtype=torch.long),
+            "coords": torch.tensor([coords], dtype=torch.long),
+            "sample_entropy": torch.tensor([ArcCollator._calculate_sample_entropy(labels)], dtype=torch.float32),
         }
 
     def _train_step(self, batch: dict, epoch: int, task_idx: int | str, view_idx: int, last_view_routing_logits: list | None) -> tuple | None:
@@ -259,37 +301,37 @@ class Trainer:
     def _train_epoch(self, epoch: int):
         dataset = self.train_loader.dataset
         for task_idx in range(self.start_task_idx, len(dataset)):
-            task_data, last_view_routing_logits = dataset[task_idx], None
+            task_data = dataset[task_idx]
+            last_view_routing_logits = None
             start_view = self.start_view_idx if task_idx == self.start_task_idx else 0
             for view_idx in range(start_view, 8):
-                converged = False
-                batch = self._prepare_batch(task_data, view_idx, self.device, self.serializer, self.consistency_tools, self.config.model.max_position_embeddings)
-                if not batch:
-                    self.console.print(f"[yellow]Skipping Task {task_idx} View {view_idx} due to excessive length.[/yellow]")
+                batch_cpu = self._prepare_batch(
+                    task_data, view_idx, self.config.model.max_position_embeddings
+                )
+                if not batch_cpu:
+                    self.console.print(
+                        f"[yellow]Skipping Task {task_idx} View {view_idx} due to excessive length.[/yellow]"
+                    )
                     continue
 
+                batch = {
+                    k: v.to(self.device) for k, v in batch_cpu.items() if isinstance(v, torch.Tensor)
+                }
+                converged = False
                 for step in range(500):
                     result = self._train_step(batch, epoch, task_idx, view_idx, last_view_routing_logits)
-                    if not result: break
+                    if not result:
+                        break
                     metrics, _, routing_logits, _ = result
-                    if metrics["main_loss"] <= 0.01 and metrics["token_acc"] >= 0.999:
+                    if metrics["main_loss"] <= 0.03 and metrics["token_acc"] >= 0.999:
                         self.console.print(f"Task {task_idx} view {view_idx} converged in {step + 1} steps.")
                         last_view_routing_logits = [r.detach() for r in routing_logits if r is not None]
-                        self.replay_queue.append((task_data, view_idx, task_idx))
                         converged = True
                         break
-                if not converged: self.console.print(f"[red]Task {task_idx} view {view_idx} hit MAX_STEPS.[/red]")
-
-                self.new_sample_counter += 1
-                if self.new_sample_counter % 7 == 0 and self.replay_queue:
-                    replay_task, replay_view_idx, replay_task_idx = random.choice(self.replay_queue)
-                    self.console.print(f"[cyan]--- Replaying sample (Task -{replay_task_idx} View {replay_view_idx}) ---[/cyan]")
-                    replay_batch = self._prepare_batch(replay_task, replay_view_idx, self.device, self.serializer, self.consistency_tools, self.config.model.max_position_embeddings)
-                    if replay_batch:
-                        self._train_step(replay_batch, epoch, f"-{replay_task_idx}", replay_view_idx, None)
-
+                if not converged:
+                    self.console.print(f"[red]Task {task_idx} view {view_idx} hit MAX_STEPS.[/red]")
             self.start_view_idx = 0
-        self.start_task_idx = 0
+        self.start_task_idx, self.start_view_idx = 0, 0
 
 
     def train(self):
@@ -332,7 +374,6 @@ class Trainer:
 
 def main():
     config = TrainConfig()
-    config.generation = GenerationConfig()
     trainer = Trainer(config)
     trainer.train()
 

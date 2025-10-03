@@ -8,6 +8,7 @@ class ModelConfig:
     num_layers: int = 8
     max_position_embeddings: int = 4096
     d_ffn_factor: int = 1
+    routing_gain: float = 10.0
 
 @dataclass
 class DataConfig:
@@ -22,7 +23,7 @@ class TrainConfig:
 
     lr: float = 1e-3
 
-    w_route_jsd: float = 1.0
+    w_route_jsd: float = 1.1
 
     num_epochs: int = 20
 
@@ -33,7 +34,3 @@ class TrainConfig:
     log_interval: int = 10
     max_checkpoints: int = 3
 
-@dataclass
-class GenerationConfig:
-    max_new_tokens: int = 256
-    top_p: float = 0.5
