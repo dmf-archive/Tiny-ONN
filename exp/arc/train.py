@@ -1,5 +1,4 @@
 import collections
-import math
 import os
 import random
 import time
@@ -83,10 +82,10 @@ class LearningDynamics:
         for grad_act, spl_in in zip(computation_output_grads, spl_inputs):
             grad_act_sq = torch.sum(grad_act**2, dim=(0, 1))
             spl_in_sq = torch.sum(spl_in**2, dim=(0, 1))
-            
+
             term1 = (spl_in_sq * grad_act_sq.sum()).sqrt()
             term2 = (grad_act_sq * spl_in_sq.sum()).sqrt()
-            
+
             norm = (term1 + term2) / 2.0
             mu_surprise_norms.append(norm)
         return mu_surprise_norms
@@ -111,7 +110,7 @@ class LearningDynamics:
 
         valid_intermediate_grads = [g for g in intermediate_grads if g is not None]
         mu_surprise_norms = self._calculate_mu_surprise_norms(valid_intermediate_grads, clean_spl_inputs)
-        
+
         with torch.no_grad():
             all_goodness = [
                 F.relu(mas_normalize(torch.norm(output_grad, p=2, dim=(0, 1))) - mas_normalize(mu_surprise))
@@ -127,16 +126,6 @@ class LearningDynamics:
         total_meta_loss = self.config.w_route_jsd * avg_route_jsd_loss
 
         avg_carc_loss = torch.tensor(0.0, device=device)
-        if last_routing_logits and last_spl_inputs:
-            reps = [
-                _get_task_representation([t for t in tensor_list if t is not None])
-                for tensor_list in [model_outputs["routing_logits"], last_routing_logits, clean_spl_inputs, last_spl_inputs]
-            ]
-            if all(isinstance(rep, torch.Tensor) for rep in reps):
-                sim_p = F.cosine_similarity(reps[0].unsqueeze(0), reps[1].unsqueeze(0))
-                sim_x = F.cosine_similarity(reps[2].unsqueeze(0), reps[3].unsqueeze(0))
-                avg_carc_loss = torch.abs(sim_p - sim_x.detach()).mean()
-                total_meta_loss += self.config.w_carc * avg_carc_loss
 
         if total_meta_loss > 0:
             meta_grads = torch.autograd.grad(total_meta_loss, self.routing_params, allow_unused=True)
@@ -169,8 +158,6 @@ class Trainer:
         self.checkpoint_dir = Path(__file__).parent / "checkpoints"
         self.checkpoint_dir.mkdir(exist_ok=True)
         self.global_step, self.epoch, self.start_task_idx, self.start_view_idx = 0, 0, 0, 0
-        self.log_cycle_goodness: list[list[torch.Tensor]] = []
-        self.log_cycle_act_rates: list[list[float]] = []
         self.last_spl_inputs: list[torch.Tensor] | None = None
         self.last_routing_logits: list[torch.Tensor] | None = None
         self.replay_queue: collections.deque = collections.deque(maxlen=100)
@@ -199,10 +186,10 @@ class Trainer:
 
     @staticmethod
     def _prepare_batch(task_data: dict, view_idx: int, device: torch.device, serializer: GridSerializer, consistency_tools: ConsistencyTools, max_len: int) -> dict[str, torch.Tensor] | None:
-        
+
         original_train = task_data["train"]
         original_test = task_data["test"]
-        
+
         transformed_train = []
         for pair in original_train:
             input_grid = torch.tensor(pair["input"], device=device)
@@ -222,7 +209,7 @@ class Trainer:
         }]
 
         augmented_task = {"train": transformed_train, "test": transformed_test}
-        
+
         ids, labels, coords = serializer.serialize_task(augmented_task)
         if len(ids) > max_len: return None
         return {
@@ -246,17 +233,20 @@ class Trainer:
         model_outputs.update({"labels": batch["labels"], "sample_entropy": batch["sample_entropy"]})
         metrics = self.observer.calculate_metrics(main_loss, model_outputs, signals, batch["input_ids"], self.model)
 
-        if "goodness_scores" in signals and signals["goodness_scores"]: self.log_cycle_goodness.append(signals["goodness_scores"])
-        if "act_rates" in metrics: self.log_cycle_act_rates.append(metrics["act_rates"])
-
-        consistency_metrics = self._calculate_consistency_metrics(model_outputs.get("routing_logits"), last_view_routing_logits, model_outputs.get("spl_inputs"), self.last_spl_inputs)
 
         signals["raw_weights"] = model_outputs.get("raw_weights")
         self.observer.maybe_log_and_visualize(
-            epoch, self.global_step, task_idx if isinstance(task_idx, int) else -1, view_idx, metrics, time.time() - start_time,
-            signals, self.evaluator, self.eval_loader, task_idx if isinstance(task_idx, int) else -1, self._save_checkpoint,
-            {k: v for k, v in (consistency_metrics or {}).items() if isinstance(v, (float, int))}, self._reinitialize_dead_prototypes_if_needed
-            {k: v for k, v in (consistency_metrics or {}).items() if isinstance(v, (float, int))},
+            epoch,
+            self.global_step,
+            task_idx if isinstance(task_idx, int) else -1,
+            view_idx,
+            metrics,
+            time.time() - start_time,
+            signals,
+            self.evaluator,
+            self.eval_loader,
+            task_idx if isinstance(task_idx, int) else -1,
+            self._save_checkpoint,
         )
 
         self.global_step += 1
@@ -265,11 +255,6 @@ class Trainer:
         torch.cuda.empty_cache()
         return metrics, model_outputs.get("raw_weights"), model_outputs.get("routing_logits"), signals
 
-    def _calculate_consistency_metrics(self, current_logits: list | None, prev_logits: list | None, current_inputs: list | None, prev_inputs: list | None) -> dict | None:
-        if not all([current_logits, prev_logits, current_inputs, prev_inputs]): return None
-        reps = [_get_task_representation([t for t in tensor_list if t is not None]) for tensor_list in [current_logits, prev_logits, current_inputs, prev_inputs]]
-        if not all(isinstance(rep, torch.Tensor) for rep in reps): return None
-        return {"sim_p": F.cosine_similarity(reps[0].unsqueeze(0), reps[1].unsqueeze(0)).item(), "sim_x": F.cosine_similarity(reps[2].unsqueeze(0), reps[3].unsqueeze(0)).item(), "rep_p": reps[0], "rep_x": reps[2]}
 
     def _train_epoch(self, epoch: int):
         dataset = self.train_loader.dataset

@@ -48,12 +48,7 @@ def spl_forward(
     effective_proto = effective_proto.to(model_dtype)
     gate_param = gate_param.to(model_dtype)
 
-    x_norms = torch.norm(x, p=2.0, dim=-1, keepdim=True)
-    x_norm = x / (x_norms + 1e-5)
-    proto_norms = torch.norm(effective_proto, p=2.0, dim=-1, keepdim=True)
-    proto_norm = effective_proto / (proto_norms + 1e-5)
-
-    match_values = F.linear(x_norm, proto_norm)
+    match_values = F.linear(x, effective_proto) / math.sqrt(x.size(-1))
     gate_logit = torch.matmul(x, gate_param.t())
     computation_output = F.linear(x, mu_weight, mu_bias)
 
@@ -264,18 +259,18 @@ class ArcEmbedding(nn.Module):
 
     def forward(self, input_ids: torch.Tensor, coords: torch.Tensor) -> torch.Tensor:
         color_embed = self.color_embedding(input_ids)
-        
+
         row_coords = coords[..., 0]
         col_coords = coords[..., 1]
 
         row_embed = self.row_embedding(row_coords.clamp(min=0, max=30))
         col_embed = self.col_embedding(col_coords.clamp(min=0, max=30))
-        
+
         is_special_token = (coords[..., 0] == -1).unsqueeze(-1)
-        
+
         pos_embed = row_embed + col_embed
         final_embed = color_embed + torch.where(is_special_token, torch.zeros_like(pos_embed), pos_embed)
-        
+
         return final_embed
 
 class ArcTransformer(nn.Module):

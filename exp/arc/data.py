@@ -96,12 +96,8 @@ class InMemoryArcDataset(Dataset):
             with open(path) as f:
                 task_data = json.load(f)
 
-            if split == "training":
-                if "test" in task_data and task_data["test"] and "output" in task_data["test"][0]:
-                    self.tasks.append(task_data)
-            elif split == "evaluation":
-                if "test" in task_data and task_data["test"] and "output" in task_data["test"][0]:
-                    self.tasks.append(task_data)
+            if (split == "training" or split == "evaluation") and "test" in task_data and task_data["test"] and "output" in task_data["test"][0]:
+                self.tasks.append(task_data)
 
         tokenizer_for_sorting = ArcColorTokenizer()
         serializer_for_sorting = GridSerializer(tokenizer_for_sorting)

@@ -29,7 +29,6 @@ tags: ["技术预研", "架构", "多模态", "MoIE", "DynSIHA"]
 **次要问题 (Secondary Questions):**
 
 - **嵌入有效性**: “分层嵌入注入”方案（已在 `exp/arc` 的 [`ArcEmbedding`](exp/arc/model.py:258) 中得到初步验证）在扩展到更多模态（如图像 Patch + 文本）时，能否有效保留各模态的关键信息（如空间几何 vs. 序列顺序）？
-- **元学习可扩展性**: 在 `exp/arc` 中驱动专家分化的 SARS/CARC 元学习框架（见 [`exp/arc/train.py`](exp/arc/train.py:58)），在面对更复杂、更多样化的混合模态数据时，能否继续驱动有意义的、模态感知的专家功能特化？
 - **性能与实现**: `exp/arc` 中基于 `torch.einsum` 的稠密计算实现，在模型规模从 ARC 的 ~0.1B 扩展到 3B/7B 目标时，其预期的性能瓶颈在哪里？与手写稀疏计算的潜在收益相比如何？
 - **Tokenizer 策略**: 由 `word_embed` 支持的小型、基于字符的统一词汇表（如 [`exp/arc/tokenizer.py`](exp/arc/tokenizer.py:4) 中的 16 词汇表概念），能否在保持泛化能力的同时，为大规模语言任务提供足够的表达能力？
 
@@ -61,7 +60,6 @@ tags: ["技术预研", "架构", "多模态", "MoIE", "DynSIHA"]
 
 - **核心架构**: [`exp/arc/model.py`](exp/arc/model.py:1) - `ArcTransformer`, `MoIETransformerBlock`, `SparseProtoLinear`
 - **数据序列化**: [`exp/arc/data.py`](exp/arc/data.py:1) - `GridSerializer`
-- **训练动力学**: [`exp/arc/train.py`](exp/arc/train.py:1) - `LearningDynamics`, JSD/CARC 损失
 
 **依赖项 (Dependencies):** 此项探索是基础性的。所有关于数据预处理、大规模训练策略和模型扩展的未来决策均依赖于本次探索的结论。
 

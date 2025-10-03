@@ -3,7 +3,6 @@ import random
 from typing import Any
 
 import torch
-import torch.nn.functional as F
 from rich.progress import Progress
 from torch.utils.data import DataLoader, Subset
 

@@ -104,7 +104,7 @@ class Observer:
             if flat_logits.numel() > 0:
                 metrics["gate_logit_avg"] = flat_logits.mean().item()
                 metrics["gate_logit_max"] = flat_logits.max().item()
-                metrics["gate_logit_top10_avg"] = flat_logits[flat_logits >= torch.quantile(flat_logits, 0.9)].mean().item()
+                metrics["gate_logit_sigma"] = flat_logits.std().item()
 
         return metrics
 
@@ -116,48 +116,23 @@ class Observer:
         view_idx: int,
         metrics: dict[str, float],
         elapsed_time: float,
-        consistency: dict[str, float] | None,
     ):
         steps_per_sec = 1 / elapsed_time if elapsed_time > 0 else float("inf")
-        title = f"Epoch {epoch} | Step {step} | Task {task_idx}"
-        if view_idx is not None:
-            title += f" | View {view_idx}"
 
-        table = Table(title=title, show_header=True, header_style="bold magenta", expand=True)
-        table.add_column("Loss (Main/JSD/CARC)", justify="center")
-        table.add_column("Acc (Token)", justify="center")
-        table.add_column("τ", justify="center")
-        table.add_column("H(x)", justify="center")
-        table.add_column("Seq Len", justify="center")
-        table.add_column("PI", justify="center")
-        table.add_column("Act % (Avg)", justify="center")
-        table.add_column("Gate Logit (Top10/Avg/Max)", justify="center")
-        table.add_column("Routing Fail % (True ID %)", justify="center")
-        table.add_column("Consist (SimP/SimX)", justify="center")
-        table.add_column("Speed (st/s)", justify="center")
-
-        act_avg = metrics.get("activation_rate_avg", 0.0) * 100
-        if consistency:
-            consistency_str = f"{consistency.get('sim_p', 0.0):.3f}/{consistency.get('sim_x', 0.0):.3f}"
-        else:
-            consistency_str = "N/A"
-        routing_fail_str = f"{metrics.get('routing_failure_rate', 0.0) * 100:.1f}%"
-        identity_str = f"{metrics.get('identity_transform_rate', 0.0) * 100:.1f}%"
-
-        table.add_row(
-            f"{metrics.get('main_loss', 0.0):.3f}/{metrics.get('route_jsd_loss', 0.0):.4f}/{metrics.get('carc_loss', 0.0):.4f}",
-            f"{metrics.get('token_acc', 0.0):.3f}",
-            f"{metrics.get('tau', 0.0):.3f}",
-            f"{metrics.get('sample_entropy', 0.0):.3f}",
-            f"{int(metrics.get('seq_len', 0))}",
-            f"{metrics.get('pi_score', 0.0):.3f}",
-            f"{act_avg:.1f}%",
-            f"{metrics.get('gate_logit_top10_avg', 0.0):.3f}/{metrics.get('gate_logit_avg', 0.0):.3f}/{metrics.get('gate_logit_max', 0.0):.3f}",
-            f"{routing_fail_str} ({identity_str})",
-            consistency_str,
-            f"{steps_per_sec:.2f}",
+        log_str = (
+            f"E{epoch} S{step} T{task_idx} V{view_idx} | "
+            f"L({metrics.get('main_loss', 0.0):.3f}/{metrics.get('route_jsd_loss', 0.0):.4f}) | "
+            f"Acc: {metrics.get('token_acc', 0.0):.3f} | "
+            f"τ: {metrics.get('tau', 0.0):.3f} | "
+            f"H(x): {metrics.get('sample_entropy', 0.0):.3f} | "
+            f"Seq: {int(metrics.get('seq_len', 0))} | "
+            f"PI: {metrics.get('pi_score', 0.0):.3f} | "
+            f"Act%({metrics.get('activation_rate_l0', 0.0)*100:.1f}/{metrics.get('activation_rate_l_mid', 0.0)*100:.1f}/{metrics.get('activation_rate_ln', 0.0)*100:.1f}/{metrics.get('activation_rate_avg', 0.0)*100:.1f}) | "
+            f"Gate({metrics.get('gate_logit_avg', 0.0):.3f}/{metrics.get('gate_logit_sigma', 0.0):.3f}/{metrics.get('gate_logit_max', 0.0):.3f}) | "
+            f"Fail: {metrics.get('routing_failure_rate', 0.0)*100:.1f}% | "
+            f"Speed: {steps_per_sec:.2f} st/s"
         )
-        self.console.print(table)
+        self.console.print(log_str)
 
     def visualize_prototypes(self, signals: dict, global_step: int):
         proto_weights = signals.get("proto_weights", [])
@@ -236,14 +211,11 @@ class Observer:
         eval_loader,
         current_task_idx: int,
         save_checkpoint_fn,
-        consistency: dict[str, float] | None,
-        reinit_fn,
     ):
         if step % self.config.log_interval == 0:
-            self.log_step(epoch, step, task_idx, view_idx, metrics, elapsed_time, consistency)
+            self.log_step(epoch, step, task_idx, view_idx, metrics, elapsed_time)
             self.visualize_prototypes(signals, step)
             save_checkpoint_fn(task_idx, view_idx)
-            reinit_fn()
 
         if step > 0 and step % self.config.eval_interval == 0:
             evaluator.run(eval_loader, current_task_idx, step)
