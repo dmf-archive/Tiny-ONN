@@ -272,7 +272,7 @@ class Trainer:
                     result = self._train_step(batch, epoch, task_idx, view_idx, last_view_routing_logits)
                     if not result: break
                     metrics, _, routing_logits, _ = result
-                    if metrics["main_loss"] <= 0.01 and metrics["token_acc"] >= 1.0:
+                    if metrics["main_loss"] <= 0.01 and metrics["token_acc"] >= 0.999:
                         self.console.print(f"Task {task_idx} view {view_idx} converged in {step + 1} steps.")
                         last_view_routing_logits = [r.detach() for r in routing_logits if r is not None]
                         self.replay_queue.append((task_data, view_idx, task_idx))

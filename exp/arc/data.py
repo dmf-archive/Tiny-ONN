@@ -54,7 +54,7 @@ class GridSerializer:
 
         full_ids.extend([im_start_id] + test_output_ids + [im_end_id])
         full_coords.extend([(-1, -1)] + test_output_coords + [(-1, -1)])
-        labels.extend([-100] + test_output_ids + [-100])
+        labels.extend([-100] + test_output_ids + [im_end_id])
 
         full_ids.append(self.tokenizer.eos_token_id)
         full_coords.append((-1, -1))

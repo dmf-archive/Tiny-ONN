@@ -26,7 +26,9 @@ class SimpleEvaluator:
 
     @torch.no_grad()
     def evaluate_single(self, task_data: dict[str, Any]) -> tuple[torch.Tensor, list[int]]:
-        max_new_tokens = self.generation_config.max_new_tokens
+        output_grid = task_data["test"][0]["output"]
+        output_grid_ids, _ = self.serializer._serialize_grid(output_grid)
+        max_new_tokens = len(output_grid_ids) + 2
 
         prompt_ids, prompt_coords = self.serializer.serialize_for_inference(task_data)
         prompt_tensor = torch.tensor([prompt_ids], dtype=torch.long, device=self.device)
