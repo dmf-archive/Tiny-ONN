@@ -1,6 +1,6 @@
 # Dynamic Function Composition
 
-`Latest update: 2025-10-03`
+`Latest update: 2025-10-04`
 
 ## 摘要
 
@@ -73,8 +73,8 @@ SARS 的最终形态建立在两大基石之上：
 1. **前向贡献 (Forward Contribution, `B_contrib`)**: 定义为专家在前向传播中的**实际输出贡献**。它由经过路由权重缩放后的输出张量 `masked_output` 的 L2 范数来衡量，直接反映了专家对最终结果的“发言权”。
    `B_contrib = ||masked_output||₂`
 
-2. **任务相关性 (Task Relevance, `B_rel`)**: 定义为任务损失对专家输出的**敏感度**。它由主损失对 `masked_output` 的梯度范数来衡量。梯度越大，说明该专家的输出对解决当前任务越关键。
-   `B_rel = ||∇_{masked_output} L_main||₂`
+2. **任务相关性 (Task Relevance, `B_rel`)**: 定义为任务损失对专家**潜在计算贡献**的敏感度。在实践中，它由主损失对路由前的 `computation_output` 张量的梯度范数来衡量。
+   `B_rel = ||∇_{computation_output} L_main||₂`
 
 3. **学习成本 (Learning Cost, `C_learn`)**: 定义为专家为适应当前任务所需付出的**参数扰动成本**。这直接量化了“灾难性遗忘”的风险，由主损失对计算核心 `mu_weight` 的真实参数梯度的 L2 范数来衡量。
    `C_learn = ||∇_{mu_weight} L_main||₂`

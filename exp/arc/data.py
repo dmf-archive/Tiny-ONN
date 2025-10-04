@@ -28,38 +28,37 @@ class GridSerializer:
     def serialize_task(self, task_data: dict[str, Any]) -> tuple[list[int], list[int], list[tuple[int, int]]]:
         full_ids: list[int] = [self.tokenizer.bos_token_id]
         full_coords: list[tuple[int, int]] = [(-1, -1)]
-        labels: list[int] = [-100]
-
+        
         im_start_id = self.tokenizer.vocab["<im_start>"]
         im_end_id = self.tokenizer.vocab["<im_end>"]
 
         for pair in task_data["train"]:
             input_ids, input_coords = self._serialize_grid(pair["input"])
             output_ids, output_coords = self._serialize_grid(pair["output"])
-
+            
             full_ids.extend([im_start_id] + input_ids + [im_end_id])
             full_coords.extend([(-1, -1)] + input_coords + [(-1, -1)])
-            labels.extend([-100] * (len(input_ids) + 2))
-
+            
             full_ids.extend([im_start_id] + output_ids + [im_end_id])
             full_coords.extend([(-1, -1)] + output_coords + [(-1, -1)])
-            labels.extend([-100] * (len(output_ids) + 2))
 
         test_input_ids, test_input_coords = self._serialize_grid(task_data["test"][0]["input"])
-        test_output_ids, test_output_coords = self._serialize_grid(task_data["test"][0]["output"])
-
         full_ids.extend([im_start_id] + test_input_ids + [im_end_id])
         full_coords.extend([(-1, -1)] + test_input_coords + [(-1, -1)])
-        labels.extend([-100] * (len(test_input_ids) + 2))
 
+        target_start_index = len(full_ids)
+
+        test_output_ids, test_output_coords = self._serialize_grid(task_data["test"][0]["output"])
         full_ids.extend([im_start_id] + test_output_ids + [im_end_id])
         full_coords.extend([(-1, -1)] + test_output_coords + [(-1, -1)])
-        labels.extend([-100] + test_output_ids + [im_end_id])
-
         full_ids.append(self.tokenizer.eos_token_id)
         full_coords.append((-1, -1))
-        labels.append(self.tokenizer.eos_token_id)
 
+        labels = list(full_ids[1:]) + [-100] 
+        
+        for i in range(target_start_index):
+            labels[i] = -100
+            
         return full_ids, labels, full_coords
 
     def serialize_for_inference(self, task_data: dict[str, Any]) -> tuple[list[int], list[tuple[int, int]]]:

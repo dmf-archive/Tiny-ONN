@@ -104,6 +104,7 @@ class LearningDynamics:
         self.optimizer_comp.zero_grad()
         self.optimizer_route.zero_grad()
 
+        computation_outputs = model_outputs["computation_outputs"]
         masked_outputs = model_outputs["masked_outputs"]
         mu_weights = []
         for i in range(self.config.model.num_layers):
@@ -113,16 +114,16 @@ class LearningDynamics:
                 block.attn.spl_o.mu_weight, block.ffn.spl1.mu_weight, block.ffn.spl2.mu_weight,
             ])
 
-        params_to_grad = self.computation_params + mu_weights + masked_outputs
+        params_to_grad = self.computation_params + computation_outputs + mu_weights
         all_grads = torch.autograd.grad(main_loss, params_to_grad, retain_graph=True, allow_unused=True)
 
         len_comp = len(self.computation_params)
-        len_mu = len(mu_weights)
+        len_comp_out = len(computation_outputs)
         comp_grads = all_grads[:len_comp]
-        mu_weight_grads = all_grads[len_comp : len_comp + len_mu]
-        masked_output_grads = all_grads[len_comp + len_mu :]
+        intermediate_grads = all_grads[len_comp : len_comp + len_comp_out]
+        mu_weight_grads = all_grads[len_comp + len_comp_out :]
 
-        c_output_grads = [g for g in masked_output_grads if g is not None]
+        c_output_grads = [g for g in intermediate_grads if g is not None]
         c_output_norms = [torch.norm(g, p=2, dim=(0, 1)) for g in c_output_grads]
         c_param_norms = [torch.norm(g, p=2, dim=-1) for g in mu_weight_grads if g is not None]
         i_effective_norms = [torch.norm(mo, p=2, dim=(0, 1)) for mo in masked_outputs if mo is not None]
