@@ -4,8 +4,8 @@ from dataclasses import dataclass, field
 @dataclass
 class ModelConfig:
     vocab_size: int = 16
-    hidden_size: int = 768
-    num_layers: int = 6
+    hidden_size: int = 512
+    num_layers: int = 8
     max_position_embeddings: int = 4096
     d_ffn_factor: int = 1
     routing_gain: float = 10.0
@@ -30,7 +30,7 @@ class TrainConfig:
     device: str = "cuda"
     seed: int = 42
 
-    eval_interval: int = 1000
+    eval_interval: int = 2500
     log_interval: int = 10
     max_checkpoints: int = 3
 

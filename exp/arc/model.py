@@ -174,11 +174,15 @@ class MoIETransformerBlock(nn.Module):
 
         ln1_out = self.ln1(x)
         c_q, mv_q, pc_q = self.attn.spl_q(ln1_out, effective_protos["attn_q"])
+        c_q = ln1_out + c_q
         c_k, mv_k, pc_k = self.attn.spl_k(ln1_out, effective_protos["attn_k"])
+        c_k = ln1_out + c_k
         c_v, mv_v, pc_v = self.attn.spl_v(ln1_out, effective_protos["attn_v"])
+        c_v = ln1_out + c_v
 
         ln2_out = self.ln2(x)
         c1, mv1, pc1 = self.ffn.spl1(ln2_out, effective_protos["ffn_spl1"])
+        c1 = ln2_out + c1
 
         dummy_h_act = torch.zeros(
             ln2_out.shape[0],
@@ -220,6 +224,7 @@ class MoIETransformerBlock(nn.Module):
         attn_out = F.scaled_dot_product_attention(q, k, v, is_causal=past_kv is None)
 
         c_o, mv_o, pc_o = self.attn.spl_o(attn_out, effective_protos["attn_o"])
+        c_o = attn_out + c_o
         cost_score_o = mas_normalize(pc_o)
         routing_logits_o = (mv_o - cost_score_o) * self.routing_gain
         rw_o = mas_normalize(routing_logits_o)
@@ -233,6 +238,7 @@ class MoIETransformerBlock(nn.Module):
         h_act = F.relu(m1)
 
         c2, mv2, pc2 = self.ffn.spl2(h_act, effective_protos["ffn_spl2"])
+        c2 = h_act + c2
         cost_score_f2 = mas_normalize(pc2)
         routing_logits_f2 = (mv2 - cost_score_f2) * self.routing_gain
         rw_f2 = mas_normalize(routing_logits_f2)
