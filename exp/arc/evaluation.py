@@ -3,8 +3,8 @@ import random
 from typing import Any
 
 import torch
-from torch.nn.attention import SDPBackend, sdpa_kernel
 from rich.progress import Progress
+from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch.utils.data import DataLoader, Subset
 
 from .config import TrainConfig

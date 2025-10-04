@@ -7,8 +7,8 @@ from typing import Any
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.nn.attention import SDPBackend, sdpa_kernel
 from rich.console import Console
+from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch.utils.data import DataLoader
 
 from .config import TrainConfig
@@ -156,7 +156,6 @@ class LearningDynamics:
         avg_route_jsd_loss = torch.stack(meta_losses).mean() if meta_losses else torch.tensor(0.0, device=device)
         total_meta_loss = self.config.w_route_jsd * avg_route_jsd_loss
 
-        avg_carc_loss = torch.tensor(0.0, device=device)
 
         if total_meta_loss > 0:
             meta_grads = torch.autograd.grad(total_meta_loss, self.routing_params, allow_unused=True)
@@ -171,7 +170,6 @@ class LearningDynamics:
 
         return {
             "route_jsd_loss": avg_route_jsd_loss,
-            "carc_loss": avg_carc_loss,
             "mu_surprises": c_param_norms,
             "goodness_scores": all_goodness,
             "goodness_logits": all_goodness_logits,

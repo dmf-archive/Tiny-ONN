@@ -79,7 +79,6 @@ class Observer:
             "token_acc": acc,
             "pi_score": pi_score,
             "route_jsd_loss": signals.get("route_jsd_loss", torch.tensor(0.0)).item(),
-            "carc_loss": signals.get("carc_loss", torch.tensor(0.0)).item(),
             "sample_entropy": model_outputs.get("sample_entropy", torch.tensor(0.0)).mean().item(),
             "tau": (
                 -torch.sum(F.softmax(active_logits, dim=-1) * F.log_softmax(active_logits, dim=-1), dim=-1)
