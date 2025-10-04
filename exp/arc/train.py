@@ -7,6 +7,7 @@ from typing import Any
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.attention import SDPBackend, sdpa_kernel
 from rich.console import Console
 from torch.utils.data import DataLoader
 
@@ -263,9 +264,14 @@ class Trainer:
     def _train_step(self, batch: dict, epoch: int, task_idx: int | str, view_idx: int, last_view_routing_logits: list | None) -> tuple | None:
         start_time = time.time()
         self.model.train()
-        with torch.autocast(device_type=self.config.device, dtype=torch.bfloat16):
-            model_outputs = self.model(batch["input_ids"], coords=batch["coords"], return_dict=True)
-            main_loss = F.cross_entropy(model_outputs["logits"][:, :-1, :].contiguous().view(-1, self.config.model.vocab_size), batch["labels"][:, 1:].contiguous().view(-1), ignore_index=-100)
+        with sdpa_kernel(SDPBackend.EFFICIENT_ATTENTION):
+            with torch.autocast(device_type=self.config.device, dtype=torch.float32):
+                model_outputs = self.model(batch["input_ids"], coords=batch["coords"], return_dict=True)
+                main_loss = F.cross_entropy(
+                    model_outputs["logits"][:, :-1, :].contiguous().view(-1, self.config.model.vocab_size),
+                    batch["labels"][:, 1:].contiguous().view(-1),
+                    ignore_index=-100,
+                )
 
         if not torch.isfinite(main_loss):
             self.console.print(f"[bold red]NaN detected in main_loss at step {self.global_step}. Aborting step.[/bold red]")

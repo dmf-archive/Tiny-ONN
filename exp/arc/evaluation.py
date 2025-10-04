@@ -3,6 +3,7 @@ import random
 from typing import Any
 
 import torch
+from torch.nn.attention import SDPBackend, sdpa_kernel
 from rich.progress import Progress
 from torch.utils.data import DataLoader, Subset
 
@@ -43,11 +44,15 @@ class SimpleEvaluator:
 
         current_r, current_c = 0, -1
 
-        with torch.autocast(device_type=self.device.type, dtype=torch.bfloat16):
+        with sdpa_kernel(SDPBackend.EFFICIENT_ATTENTION), torch.autocast(
+            device_type=self.device.type, dtype=torch.float16
+        ):
             for _ in range(max_new_tokens):
                 model_input = tokens if past_key_values is None else tokens[:, -1:]
                 coords_input = coords if past_key_values is None else coords[:, -1:]
-                outputs = self.model(model_input, coords=coords_input, past_key_values=past_key_values, return_dict=True)
+                outputs = self.model(
+                    model_input, coords=coords_input, past_key_values=past_key_values, return_dict=True
+                )
                 logits = outputs["logits"]
                 past_key_values = outputs["past_key_values"]
 

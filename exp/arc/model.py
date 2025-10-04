@@ -221,7 +221,11 @@ class MoIETransformerBlock(nn.Module):
             k = torch.cat([past_kv[0], k], dim=1)
             v = torch.cat([past_kv[1], v], dim=1)
         present_kv = (k, v)
+        q = q.unsqueeze(1)
+        k = k.unsqueeze(1)
+        v = v.unsqueeze(1)
         attn_out = F.scaled_dot_product_attention(q, k, v, is_causal=past_kv is None)
+        attn_out = attn_out.squeeze(1)
 
         c_o, mv_o, pc_o = self.attn.spl_o(attn_out, effective_protos["attn_o"])
         c_o = attn_out + c_o
@@ -281,7 +285,7 @@ class ArcTransformer(nn.Module):
     def __init__(self, config: ModelConfig, device: torch.device | str):
         super().__init__()
         self.config, self.device = config, device
-        dtype = torch.bfloat16
+        dtype = torch.float32
         self.embedding = torch.jit.script(ArcEmbedding(config, dtype=dtype))
         self.rotary_emb = RotaryEmbedding(
             dim=config.hidden_size, max_position_embeddings=config.max_position_embeddings, device=device, dtype=dtype

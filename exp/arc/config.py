@@ -8,7 +8,7 @@ class ModelConfig:
     num_layers: int = 6
     max_position_embeddings: int = 4096
     d_ffn_factor: int = 1
-    routing_gain: float = 10.0
+    routing_gain: float = 1.0
 
 @dataclass
 class DataConfig:
