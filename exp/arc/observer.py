@@ -62,7 +62,7 @@ class Observer:
         complexity_cost = sum(all_surp_norms) if all_surp_norms else 0.0
         pi_score = torch.exp(-1.0 * main_loss.detach() - 1.0 * complexity_cost).item()
 
-        num_spl_modules = self.config.model.num_layers * 6
+        num_spl_modules = self.config.model.num_layers * 4
         act_rates = [0.0] * num_spl_modules
         if raw_weights:
             act_rates = [rw.gt(0).float().mean().item() for rw in raw_weights]
@@ -89,9 +89,9 @@ class Observer:
             ),
             "seq_len": float(labels.shape[1]),
             "activation_rate_avg": sum(act_rates) / len(act_rates) if act_rates else 0.0,
-            "activation_rate_l0": sum(act_rates[:6]) / 6 if act_rates else 0.0,
-            "activation_rate_l_mid": sum(act_rates[num_layers * 3 : num_layers * 3 + 6]) / 6 if len(act_rates) > num_layers * 3 + 6 else 0.0,
-            "activation_rate_ln": sum(act_rates[-6:]) / 6 if act_rates else 0.0,
+            "activation_rate_l0": sum(act_rates[:4]) / 4 if act_rates else 0.0,
+            "activation_rate_l_mid": sum(act_rates[num_layers * 2 : num_layers * 2 + 4]) / 4 if len(act_rates) > num_layers * 2 + 4 else 0.0,
+            "activation_rate_ln": sum(act_rates[-4:]) / 4 if act_rates else 0.0,
             "act_rates": act_rates,
             "routing_failure_rate": routing_failure_rate,
             "identity_transform_rate": identity_transform_rate,
@@ -141,13 +141,13 @@ class Observer:
         if not proto_weights or not raw_weights or not goodness_logits:
             return
 
-        num_spl = 6
+        num_spl = 4
         num_layers = self.config.model.num_layers
 
-        fig, axes = plt.subplots(num_layers, num_spl, figsize=(20, 5 * num_layers), squeeze=False)
-        fig.suptitle(f"Prototype Goodness Distribution @ Step {global_step}", fontsize=16)
+        fig, axes = plt.subplots(num_layers, num_spl, figsize=(15, 5 * num_layers), squeeze=False)
+        fig.suptitle(f"Prototype Distribution @ Step {global_step}", fontsize=16)
         color_map = {"good": "green", "bad": "red", "inactive": "grey"}
-        names = ["attn_q", "attn_k", "attn_v", "attn_o", "ffn_spl1", "ffn_spl2"]
+        names = ["attn_q", "attn_k", "attn_v", "attn_o"]
 
         for i in range(num_layers):
             for j in range(num_spl):

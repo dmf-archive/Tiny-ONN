@@ -109,10 +109,14 @@ class LearningDynamics:
         mu_weights = []
         for i in range(self.config.model.num_layers):
             block = self.model.blocks[i]
-            mu_weights.extend([
-                block.attn.spl_q.mu_weight, block.attn.spl_k.mu_weight, block.attn.spl_v.mu_weight,
-                block.attn.spl_o.mu_weight, block.ffn.spl1.mu_weight, block.ffn.spl2.mu_weight,
-            ])
+            mu_weights.extend(
+                [
+                    block.attn.spl_q.mu_weight,
+                    block.attn.spl_k.mu_weight,
+                    block.attn.spl_v.mu_weight,
+                    block.attn.spl_o.mu_weight,
+                ]
+            )
 
         params_to_grad = self.computation_params + computation_outputs + mu_weights
         all_grads = torch.autograd.grad(main_loss, params_to_grad, retain_graph=True, allow_unused=True)
