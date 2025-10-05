@@ -6,6 +6,7 @@
 
 - `pytorch/pytorch`
 - `LINs-lab/DynMoE`
+- `da-fr/arc-prize-2024`
 
 ## 标准预制件
 
