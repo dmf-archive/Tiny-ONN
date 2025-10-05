@@ -232,6 +232,7 @@ class Observer:
         target_grid: torch.Tensor,
         pred_grid: torch.Tensor | None,
         pred_tokens_decoded: str | None,
+        probabilities: list[float] | None,
         step: int,
     ):
         self.console.print()
@@ -258,6 +259,10 @@ class Observer:
             self.console.print(pred_tokens_decoded)
         else:
             self.console.print("[bold]Generated Token Stream:[/bold] [red]N/A[/red]")
+
+        if probabilities:
+            prob_str = " ".join([f"{p:.2f}" for p in probabilities])
+            self.console.print(f"[bold]Probabilities:[/bold] {prob_str}")
 
         self.console.print()
 

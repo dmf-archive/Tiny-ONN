@@ -119,6 +119,7 @@ class MoIETransformerBlock(nn.Module):
     def __init__(self, config: ModelConfig, dtype: torch.dtype = torch.float32):
         super().__init__()
         self.ln1 = nn.LayerNorm(config.hidden_size, eps=1e-5)
+        self.d_model = config.hidden_size
         self.attn = DynamicInfiniteHeadAttention(config, dtype=dtype)
         self.routing_gain = config.routing_gain
         self.proto_transforms = nn.ModuleDict(
@@ -186,15 +187,25 @@ class MoIETransformerBlock(nn.Module):
 
         cos, sin = pos_emb
         q, k = apply_rotary_pos_emb(q, k, cos, sin)
+
+        batch_size, seq_len, _ = q.shape
+        num_heads = 1
+        head_dim = self.d_model
+        
+        q = q.view(batch_size, seq_len, num_heads, head_dim).transpose(1, 2)
+        k = k.view(batch_size, seq_len, num_heads, head_dim).transpose(1, 2)
+        v = v.view(batch_size, seq_len, num_heads, head_dim).transpose(1, 2)
+
         if past_kv is not None:
-            k = torch.cat([past_kv[0], k], dim=1)
-            v = torch.cat([past_kv[1], v], dim=1)
+            past_k, past_v = past_kv
+            k = torch.cat([past_k, k], dim=-2)
+            v = torch.cat([past_v, v], dim=-2)
+
         present_kv = (k, v)
-        q = q.unsqueeze(1)
-        k = k.unsqueeze(1)
-        v = v.unsqueeze(1)
-        attn_out = F.scaled_dot_product_attention(q, k, v, is_causal=past_kv is None)
-        attn_out = attn_out.squeeze(1)
+        
+        is_causal = past_kv is None
+        attn_out = F.scaled_dot_product_attention(q, k, v, is_causal=is_causal)
+        attn_out = attn_out.transpose(1, 2).contiguous().view(batch_size, seq_len, self.d_model)
 
         c_o, mv_o, pc_o = self.attn.spl_o(attn_out, outgoing_proto_state["attn_o"])
         c_o = attn_out + c_o

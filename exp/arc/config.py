@@ -11,15 +11,24 @@ class ModelConfig:
     routing_gain: float = 1.0
 
 @dataclass
+class GenerationConfig:
+    use_dfs: bool = False
+    min_prob: float = 0.9
+    eos_token_id: int = 2
+
+
+@dataclass
 class DataConfig:
     data_path: str = "data/ARC-AGI-2/data"
     batch_size: int = 1
     num_workers: int = 4
 
+
 @dataclass
 class TrainConfig:
     model: ModelConfig = field(default_factory=ModelConfig)
     data: DataConfig = field(default_factory=DataConfig)
+    generation: GenerationConfig = field(default_factory=GenerationConfig)
 
     lr: float = 1e-3
 
