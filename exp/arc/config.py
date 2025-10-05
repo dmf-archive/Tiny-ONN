@@ -35,6 +35,7 @@ class TrainConfig:
     w_route_jsd: float = 1.1
 
     num_epochs: int = 20
+    num_augmentation_views: int = 2
 
     device: str = "cuda"
     seed: int = 42

@@ -312,7 +312,14 @@ class Trainer:
             task_data = dataset[task_idx]
             last_view_routing_logits = None
             start_view = self.start_view_idx if task_idx == self.start_task_idx else 0
-            for view_idx in range(start_view, 8):
+            
+            all_views = list(range(8))
+            if start_view > 0:
+                selected_views = all_views[start_view:]
+            else:
+                selected_views = random.sample(all_views, self.config.num_augmentation_views)
+
+            for view_idx in selected_views:
                 batch_cpu = self._prepare_batch(
                     task_data, view_idx, self.config.model.max_position_embeddings
                 )
