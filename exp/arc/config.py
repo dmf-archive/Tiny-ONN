@@ -14,7 +14,7 @@ class ModelConfig:
 class DataConfig:
     data_path: str = "data/ARC-AGI-2/data"
     batch_size: int = 1
-    num_workers: int = 2
+    num_workers: int = 4
 
 @dataclass
 class TrainConfig:

@@ -1,49 +1,34 @@
 # Tiny-ONN 出版策略与论文大纲 (草案)
 
-**核心策略**: 优先完成 ARC 奖项所需的论文（论文 3），同步推进实验以支持其论点。在 ARC 截止日期后，回头系统性地整理和发表关于底层架构（论文 1）和宏观理论框架（论文 2）的论文。
+**核心策略**: 优先完成 ARC 奖项所需的论文（论文 2），同步推进实验以支持其论点。在 ARC 截止日期后，回头系统性地整理和发表关于理论框架（论文 1）的论文。
 
 ---
 
-## 论文 1 (后续发表): 基础架构
+## 论文 1 (后续发表): 统一理论框架
 
-- **拟定标题**: _Sparse Proto Linear (SPL): A Self-Organizing Building Block for Dynamic Neural Computation_
-- **目标期刊/会议**: ICLR, NeurIPS
+- **拟定标题**: _Sparse Proto-Routing as Variational Free Energy Minimization: A Unified Framework for Deep Active Inference_
+- **目标期刊/会议**: TMLR, ICLR, Nature Communications, NeuralPS
 - **摘要 (Abstract)**:
-  > We introduce Sparse Proto Linear (SPL), a novel, self-organizing linear layer designed to replace standard dense layers in neural networks. SPL decouples its parameters into a computational core (`mu_weight`), a perceptual pattern matcher (`proto_weight`), and a memory-based gate (`gate_param`). By employing a pure content-addressing mechanism via normalized cosine similarity and a memory-driven meta-learning rule (MSAPS), SPL can dynamically compose specialized computational functions for each input. Our formulation includes a parameter-free adaptive learning mechanism that effectively balances knowledge preservation and plasticity, mitigating catastrophic forgetting. We demonstrate that SPL serves as a robust and efficient building block for creating dynamic, sparse, and continually learning neural architectures.
+  > We present a unified framework that operationalizes the Free-Energy Principle (FEP) for deep neural networks through a novel mechanism termed Sparse Proto-Routing. This framework treats meta-learning as an active inference process, where the network minimizes a tractable proxy for variational free energy by dynamically selecting and composing computational pathways. We introduce the Sparse Proto Linear (SPL) layer, a self-organizing building block that decouples parameters into a computational core, a perceptual pattern matcher, and a routing gate. The routing decisions are guided by a meta-learning objective, Surprise-Aware Routing Shaping (SARS), which aligns the network's routing distribution with an ideal expert utility distribution derived from the main task's gradient signals. This dual-optimizer architecture allows the agent to rapidly adapt its computational strategy (inference) while stably updating its world model (learning). We demonstrate that this approach not only provides a first-principles derivation for dynamic sparse computation but also naturally mitigates catastrophic forgetting, paving the way for more general and adaptive AI systems.
 - **大纲 (Outline)**:
-  1. **Introduction**: 现有静态、同质化神经网络层的局限性。引出对动态、自组织计算的需求。
-  2. **From SBL to SPL**: 介绍从稀疏贝叶斯线性层 (SBL) 到稀疏原型线性层 (SPL) 的演进，重点阐述为解决梯度冲突和灾难性遗忘所做的改进。
-  3. **The Sparse Proto Linear (SPL) Layer**:
-     - 3.1. Parameter Decoupling: `mu`, `proto`, and `gate` auras.
-     - 3.2. Pure Content-Addressing: The role of L2 normalization in eliminating norm pollution.
-     - 3.3. Memory-Surprise-Aware Prototype Shaping (MSAPS): The core meta-learning dynamic.
-     - 3.4. Adaptive Dynamics: Inertia and Decay weights for parameter-free learning rate and weight decay adaptation.
-  4. **Experiments**: 在合成任务上验证 SPL 的基本属性（稀疏性、抗遗忘、自组织聚类）。
-  5. **Conclusion**: 总结 SPL 作为下一代神经网络基础构建块的潜力。
+  1. **Introduction**: The challenge of building adaptive and continually learning AI. Introduce the Free-Energy Principle (FEP) as a guiding theory and propose our work as its computational operationalization.
+  2. **Theoretical Foundation: From FEP to Surprise-Aware Routing Shaping (SARS)**:
+     - 2.1. Variational Free Energy as the Objective.
+     - 2.2. "Surprise" (Gradient Norm) as a Signal for Inference.
+     - 2.3. SARS: Framing Meta-Learning as Distribution Alignment between routing policy `P` and expert utility `Q`.
+  3. **The Computational Substrate: Sparse Proto Linear (SPL)**:
+     - 3.1. Decoupling Computation, Perception, and Action (Routing).
+     - 3.2. SPL as a VQ-VAE Analogue: The role of `mu`, `proto`, and `gate`.
+  4. **The Unified Framework in Action**:
+     - 4.1. The Dual-Optimizer Action-Perception Loop.
+     - 4.2. How Sparse Proto-Routing Minimizes Free Energy.
+     - 4.3. Emergent Properties: Dynamic sparsity, mitigation of catastrophic forgetting.
+  5. **Experiments**: Validation on synthetic tasks demonstrating the core properties of the framework.
+  6. **Conclusion**: Proposing this framework as a principled path towards deep active inference.
 
 ---
 
-## 论文 2 (后续发表): 理论框架
-
-- **拟定标题**: _Predictive Integrity Maximization: A Computational Framework for Meta-Learning Inspired by the Free-Energy Principle_
-- **目标期刊/会议**: TMLR, Cognitive Science, Nature Communications
-- **摘要 (Abstract)**:
-  > Inspired by the Free-Energy Principle (FEP) in neuroscience, we propose Predictive Integrity Maximization (PIMax), a novel meta-learning framework for training intelligent agents. PIMax frames learning as an active inference process that seeks to maximize a computationally tractable proxy for the system's variational free energy, termed Predictive Integrity (PI). We operationalize this framework using a dual-optimizer architecture, where a fast meta-optimizer performs inference over the system's internal configuration (e.g., routing strategies) to minimize "surprise," while a slow main optimizer updates the system's world model. This dual-timescale dynamic allows the agent to rapidly adapt its computational strategy while stably accumulating knowledge. We argue that PIMax provides a unifying theoretical lens for understanding the emergence of complex, self-organizing behaviors in artificial neural networks.
-- **大纲 (Outline)**:
-  1. **Introduction**: AI 中元学习的挑战。介绍 FEP 作为生物智能的统一理论，并提出其在 AI 中的应用潜力。
-  2. **Theoretical Foundation: Integrated Predictive Workspace Theory (IPWT)**:
-     - 2.1. From FEP to Predictive Integrity (PI): 推导 PI 作为自由能的可计算代理。
-     - 2.2. The PI Score: Formalizing inaccuracy and complexity costs.
-  3. **The PIMax Framework**:
-     - 3.1. Dual Optimizers as an Action-Perception Loop.
-     - 3.2. "Surprise" as the Gradient Field: SAPS as the inference engine.
-     - 3.3. The World Model as the Generative Model.
-  4. **Connecting to Other Theories**: 讨论 PIMax 与现有元学习算法（如 MAML, Reptile）和持续学习方法的关系。
-  5. **Conclusion**: 展望 PIMax 作为构建更通用、更自适应 AI 的理论基础。
-
----
-
-## 论文 3 (优先发表, 目标 ARC 奖): 应用与涌现
+## 论文 2 (优先发表, 目标 ARC 奖): 应用与涌现
 
 - **拟定标题**: _Emergent Differentiable Program Search for Abstract Reasoning in Transformers_
 - **目标**: ARC Prize Paper Reward
@@ -62,5 +47,5 @@
   4. **Results on ARC-AGI**:
      - 4.1. Quantitative Results: 展示在 ARC-AGI-2 评估集上的性能，并与其他 SOTA 方法进行对比。
      - 4.2. Qualitative Analysis: 可视化具体任务的求解过程，展示动态生成的稀疏计算图。
-     - 4.3. Causal Solidification: 分析 `gate_param` 的演化，展示模型如何“记住”并固化成功的计算路径。
+     - 4.3. Causal Solidification: 分析 `proto` 的演化，展示模型如何“记住”并固化成功的计算路径。
   5. **Conclusion**: 总结我们的方法作为一种新的“可微程序搜索”范式的潜力，并讨论其对未来 AGI 研究的启示。

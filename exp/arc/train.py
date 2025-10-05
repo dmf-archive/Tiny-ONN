@@ -322,7 +322,7 @@ class Trainer:
                     k: v.to(self.device) for k, v in batch_cpu.items() if isinstance(v, torch.Tensor)
                 }
                 converged = False
-                for step in range(500):
+                for step in range(100):
                     result = self._train_step(batch, epoch, task_idx, view_idx, last_view_routing_logits)
                     if not result:
                         break
