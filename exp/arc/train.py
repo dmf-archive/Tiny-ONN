@@ -27,7 +27,7 @@ def _jsd_from_distributions(p_dist_unnorm: torch.Tensor, q_dist_unnorm: torch.Te
     m_dist = 0.5 * (p_dist + q_dist)
     kl_p_m = torch.sum(p_dist * (torch.log(p_dist + epsilon) - torch.log(m_dist + epsilon)), dim=-1)
     kl_q_m = torch.sum(q_dist * (torch.log(q_dist + epsilon) - torch.log(m_dist + epsilon)), dim=-1)
-    return (0.5 * kl_p_m + 0.5 * kl_q_m).mean()
+    return 0.5 * kl_p_m + 0.5 * kl_q_m
 
 
 def _get_task_representation(tensors: list[torch.Tensor]) -> torch.Tensor | None:
@@ -73,6 +73,44 @@ def _augment_and_map_kernel(grids: list[torch.Tensor], transform_idx: int, color
     return transformed_grids
 
 
+@torch.jit.script
+def _calculate_goodness_jit(
+    masked_outputs: list[torch.Tensor],
+    captured_spl_grad_outputs: list[torch.Tensor],
+    captured_spl_inputs: list[torch.Tensor],
+) -> tuple[list[torch.Tensor], list[torch.Tensor], list[torch.Tensor]]:
+    all_goodness: list[torch.Tensor] = []
+    all_goodness_logits: list[torch.Tensor] = []
+    all_mu_surprises: list[torch.Tensor] = []
+
+    num_modules = len(masked_outputs)
+    for i in range(num_modules):
+        grad_output = captured_spl_grad_outputs[i]
+        x = captured_spl_inputs[i]
+        masked_output = masked_outputs[i]
+
+        b_contrib_token = torch.abs(masked_output)
+        b_rel_token = torch.abs(grad_output)
+
+        per_token_grad_weight = torch.einsum("bso,bsi->bsoi", grad_output, x)
+        c_learn_token = torch.norm(per_token_grad_weight, p=2, dim=-1)
+        
+        all_mu_surprises.append(torch.mean(c_learn_token, dim=(0, 1)))
+
+        benefit_eff_token = mas_normalize(b_contrib_token)
+        benefit_rel_token = mas_normalize(b_rel_token)
+        synergistic_benefit_token = mas_normalize(benefit_eff_token * benefit_rel_token)
+
+        learning_cost_token = mas_normalize(c_learn_token)
+
+        goodness_logits_token = synergistic_benefit_token / (learning_cost_token + 1e-9)
+        
+        all_goodness_logits.append(goodness_logits_token)
+        all_goodness.append(F.relu(goodness_logits_token))
+
+    return all_goodness, all_goodness_logits, all_mu_surprises
+
+
 class LearningDynamics:
     def __init__(
         self,
@@ -99,74 +137,35 @@ class LearningDynamics:
         return _jsd_from_distributions(p_dist_unnorm, q_dist_unnorm)
 
     def compute_and_apply_gradients(
-        self, main_loss: torch.Tensor, model_outputs: dict, device: torch.device, last_routing_logits: list[torch.Tensor] | None, last_spl_inputs: list[torch.Tensor] | None
+        self,
+        main_loss: torch.Tensor,
+        model_outputs: dict,
+        device: torch.device,
+        captured_spl_inputs: list[torch.Tensor],
+        captured_spl_grad_outputs: list[torch.Tensor],
     ) -> dict[str, Any]:
         self.optimizer_comp.zero_grad()
         self.optimizer_route.zero_grad()
 
-        computation_outputs = model_outputs["computation_outputs"]
+        main_loss.backward(retain_graph=True)
+
         masked_outputs = model_outputs["masked_outputs"]
-        mu_weights = []
-        for i in range(self.config.model.num_layers):
-            block = self.model.blocks[i]
-            mu_weights.extend(
-                [
-                    block.attn.spl_q.mu_weight,
-                    block.attn.spl_k.mu_weight,
-                    block.attn.spl_v.mu_weight,
-                    block.attn.spl_o.mu_weight,
-                ]
-            )
 
-        params_to_grad = self.computation_params + computation_outputs + mu_weights
-        all_grads = torch.autograd.grad(main_loss, params_to_grad, retain_graph=True, allow_unused=True)
-
-        len_comp = len(self.computation_params)
-        len_comp_out = len(computation_outputs)
-        comp_grads = all_grads[:len_comp]
-        intermediate_grads = all_grads[len_comp : len_comp + len_comp_out]
-        mu_weight_grads = all_grads[len_comp + len_comp_out :]
-
-        c_output_grads = [g for g in intermediate_grads if g is not None]
-        c_output_norms = [torch.norm(g, p=2, dim=(0, 1)) for g in c_output_grads]
-        c_param_norms = [torch.norm(g, p=2, dim=-1) for g in mu_weight_grads if g is not None]
-        i_effective_norms = [torch.norm(mo, p=2, dim=(0, 1)) for mo in masked_outputs if mo is not None]
-
-        with torch.no_grad():
-            all_goodness = []
-            all_goodness_logits = []
-            num_modules = min(len(i_effective_norms), len(c_output_norms), len(c_param_norms))
-            for i in range(num_modules):
-                i_eff, c_out, c_param = i_effective_norms[i], c_output_norms[i], c_param_norms[i]
-                if not (i_eff.shape == c_out.shape == c_param.shape): continue
-                benefit_eff = mas_normalize(i_eff)
-                benefit_rel = mas_normalize(c_out)
-                synergistic_benefit = mas_normalize(benefit_eff * benefit_rel)
-                learning_cost = mas_normalize(c_param)
-                goodness_logits = synergistic_benefit / (learning_cost + 1e-9)
-                all_goodness_logits.append(goodness_logits)
-                all_goodness.append(F.relu(goodness_logits))
-
-        with torch.no_grad():
-            for param, grad in zip(self.computation_params, comp_grads):
-                if grad is not None:
-                    param.grad = grad.clone()
+        all_goodness, all_goodness_logits, all_mu_surprises = _calculate_goodness_jit(
+            masked_outputs, captured_spl_grad_outputs, captured_spl_inputs
+        )
 
         meta_losses = [
             self._calculate_jsd_loss(logit, good)
             for logit, good in zip(model_outputs["routing_logits"], all_goodness)
-            if logit.numel() > 0 and good.numel() > 0 and logit.shape[-1] == good.shape[-1]
+            if logit.numel() > 0 and good.numel() > 0 and logit.shape == good.shape
         ]
+        
         avg_route_jsd_loss = torch.stack(meta_losses).mean() if meta_losses else torch.tensor(0.0, device=device)
         total_meta_loss = self.config.w_route_jsd * avg_route_jsd_loss
 
-
         if total_meta_loss > 0:
-            meta_grads = torch.autograd.grad(total_meta_loss, self.routing_params, allow_unused=True)
-            with torch.no_grad():
-                for param, grad in zip(self.routing_params, meta_grads):
-                    if grad is not None:
-                        param.grad = grad.clone()
+            total_meta_loss.backward()
 
         torch.nn.utils.clip_grad_norm_(self.computation_params, max_norm=1.0)
         self.optimizer_comp.step()
@@ -174,7 +173,7 @@ class LearningDynamics:
 
         return {
             "route_jsd_loss": avg_route_jsd_loss,
-            "mu_surprises": c_param_norms,
+            "mu_surprises": all_mu_surprises,
             "goodness_scores": all_goodness,
             "goodness_logits": all_goodness_logits,
             "proto_weights": [p.detach() for name, p in self.routing_params_with_names if "proto_weight" in name],
@@ -193,8 +192,8 @@ class Trainer:
         self.checkpoint_dir = Path(__file__).parent / "checkpoints"
         self.checkpoint_dir.mkdir(exist_ok=True)
         self.global_step, self.epoch, self.start_task_idx, self.start_view_idx = 0, 0, 0, 0
-        self.last_spl_inputs: list[torch.Tensor] | None = None
-        self.last_routing_logits: list[torch.Tensor] | None = None
+        self.captured_spl_inputs: list[torch.Tensor] = []
+        self.captured_spl_grad_outputs: list[torch.Tensor] = []
 
     def _setup_data(self):
         collator = ArcCollator(self.tokenizer, max_len=self.config.model.max_position_embeddings)
@@ -263,12 +262,22 @@ class Trainer:
             "sample_entropy": torch.tensor([ArcCollator._calculate_sample_entropy(labels)], dtype=torch.float32),
         }
 
-    def _train_step(self, batch: dict, epoch: int, task_idx: int | str, view_idx: int, last_view_routing_logits: list | None) -> tuple | None:
+    def _train_step(self, batch: dict, epoch: int, task_idx: int | str, view_idx: int) -> tuple | None:
         start_time = time.time()
         self.model.train()
+        
+        self.captured_spl_inputs.clear()
+        self.captured_spl_grad_outputs.clear()
+
         with sdpa_kernel(SDPBackend.EFFICIENT_ATTENTION):
             with torch.autocast(device_type=self.config.device, dtype=torch.float32):
-                model_outputs = self.model(batch["input_ids"], coords=batch["coords"], return_dict=True)
+                model_outputs = self.model(
+                    batch["input_ids"],
+                    coords=batch["coords"],
+                    return_dict=True,
+                    captured_spl_inputs=self.captured_spl_inputs,
+                    captured_spl_grad_outputs=self.captured_spl_grad_outputs,
+                )
                 main_loss = F.cross_entropy(
                     model_outputs["logits"][:, :-1, :].contiguous().view(-1, self.config.model.vocab_size),
                     batch["labels"][:, 1:].contiguous().view(-1),
@@ -279,10 +288,11 @@ class Trainer:
             self.console.print(f"[bold red]NaN detected in main_loss at step {self.global_step}. Aborting step.[/bold red]")
             return None
 
-        signals = self.dynamics.compute_and_apply_gradients(main_loss, model_outputs, self.device, self.last_routing_logits, self.last_spl_inputs)
+        signals = self.dynamics.compute_and_apply_gradients(
+            main_loss, model_outputs, self.device, self.captured_spl_inputs, self.captured_spl_grad_outputs
+        )
         model_outputs.update({"labels": batch["labels"], "sample_entropy": batch["sample_entropy"]})
         metrics = self.observer.calculate_metrics(main_loss, model_outputs, signals, batch["input_ids"], self.model)
-
 
         signals["raw_weights"] = model_outputs.get("raw_weights")
         self.observer.maybe_log_and_visualize(
@@ -300,8 +310,6 @@ class Trainer:
         )
 
         self.global_step += 1
-        self.last_routing_logits = [r.detach() for r in model_outputs.get("routing_logits", []) if r is not None]
-        self.last_spl_inputs = [s.detach() for s in model_outputs.get("spl_inputs", []) if s is not None]
         torch.cuda.empty_cache()
         return metrics, model_outputs.get("raw_weights"), model_outputs.get("routing_logits"), signals
 
@@ -310,9 +318,8 @@ class Trainer:
         dataset = self.train_loader.dataset
         for task_idx in range(self.start_task_idx, len(dataset)):
             task_data = dataset[task_idx]
-            last_view_routing_logits = None
             start_view = self.start_view_idx if task_idx == self.start_task_idx else 0
-            
+
             all_views = list(range(8))
             if start_view > 0:
                 selected_views = all_views[start_view:]
@@ -320,27 +327,22 @@ class Trainer:
                 selected_views = random.sample(all_views, self.config.num_augmentation_views)
 
             for view_idx in selected_views:
-                batch_cpu = self._prepare_batch(
-                    task_data, view_idx, self.config.model.max_position_embeddings
-                )
+                batch_cpu = self._prepare_batch(task_data, view_idx, self.config.model.max_position_embeddings)
                 if not batch_cpu:
                     self.console.print(
                         f"[yellow]Skipping Task {task_idx} View {view_idx} due to excessive length.[/yellow]"
                     )
                     continue
 
-                batch = {
-                    k: v.to(self.device) for k, v in batch_cpu.items() if isinstance(v, torch.Tensor)
-                }
+                batch = {k: v.to(self.device) for k, v in batch_cpu.items() if isinstance(v, torch.Tensor)}
                 converged = False
                 for step in range(100):
-                    result = self._train_step(batch, epoch, task_idx, view_idx, last_view_routing_logits)
+                    result = self._train_step(batch, epoch, task_idx, view_idx)
                     if not result:
                         break
                     metrics, _, routing_logits, _ = result
                     if metrics["main_loss"] <= 0.03 and metrics["token_acc"] >= 0.999:
                         self.console.print(f"Task {task_idx} view {view_idx} converged in {step + 1} steps.")
-                        last_view_routing_logits = [r.detach() for r in routing_logits if r is not None]
                         converged = True
                         break
                 if not converged:

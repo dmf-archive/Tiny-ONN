@@ -24,6 +24,7 @@ class ArcGenerator:
         self.observer = observer
         self.device = device
         self.config = config
+        self.eos_token_id = self.serializer.tokenizer.eos_token_id
 
     @torch.no_grad()
     def generate(self, task_data: dict[str, Any]) -> tuple[torch.Tensor, list[int], list[float]]:
@@ -86,7 +87,7 @@ class ArcGenerator:
                 next_coord = torch.tensor([[next_coord_tuple]], dtype=torch.long, device=self.device)
                 coords = torch.cat([coords, next_coord], dim=1)
 
-                if next_token_item == self.config.eos_token_id or next_token_item == self.serializer.tokenizer.vocab["<im_end>"]:
+                if next_token_item == self.eos_token_id or next_token_item == self.serializer.tokenizer.vocab["<im_end>"]:
                     break
 
         return tokens[0, input_ids.shape[1] :].tolist(), probabilities
@@ -122,7 +123,7 @@ class ArcGenerator:
         for i, s in softmax:
             next_score = score + s.item()
             if next_score < max_score:
-                if i == self.config.eos_token_id:
+                if i == self.eos_token_id:
                     suffixes = [([], next_score)]
                 elif max_new_tokens > 1:
                     if remaining_logits is None:

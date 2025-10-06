@@ -158,7 +158,8 @@ class Observer:
 
                 protos = proto_weights[idx].cpu().to(torch.float32)
                 rw = raw_weights[idx].cpu().to(torch.float32)
-                logits = goodness_logits[idx].cpu().to(torch.float32)
+                logits_raw = goodness_logits[idx].cpu().to(torch.float32)
+                logits = torch.mean(logits_raw, dim=(0, 1)) if logits_raw.ndim == 3 else logits_raw
 
                 num_activations = (rw > 0).float().sum(dim=(0, 1))
 

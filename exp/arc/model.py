@@ -140,7 +140,13 @@ class MoIETransformerBlock(nn.Module):
         )
 
     def forward(
-        self, x: torch.Tensor, pos_emb: tuple, past_kv: tuple | None = None, incoming_proto_state: dict | None = None
+        self,
+        x: torch.Tensor,
+        pos_emb: tuple,
+        past_kv: tuple | None = None,
+        incoming_proto_state: dict | None = None,
+        captured_spl_inputs: list | None = None,
+        captured_spl_grad_outputs: list | None = None,
     ) -> tuple:
         outgoing_proto_state = {}
         spl_modules = {
@@ -220,6 +226,19 @@ class MoIETransformerBlock(nn.Module):
         all_raw.append(rw_o)
         all_routing_logits.append(routing_logits_o)
         all_spl_inputs.extend([ln1_out] * 3 + [attn_out])
+        
+        if self.training:
+            if captured_spl_inputs is not None:
+                captured_spl_inputs.append(ln1_out.clone().detach())
+                captured_spl_inputs.append(ln1_out.clone().detach())
+                captured_spl_inputs.append(ln1_out.clone().detach())
+                captured_spl_inputs.append(attn_out.clone().detach())
+
+            if captured_spl_grad_outputs is not None:
+                c_q.register_hook(lambda grad: captured_spl_grad_outputs.append(grad.clone().detach()))
+                c_k.register_hook(lambda grad: captured_spl_grad_outputs.append(grad.clone().detach()))
+                c_v.register_hook(lambda grad: captured_spl_grad_outputs.append(grad.clone().detach()))
+                c_o.register_hook(lambda grad: captured_spl_grad_outputs.append(grad.clone().detach()))
 
         return x_out, all_masked, all_comp, all_raw, all_spl_inputs, all_routing_logits, present_kv, outgoing_proto_state
 
@@ -259,7 +278,15 @@ class ArcTransformer(nn.Module):
         self.blocks = nn.ModuleList([MoIETransformerBlock(config, dtype=dtype) for _ in range(config.num_layers)])
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False, dtype=dtype)
 
-    def forward(self, input_ids: torch.Tensor, coords: torch.Tensor, past_key_values: list | None = None, return_dict: bool = False):
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        coords: torch.Tensor,
+        past_key_values: list | None = None,
+        return_dict: bool = False,
+        captured_spl_inputs: list | None = None,
+        captured_spl_grad_outputs: list | None = None,
+    ):
         x = self.embedding(input_ids, coords)
         pos_emb = self.rotary_emb(x, seq_len=input_ids.size(1))
         past_key_values = past_key_values if past_key_values is not None else [None] * len(self.blocks)
@@ -285,7 +312,14 @@ class ArcTransformer(nn.Module):
                 routing_logits,
                 present_kv,
                 outgoing_proto_state,
-            ) = block(x, pos_emb, past_key_values[i], incoming_proto_state)
+            ) = block(
+                x,
+                pos_emb,
+                past_key_values[i],
+                incoming_proto_state,
+                captured_spl_inputs=captured_spl_inputs,
+                captured_spl_grad_outputs=captured_spl_grad_outputs,
+            )
             presents.append(present_kv)
             all_masked.extend(masked)
             all_comp.extend(comp)
