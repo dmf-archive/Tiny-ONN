@@ -8,7 +8,7 @@ tags: ["theory", "backpropagation", "forward-forward", "spl", "variational-infer
 
 ## 1. 核心论点 (Core Thesis)
 
-本文旨在形式化地证明，在 `Tiny-ONN` 的核心计算单元 `Sparse ProtoLinear (SPL)` 架构下，全局优化的**反向传播 (Backpropagation, BP)** 和局部优化的**前向-前向算法 (Forward-Forward, FF)**，尽管计算路径截然不同，但最终都在优化**同一个理论目标**：最小化系统的变分自由能 (Variational Free Energy, VFE)。
+本文旨在证明，在 `Tiny-ONN` 的核心计算单元 `Sparse ProtoLinear (SPL)` 架构下，全局优化的**反向传播 (Backpropagation, BP)** 和局部优化的**前向-前向算法 (Forward-Forward, FF)**，尽管计算路径截然不同，但最终都在优化**同一个理论目标**：最小化系统的变分自由能 (Variational Free Energy, VFE)。
 
 BP 可以被视为该优化目标的**精确解析解**，而 FF 则是其**高效的、本地化的蒙特卡洛近似**。这种等效性解释了为何 `SPL` 架构可以无缝切换这两种学习范式。
 
