@@ -18,7 +18,7 @@
      - 2.3. SARS: Framing Meta-Learning as Distribution Alignment between routing policy `P` and expert utility `Q`.
   3. **The Computational Substrate: Sparse Proto Linear (SPL)**:
      - 3.1. Decoupling Computation, Perception, and Action (Routing).
-     - 3.2. SPL as a VQ-VAE Analogue: The role of `mu`, `proto`, and `gate`.
+     - 3.2. SPL as a Deterministic VQ-VAE Unit: The role of `mu` (Codebook), `proto` (Encoder), and `gate` (Deterministic Sampler).
   4. **The Unified Framework in Action**:
      - 4.1. The Dual-Optimizer Action-Perception Loop.
      - 4.2. How Sparse Proto-Routing Minimizes Free Energy.
