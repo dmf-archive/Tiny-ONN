@@ -49,11 +49,25 @@ def spl_forward(
 
     match_values = F.linear(x, proto_state) / math.sqrt(x.size(-1))
     gate_logit = torch.matmul(x, gate_param.t())
-    computation_output = F.linear(x, mu_weight, mu_bias)
+    computation_output = F.linear(F.silu(x), mu_weight, mu_bias)
 
     return computation_output, match_values, gate_logit
 
 
+
+@torch.jit.script
+def get_routed_weights_with_fallback(routing_logits: torch.Tensor) -> torch.Tensor:
+    raw_weights = mas_normalize(routing_logits)
+    failed_tokens_mask = raw_weights.sum(dim=-1) == 0
+    if torch.any(failed_tokens_mask):
+        fallback_indices = torch.argmax(routing_logits, dim=-1)
+        fallback_one_hot = F.one_hot(fallback_indices, num_classes=raw_weights.shape[-1]).to(
+            raw_weights.dtype
+        )
+        expanded_mask = failed_tokens_mask.unsqueeze(-1)
+        final_weights = torch.where(expanded_mask, fallback_one_hot, raw_weights)
+        return final_weights
+    return raw_weights
 class RotaryEmbedding(nn.Module):
     def __init__(
         self,
@@ -212,7 +226,7 @@ class MoIETransformerBlock(nn.Module):
         c_o, mv_o, pc_o = self.attn.spl_o(attn_out, outgoing_proto_state["attn_o"])
         cost_score_o = mas_normalize(pc_o)
         routing_logits_o = (mv_o - cost_score_o) * self.routing_gain
-        rw_o = mas_normalize(routing_logits_o)
+        rw_o = get_routed_weights_with_fallback(routing_logits_o)
         m_o = c_o * rw_o
         x_out = x + m_o
 
