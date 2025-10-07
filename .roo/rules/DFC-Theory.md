@@ -70,7 +70,7 @@ SARS 的最终形态建立在两大基石之上：
 
 该模型由三个核心组件构成：
 
-1. **前向贡献 (Forward Contribution, `B_contrib`)**: 定义为专家在前向传播中的**实际输出贡献**。它由经过路由权重缩放后的输出张量 `masked_output` 的 L2 范数来衡量，直接反映了专家对最终结果的“发言权”。
+1. **前向贡献 (Forward Contribution, `B_contrib`)**: 定义为专家在前向传播中的**实际输出贡献**。它由经过路由权重缩放后的权重张量 `raw_weights` 来衡量，反映了专家对最终结果的“发言权”。
    `B_contrib = ||masked_output||₂`
 
 2. **任务相关性 (Task Relevance, `B_rel`)**: 定义为任务损失对专家**潜在计算贡献**的敏感度。在实践中，它由主损失对路由前的 `computation_output` 张量的梯度范数来衡量。
@@ -102,7 +102,7 @@ SARS 的最终形态建立在两大基石之上：
 
 **SARS 元学习的本质是本地化的、可微分的赫布学习 (Hebbian Learning)**。赫布定律的核心思想是“一起激活的神经元会连接在一起”。在 SARS 框架下：
 
-- 一个专家（神经元集合）若被激活（`routing_logits` 高），并且其处理后的输出对主任务有显著贡献（`Synergistic_Benefit` 高），那么其对应的 `Goodness` 分数就会高。
+- 一个专家（神经元集合）若被路由权重高（`routing_logits` 高），并且其处理后的输出对主任务有显著贡献（`Synergistic_Benefit` 高），那么其对应的 `Goodness` 分数就会高。
 - 元学习的目标 `L_meta` 会驱动路由分布 `P` 去对齐这个高 `Goodness` 的分布 `Q`。
 - 这等价于，通过梯度下降，**强化了那些“共同激活”且表现良好的专家的路由权重**。
 

@@ -119,6 +119,7 @@ class LearningDynamics:
         routing_params_with_names: list[tuple[str, nn.Parameter]],
         optimizer_comp: torch.optim.Optimizer,
         optimizer_route: torch.optim.Optimizer,
+        spl_modules: list[nn.Module],
     ):
         self.config = config
         self.model = model
@@ -127,6 +128,7 @@ class LearningDynamics:
         self.routing_params = [p for _, p in routing_params_with_names]
         self.optimizer_comp = optimizer_comp
         self.optimizer_route = optimizer_route
+        self.spl_modules = spl_modules
 
     @staticmethod
     @torch.jit.script
@@ -149,6 +151,11 @@ class LearningDynamics:
 
         main_loss.backward(retain_graph=True)
 
+        with torch.no_grad():
+            for param in self.routing_params:
+                if param.grad is not None:
+                    param.grad.zero_()
+
         all_goodness, all_goodness_logits, all_mu_surprises = _calculate_goodness_jit(
             raw_weights, captured_spl_grad_outputs, captured_spl_inputs
         )
@@ -163,7 +170,21 @@ class LearningDynamics:
         total_meta_loss = self.config.w_route_jsd * avg_route_jsd_loss
 
         if total_meta_loss > 0:
-            total_meta_loss.backward()
+            meta_grads = torch.autograd.grad(total_meta_loss, self.routing_params, allow_unused=True)
+            with torch.no_grad():
+                for param, grad in zip(self.routing_params, meta_grads):
+                    if grad is not None:
+                        param.grad = grad
+
+        for i, module in enumerate(self.spl_modules):
+            if i < len(all_goodness):
+                goodness = all_goodness[i]
+                goodness_mask = torch.mean(goodness, dim=(0, 1)).detach()
+
+                if module.mu_weight.grad is not None:
+                    module.mu_weight.grad.mul_(goodness_mask.unsqueeze(1))
+                if module.mu_bias.grad is not None:
+                    module.mu_bias.grad.mul_(goodness_mask)
 
         torch.nn.utils.clip_grad_value_(self.model.parameters(), clip_value=1.0)
         self.optimizer_comp.step()
@@ -209,9 +230,17 @@ class Trainer:
         self.model = ArcTransformer(self.config.model, device=self.device).to(self.device)
         computation_params = [p for name, p in self.model.named_parameters() if "proto_weight" not in name and "gate_param" not in name]
         routing_params_with_names = [(name, p) for name, p in self.model.named_parameters() if "proto_weight" in name or "gate_param" in name]
+        
+        spl_modules = []
+        for block in self.model.blocks:
+            spl_modules.append(block.attn.spl_q)
+            spl_modules.append(block.attn.spl_k)
+            spl_modules.append(block.attn.spl_v)
+            spl_modules.append(block.attn.spl_o)
+
         self.optimizer_comp = torch.optim.AdamW(computation_params, lr=self.config.lr)
         self.optimizer_route = torch.optim.AdamW([p for _, p in routing_params_with_names], lr=self.config.lr)
-        self.dynamics = LearningDynamics(self.config, self.model, computation_params, routing_params_with_names, self.optimizer_comp, self.optimizer_route)
+        self.dynamics = LearningDynamics(self.config, self.model, computation_params, routing_params_with_names, self.optimizer_comp, self.optimizer_route, spl_modules)
         self.evaluator = EvaluationStep(self.model, self.serializer, GridDeserializer(self.tokenizer), self.observer, self.device, self.train_loader.dataset, self.config)
 
     def _prepare_batch(self, task_data: dict, view_idx: int, max_len: int) -> dict[str, torch.Tensor] | None:
