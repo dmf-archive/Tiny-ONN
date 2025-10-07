@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 @dataclass
 class ModelConfig:
     vocab_size: int = 16
-    hidden_size: int = 256
+    hidden_size: int = 384
     num_layers: int = 6
     max_position_embeddings: int = 4096
     d_ffn_factor: int = 1

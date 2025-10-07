@@ -29,7 +29,7 @@ def _jsd_from_distributions(p_dist_unnorm: torch.Tensor, q_dist_unnorm: torch.Te
     kl_q_m = torch.sum(q_dist * (torch.log(q_dist + epsilon) - torch.log(m_dist + epsilon)), dim=-1)
     return 0.5 * kl_p_m + 0.5 * kl_q_m
 
-
+@torch.jit.script
 def _get_task_representation(tensors: list[torch.Tensor]) -> torch.Tensor | None:
     if not tensors or any(t.ndim != 3 for t in tensors) or tensors[0].shape[0] > 1:
         return None
@@ -167,7 +167,7 @@ class LearningDynamics:
         if total_meta_loss > 0:
             total_meta_loss.backward()
 
-        torch.nn.utils.clip_grad_norm_(self.computation_params, max_norm=1.0)
+        torch.nn.utils.clip_grad_value_(self.model.parameters(), clip_value=1.0)
         self.optimizer_comp.step()
         self.optimizer_route.step()
 
@@ -341,7 +341,7 @@ class Trainer:
                     if not result:
                         break
                     metrics, _, routing_logits, _ = result
-                    if metrics["main_loss"] <= 0.03 and metrics["token_acc"] >= 0.999:
+                    if metrics["main_loss"] <= 0.01 and metrics["token_acc"] >= 0.999:
                         self.console.print(f"Task {task_idx} view {view_idx} converged in {step + 1} steps.")
                         converged = True
                         break
