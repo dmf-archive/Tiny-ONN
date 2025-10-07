@@ -93,10 +93,10 @@ class SparseProtoLinear(nn.Module):
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
-        nn.init.kaiming_uniform_(self.mu_weight, a=math.sqrt(5))
+        nn.init.normal_(self.mu_weight, mean=0.0, std=0.02)
         nn.init.normal_(self.proto_weight, mean=0.0, std=0.02)
         nn.init.zeros_(self.mu_bias)
-        nn.init.zeros_(self.gate_param)
+        nn.init.uniform_(self.gate_param, a=0.0, b=1.0)
 
     def forward(
         self, x: torch.Tensor, proto_state: torch.Tensor
