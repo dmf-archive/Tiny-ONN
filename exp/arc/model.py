@@ -186,9 +186,8 @@ class MoIETransformerBlock(nn.Module):
         q, k, v = torch.zeros_like(c_q), torch.zeros_like(c_k), torch.zeros_like(c_v)
 
         for i in range(3):
-            cost_score = mas_normalize(costs_qkv[i])
-            routing_logits = (match_qkv[i] - cost_score) * self.routing_gain
-            raw_weights = mas_normalize(routing_logits)
+            routing_logits = (match_qkv[i] - costs_qkv[i]) * self.routing_gain
+            raw_weights = get_routed_weights_with_fallback(routing_logits)
             masked = comp_qkv[i] * raw_weights
             if i == 0:
                 q = masked

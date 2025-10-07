@@ -28,37 +28,44 @@ class GridSerializer:
     def serialize_task(self, task_data: dict[str, Any]) -> tuple[list[int], list[int], list[tuple[int, int]]]:
         full_ids: list[int] = [self.tokenizer.bos_token_id]
         full_coords: list[tuple[int, int]] = [(-1, -1)]
-        
+        labels: list[int] = [-100]
+
         im_start_id = self.tokenizer.vocab["<im_start>"]
         im_end_id = self.tokenizer.vocab["<im_end>"]
 
+        def extend_and_mask(
+            ids: list[int],
+            coords: list[tuple[int, int]],
+            is_input: bool,
+        ):
+            full_ids.extend([im_start_id] + ids + [im_end_id])
+            full_coords.extend([(-1, -1)] + coords + [(-1, -1)])
+            if is_input:
+                labels.extend([-100] * (len(ids) + 2))
+            else:
+                labels.extend([-100] + ids + [im_end_id])
+
         for pair in task_data["train"]:
             input_ids, input_coords = self._serialize_grid(pair["input"])
+            extend_and_mask(input_ids, input_coords, is_input=True)
+
             output_ids, output_coords = self._serialize_grid(pair["output"])
-            
-            full_ids.extend([im_start_id] + input_ids + [im_end_id])
-            full_coords.extend([(-1, -1)] + input_coords + [(-1, -1)])
-            
-            full_ids.extend([im_start_id] + output_ids + [im_end_id])
-            full_coords.extend([(-1, -1)] + output_coords + [(-1, -1)])
+            extend_and_mask(output_ids, output_coords, is_input=False)
 
-        test_input_ids, test_input_coords = self._serialize_grid(task_data["test"][0]["input"])
-        full_ids.extend([im_start_id] + test_input_ids + [im_end_id])
-        full_coords.extend([(-1, -1)] + test_input_coords + [(-1, -1)])
+        test_input_ids, test_input_coords = self._serialize_grid(
+            task_data["test"][0]["input"]
+        )
+        extend_and_mask(test_input_ids, test_input_coords, is_input=True)
 
-        target_start_index = len(full_ids)
+        test_output_ids, test_output_coords = self._serialize_grid(
+            task_data["test"][0]["output"]
+        )
+        extend_and_mask(test_output_ids, test_output_coords, is_input=False)
 
-        test_output_ids, test_output_coords = self._serialize_grid(task_data["test"][0]["output"])
-        full_ids.extend([im_start_id] + test_output_ids + [im_end_id])
-        full_coords.extend([(-1, -1)] + test_output_coords + [(-1, -1)])
         full_ids.append(self.tokenizer.eos_token_id)
         full_coords.append((-1, -1))
-
-        labels = list(full_ids[1:]) + [-100] 
+        labels.append(self.tokenizer.eos_token_id)
         
-        for i in range(target_start_index):
-            labels[i] = -100
-            
         return full_ids, labels, full_coords
 
     def serialize_for_inference(self, task_data: dict[str, Any]) -> tuple[list[int], list[tuple[int, int]]]:

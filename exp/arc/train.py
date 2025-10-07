@@ -75,7 +75,7 @@ def _augment_and_map_kernel(grids: list[torch.Tensor], transform_idx: int, color
 
 @torch.jit.script
 def _calculate_goodness_jit(
-    raw_weights: list[torch.Tensor],
+    masked_outputs: list[torch.Tensor],
     captured_spl_grad_outputs: list[torch.Tensor],
     captured_spl_inputs: list[torch.Tensor],
 ) -> tuple[list[torch.Tensor], list[torch.Tensor], list[torch.Tensor]]:
@@ -83,12 +83,13 @@ def _calculate_goodness_jit(
     all_goodness_logits: list[torch.Tensor] = []
     all_mu_surprises: list[torch.Tensor] = []
 
-    num_modules = len(raw_weights)
+    num_modules = len(masked_outputs)
     for i in range(num_modules):
         grad_output = captured_spl_grad_outputs[i]
         x = captured_spl_inputs[i]
+        masked_output = masked_outputs[i]
         
-        b_contrib_token = raw_weights[i]
+        b_contrib_token = torch.abs(masked_output)
         b_rel_token = torch.abs(grad_output)
 
         per_token_grad_weight = torch.einsum("bso,bsi->bsoi", grad_output, x)
@@ -102,7 +103,7 @@ def _calculate_goodness_jit(
 
         learning_cost_token = mas_normalize(c_learn_token)
 
-        goodness_logits_token = synergistic_benefit_token / (learning_cost_token + 1e-9)
+        goodness_logits_token = mas_normalize(synergistic_benefit_token / (learning_cost_token + 1e-9))
         
         all_goodness_logits.append(goodness_logits_token)
         all_goodness.append(F.relu(goodness_logits_token))
@@ -144,7 +145,7 @@ class LearningDynamics:
         device: torch.device,
         captured_spl_inputs: list[torch.Tensor],
         captured_spl_grad_outputs: list[torch.Tensor],
-        raw_weights: list[torch.Tensor],
+        masked_outputs: list[torch.Tensor],
     ) -> dict[str, Any]:
         self.optimizer_comp.zero_grad()
         self.optimizer_route.zero_grad()
@@ -157,7 +158,7 @@ class LearningDynamics:
                     param.grad.zero_()
 
         all_goodness, all_goodness_logits, all_mu_surprises = _calculate_goodness_jit(
-            raw_weights, captured_spl_grad_outputs, captured_spl_inputs
+            masked_outputs, captured_spl_grad_outputs, captured_spl_inputs
         )
 
         meta_losses = [
@@ -186,7 +187,7 @@ class LearningDynamics:
                 if module.mu_bias.grad is not None:
                     module.mu_bias.grad.mul_(goodness_mask)
 
-        torch.nn.utils.clip_grad_value_(self.model.parameters(), clip_value=1.0)
+        torch.nn.utils.clip_grad_value_(self.computation_params, clip_value=1.0)
         self.optimizer_comp.step()
         self.optimizer_route.step()
 
@@ -316,7 +317,7 @@ class Trainer:
             return None
 
         signals = self.dynamics.compute_and_apply_gradients(
-            main_loss, model_outputs, self.device, self.captured_spl_inputs, self.captured_spl_grad_outputs, model_outputs["raw_weights"]
+            main_loss, model_outputs, self.device, self.captured_spl_inputs, self.captured_spl_grad_outputs, model_outputs["masked_outputs"]
         )
         model_outputs.update({"labels": batch["labels"], "sample_entropy": batch["sample_entropy"]})
         metrics = self.observer.calculate_metrics(main_loss, model_outputs, signals, batch["input_ids"], self.model)
