@@ -75,7 +75,7 @@ def _augment_and_map_kernel(grids: list[torch.Tensor], transform_idx: int, color
 
 @torch.jit.script
 def _calculate_goodness_jit(
-    masked_outputs: list[torch.Tensor],
+    raw_weights: list[torch.Tensor],
     captured_spl_grad_outputs: list[torch.Tensor],
     captured_spl_inputs: list[torch.Tensor],
 ) -> tuple[list[torch.Tensor], list[torch.Tensor], list[torch.Tensor]]:
@@ -83,13 +83,12 @@ def _calculate_goodness_jit(
     all_goodness_logits: list[torch.Tensor] = []
     all_mu_surprises: list[torch.Tensor] = []
 
-    num_modules = len(masked_outputs)
+    num_modules = len(raw_weights)
     for i in range(num_modules):
         grad_output = captured_spl_grad_outputs[i]
         x = captured_spl_inputs[i]
-        masked_output = masked_outputs[i]
-
-        b_contrib_token = torch.abs(masked_output)
+        
+        b_contrib_token = raw_weights[i]
         b_rel_token = torch.abs(grad_output)
 
         per_token_grad_weight = torch.einsum("bso,bsi->bsoi", grad_output, x)
@@ -143,16 +142,15 @@ class LearningDynamics:
         device: torch.device,
         captured_spl_inputs: list[torch.Tensor],
         captured_spl_grad_outputs: list[torch.Tensor],
+        raw_weights: list[torch.Tensor],
     ) -> dict[str, Any]:
         self.optimizer_comp.zero_grad()
         self.optimizer_route.zero_grad()
 
         main_loss.backward(retain_graph=True)
 
-        masked_outputs = model_outputs["masked_outputs"]
-
         all_goodness, all_goodness_logits, all_mu_surprises = _calculate_goodness_jit(
-            masked_outputs, captured_spl_grad_outputs, captured_spl_inputs
+            raw_weights, captured_spl_grad_outputs, captured_spl_inputs
         )
 
         meta_losses = [
@@ -289,7 +287,7 @@ class Trainer:
             return None
 
         signals = self.dynamics.compute_and_apply_gradients(
-            main_loss, model_outputs, self.device, self.captured_spl_inputs, self.captured_spl_grad_outputs
+            main_loss, model_outputs, self.device, self.captured_spl_inputs, self.captured_spl_grad_outputs, model_outputs["raw_weights"]
         )
         model_outputs.update({"labels": batch["labels"], "sample_entropy": batch["sample_entropy"]})
         metrics = self.observer.calculate_metrics(main_loss, model_outputs, signals, batch["input_ids"], self.model)
@@ -340,8 +338,8 @@ class Trainer:
                     result = self._train_step(batch, epoch, task_idx, view_idx)
                     if not result:
                         break
-                    metrics, _, routing_logits, _ = result
-                    if metrics["main_loss"] <= 0.01 and metrics["token_acc"] >= 0.999:
+                    metrics, raw_weights, routing_logits, _ = result
+                    if metrics["main_loss"] <= 0.05 and metrics["token_acc"] >= 0.999:
                         self.console.print(f"Task {task_idx} view {view_idx} converged in {step + 1} steps.")
                         converged = True
                         break

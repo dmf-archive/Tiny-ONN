@@ -35,7 +35,6 @@ def mas_normalize_negative(logits: torch.Tensor) -> torch.Tensor:
     return -F.relu(-mas_normalize(logits))
 
 
-@torch.jit.script
 def spl_forward(
     x: torch.Tensor,
     proto_state: torch.Tensor,
@@ -95,7 +94,7 @@ class SparseProtoLinear(nn.Module):
 
     def reset_parameters(self) -> None:
         nn.init.kaiming_uniform_(self.mu_weight, a=math.sqrt(5))
-        nn.init.kaiming_uniform_(self.proto_weight, a=math.sqrt(5))
+        nn.init.normal_(self.proto_weight, mean=0.0, std=0.02)
         nn.init.zeros_(self.mu_bias)
         nn.init.zeros_(self.gate_param)
 
@@ -164,11 +163,8 @@ class MoIETransformerBlock(nn.Module):
 
         ln1_out = self.ln1(x)
         c_q, mv_q, pc_q = self.attn.spl_q(ln1_out, outgoing_proto_state["attn_q"])
-        c_q = ln1_out + c_q
         c_k, mv_k, pc_k = self.attn.spl_k(ln1_out, outgoing_proto_state["attn_k"])
-        c_k = ln1_out + c_k
         c_v, mv_v, pc_v = self.attn.spl_v(ln1_out, outgoing_proto_state["attn_v"])
-        c_v = ln1_out + c_v
 
         all_masked, all_comp, all_raw, all_routing_logits, all_spl_inputs = [], [], [], [], []
 
@@ -214,7 +210,6 @@ class MoIETransformerBlock(nn.Module):
         attn_out = attn_out.transpose(1, 2).contiguous().view(batch_size, seq_len, self.d_model)
 
         c_o, mv_o, pc_o = self.attn.spl_o(attn_out, outgoing_proto_state["attn_o"])
-        c_o = attn_out + c_o
         cost_score_o = mas_normalize(pc_o)
         routing_logits_o = (mv_o - cost_score_o) * self.routing_gain
         rw_o = mas_normalize(routing_logits_o)
@@ -240,7 +235,7 @@ class MoIETransformerBlock(nn.Module):
                 c_v.register_hook(lambda grad: captured_spl_grad_outputs.append(grad.clone().detach()))
                 c_o.register_hook(lambda grad: captured_spl_grad_outputs.append(grad.clone().detach()))
 
-        return x_out, all_masked, all_comp, all_raw, all_spl_inputs, all_routing_logits, present_kv, outgoing_proto_state
+        return x_out, all_masked, all_comp, all_raw, all_spl_inputs, all_routing_logits, present_kv, outgoing_proto_state, all_raw
 
 
 class ArcEmbedding(nn.Module):
@@ -312,6 +307,7 @@ class ArcTransformer(nn.Module):
                 routing_logits,
                 present_kv,
                 outgoing_proto_state,
+                raw_weights,
             ) = block(
                 x,
                 pos_emb,
@@ -324,7 +320,7 @@ class ArcTransformer(nn.Module):
             all_masked.extend(masked)
             all_comp.extend(comp)
             all_spl_in.extend(spl_inputs)
-            all_raw.extend(raw)
+            all_raw.extend(raw_weights)
             all_protos.append(outgoing_proto_state)
             all_routing_logits.extend(routing_logits)
             incoming_proto_state = outgoing_proto_state
