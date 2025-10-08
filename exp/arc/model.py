@@ -48,7 +48,7 @@ def spl_forward(
     gate_param = gate_param.to(model_dtype)
 
     match_values = F.linear(x, proto_state) / math.sqrt(x.size(-1))
-    gate_logit = torch.matmul(x, gate_param.t())
+    gate_logit = gate_param
     computation_output = F.linear(F.silu(x), mu_weight, mu_bias)
 
     return computation_output, match_values, gate_logit
@@ -103,14 +103,14 @@ class SparseProtoLinear(nn.Module):
         self.mu_weight = nn.Parameter(torch.empty(out_features, in_features, dtype=dtype))
         self.proto_weight = nn.Parameter(torch.empty(out_features, in_features, dtype=dtype))
         self.mu_bias = nn.Parameter(torch.empty(out_features, dtype=dtype))
-        self.gate_param = nn.Parameter(torch.empty(out_features, in_features, dtype=dtype))
+        self.gate_param = nn.Parameter(torch.empty(out_features, dtype=dtype))
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
         nn.init.normal_(self.mu_weight, mean=0.0, std=0.02)
         nn.init.normal_(self.proto_weight, mean=0.0, std=0.02)
         nn.init.zeros_(self.mu_bias)
-        nn.init.uniform_(self.gate_param, a=0.0, b=1.0)
+        nn.init.zeros_(self.gate_param)
 
     def forward(
         self, x: torch.Tensor, proto_state: torch.Tensor
