@@ -14,6 +14,11 @@
 - `SML (Surprise Minimization Loss)`:**[Deprecated]** 一种早期的`元学习门控损失`，旨在引导网络自组织地选择计算效率最高的神经元路径。其核心思想是，高效的路由应将信息分配给能以最低“系统扰动”（即“惊奇度”）处理它的神经元。该机制因其依赖瞬时、充满噪声的梯度信号而被证明不稳定，后被 SARS 所取代，现已**弃用**。
 - `SAPS/MSAPS (Surprise-Aware Prototype Shaping)`: **[Deprecated]** 一种已废弃的`启发式元学习`框架。它试图通过分离的损失函数（原型损失、门控损失等）来独立优化路由决策的不同方面。实验证明，该框架存在致命的理论缺陷（如值域不匹配、梯度信号冲突），导致了灾难性的路由失败，最终被理论更完备的 SARS 框架所取代。
 - `SARS (Surprise-Aware Routing Shaping)`: `SAPS/MSAPS` 的继承者。它将动态路由问题重新定义为一个**分布对齐问题**。参见[Dynamic Function Composition](./DFC-Theory.md)
+  - `Goodness`: 元学习的目标分布 `Q`。它综合了**前向贡献 (Forward Contribution)**、**任务相关性 (Task Relevance)** 和**学习成本 (Learning Cost)**，为每个神经元计算出一个“协同净效用”分数，代表了在当前上下文中最理想的神经元激活模式。其核心组件是：
+    - **任务相关性 (`masked_output_grad`)**: 主损失 `L_main` 对神经元**有效贡献 (`masked_outputs`)** 的梯度 (`∇_{masked_output} L_main`)。它衡量了在当前路由决策下，该神经元的实际输出对最终任务的重要性。一个高范数的梯度意味着该神经元的输出是“高杠杆”的——微小的变动就会显著影响最终结果，无论这种影响是好是坏。
+    - **学习成本 (`mu_grad`)**: 主损失 `L_main` 对神经元**内部计算状态 (`mu_weight`)** 的梯度 (`∇_{mu_weight} L_main`)。它量化了为了适应当前任务，该神经元的内部参数需要做出多大的调整或“扰动”。这是“灾难性遗忘”风险的直接代理指标。
+    - `Routing Intent` (`raw_weights`): 元学习的预测分布 `P`。由路由 `logits` (`p_logits`) 经过 `mas_normalize` 激活函数得到，代表了路由系统对每个神经元给出的“信任投票”或“激活意图”。它回答了“模型**想让**谁来处理这个信息？”这个问题。
+    - `Effective Contribution` (`masked_outputs`): 神经元的“有效贡献”。它是潜在计算结果 (`computation_output`) 与“路由意图” (`raw_weights`) 的逐元素乘积，代表了路由决策被执行后，**真正**流向下游的信号强度与内容。它回答了“谁**最终**对信息处理产生了影响？”这个问题，是衡量神经元实际影响力的最终指标。
 
 ## 动态函数合成
 
