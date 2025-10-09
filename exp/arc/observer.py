@@ -78,7 +78,7 @@ class Observer:
             "main_loss": main_loss.item(),
             "token_acc": acc,
             "pi_score": pi_score,
-            "route_jsd_loss": signals.get("route_jsd_loss", torch.tensor(0.0)).item(),
+            "meta_loss": signals.get("meta_loss", torch.tensor(0.0)).item(),
             "sample_entropy": model_outputs.get("sample_entropy", torch.tensor(0.0)).mean().item(),
             "tau": (
                 -torch.sum(F.softmax(active_logits, dim=-1) * F.log_softmax(active_logits, dim=-1), dim=-1)
@@ -120,7 +120,7 @@ class Observer:
 
         log_str = (
             f"E{epoch} S{step} T{task_idx} V{view_idx} | "
-            f"L({metrics.get('main_loss', 0.0):.3f}/{metrics.get('route_jsd_loss', 0.0):.4f}) | "
+            f"L({metrics.get('main_loss', 0.0):.3f}/{metrics.get('meta_loss', 0.0):.4f}) | "
             f"Acc: {metrics.get('token_acc', 0.0):.3f} | "
             f"τ: {metrics.get('tau', 0.0):.3f} | "
             f"H(x): {metrics.get('sample_entropy', 0.0):.3f} | "

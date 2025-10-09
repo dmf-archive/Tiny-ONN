@@ -31,7 +31,7 @@ class TrainConfig:
 
     lr: float = 1e-3
 
-    w_route_jsd: float = 1.0
+    w_meta: float = 1.0
 
     num_epochs: int = 20
     num_augmentation_views: int = 2

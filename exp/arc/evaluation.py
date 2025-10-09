@@ -29,8 +29,9 @@ class ArcGenerator:
     @torch.no_grad()
     def generate(self, task_data: dict[str, Any]) -> tuple[torch.Tensor, list[int], list[float]]:
         output_grid = task_data["test"][0].get("output", [])
-        output_grid_ids, _ = self.serializer._serialize_grid(output_grid)
-        max_new_tokens = len(output_grid_ids) + 2
+        num_rows = len(output_grid)
+        num_pixels = sum(len(row) for row in output_grid)
+        max_new_tokens = num_pixels + num_rows + 2
 
         prompt_ids, prompt_coords = self.serializer.serialize_for_inference(task_data)
         prompt_tensor = torch.tensor([prompt_ids], dtype=torch.long, device=self.device)

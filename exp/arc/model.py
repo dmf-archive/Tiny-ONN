@@ -56,18 +56,8 @@ def spl_forward(
 
 
 @torch.jit.script
-def get_routed_weights_with_fallback(routing_logits: torch.Tensor) -> torch.Tensor:
-    raw_weights = mas_normalize(routing_logits)
-    failed_tokens_mask = raw_weights.sum(dim=-1) == 0
-    if torch.any(failed_tokens_mask):
-        fallback_indices = torch.argmax(routing_logits, dim=-1)
-        fallback_one_hot = F.one_hot(fallback_indices, num_classes=raw_weights.shape[-1]).to(
-            raw_weights.dtype
-        )
-        expanded_mask = failed_tokens_mask.unsqueeze(-1)
-        final_weights = torch.where(expanded_mask, fallback_one_hot, raw_weights)
-        return final_weights
-    return raw_weights
+def get_routed_weights(routing_logits: torch.Tensor) -> torch.Tensor:
+    return mas_normalize(routing_logits)
 class RotaryEmbedding(nn.Module):
     def __init__(
         self,
@@ -159,7 +149,7 @@ class MoIETransformerBlock(nn.Module):
         past_kv: tuple | None = None,
         incoming_proto_state: dict | None = None,
         captured_spl_inputs: list | None = None,
-        captured_spl_grad_outputs: list | None = None,
+        captured_masked_grad_outputs: list | None = None,
     ) -> tuple:
         outgoing_proto_state = {}
         spl_modules = {
@@ -187,8 +177,10 @@ class MoIETransformerBlock(nn.Module):
 
         for i in range(3):
             routing_logits = (match_qkv[i] - costs_qkv[i]) * self.routing_gain
-            raw_weights = get_routed_weights_with_fallback(routing_logits)
-            masked = comp_qkv[i] * raw_weights
+            computation_output = comp_qkv[i]
+
+            raw_weights = get_routed_weights(routing_logits)
+            masked = computation_output * raw_weights
             if i == 0:
                 q = masked
             elif i == 1:
@@ -196,7 +188,7 @@ class MoIETransformerBlock(nn.Module):
             else:
                 v = masked
             all_masked.append(masked)
-            all_comp.append(comp_qkv[i])
+            all_comp.append(computation_output)
             all_raw.append(raw_weights)
             all_routing_logits.append(routing_logits)
 
@@ -206,7 +198,7 @@ class MoIETransformerBlock(nn.Module):
         batch_size, seq_len, _ = q.shape
         num_heads = 1
         head_dim = self.d_model
-        
+
         q = q.view(batch_size, seq_len, num_heads, head_dim).transpose(1, 2)
         k = k.view(batch_size, seq_len, num_heads, head_dim).transpose(1, 2)
         v = v.view(batch_size, seq_len, num_heads, head_dim).transpose(1, 2)
@@ -217,7 +209,7 @@ class MoIETransformerBlock(nn.Module):
             v = torch.cat([past_v, v], dim=-2)
 
         present_kv = (k, v)
-        
+
         is_causal = past_kv is None
         attn_out = F.scaled_dot_product_attention(q, k, v, is_causal=is_causal)
         attn_out = attn_out.transpose(1, 2).contiguous().view(batch_size, seq_len, self.d_model)
@@ -225,16 +217,19 @@ class MoIETransformerBlock(nn.Module):
         c_o, mv_o, pc_o = self.attn.spl_o(attn_out, outgoing_proto_state["attn_o"])
         cost_score_o = mas_normalize(pc_o)
         routing_logits_o = (mv_o - cost_score_o) * self.routing_gain
-        rw_o = get_routed_weights_with_fallback(routing_logits_o)
-        m_o = c_o * rw_o
+
+        computation_output_o = c_o
+
+        rw_o = get_routed_weights(routing_logits_o)
+        m_o = computation_output_o * rw_o
         x_out = x + m_o
 
         all_masked.append(m_o)
-        all_comp.append(c_o)
+        all_comp.append(computation_output_o)
         all_raw.append(rw_o)
         all_routing_logits.append(routing_logits_o)
         all_spl_inputs.extend([ln1_out] * 3 + [attn_out])
-        
+
         if self.training:
             if captured_spl_inputs is not None:
                 captured_spl_inputs.append(ln1_out.clone().detach())
@@ -242,13 +237,13 @@ class MoIETransformerBlock(nn.Module):
                 captured_spl_inputs.append(ln1_out.clone().detach())
                 captured_spl_inputs.append(attn_out.clone().detach())
 
-            if captured_spl_grad_outputs is not None:
-                c_q.register_hook(lambda grad: captured_spl_grad_outputs.append(grad.clone().detach()))
-                c_k.register_hook(lambda grad: captured_spl_grad_outputs.append(grad.clone().detach()))
-                c_v.register_hook(lambda grad: captured_spl_grad_outputs.append(grad.clone().detach()))
-                c_o.register_hook(lambda grad: captured_spl_grad_outputs.append(grad.clone().detach()))
+            if captured_masked_grad_outputs is not None:
+                all_masked[0].register_hook(lambda grad: captured_masked_grad_outputs.insert(0, grad.clone().detach()))
+                all_masked[1].register_hook(lambda grad: captured_masked_grad_outputs.insert(0, grad.clone().detach()))
+                all_masked[2].register_hook(lambda grad: captured_masked_grad_outputs.insert(0, grad.clone().detach()))
+                all_masked[3].register_hook(lambda grad: captured_masked_grad_outputs.insert(0, grad.clone().detach()))
 
-        return x_out, all_masked, all_comp, all_raw, all_spl_inputs, all_routing_logits, present_kv, outgoing_proto_state, all_raw
+        return x_out, all_masked, all_comp, all_raw, all_spl_inputs, all_routing_logits, present_kv, outgoing_proto_state
 
 
 class ArcEmbedding(nn.Module):
@@ -293,7 +288,7 @@ class ArcTransformer(nn.Module):
         past_key_values: list | None = None,
         return_dict: bool = False,
         captured_spl_inputs: list | None = None,
-        captured_spl_grad_outputs: list | None = None,
+        captured_masked_grad_outputs: list | None = None,
     ):
         x = self.embedding(input_ids, coords)
         pos_emb = self.rotary_emb(x, seq_len=input_ids.size(1))
@@ -320,20 +315,19 @@ class ArcTransformer(nn.Module):
                 routing_logits,
                 present_kv,
                 outgoing_proto_state,
-                raw_weights,
             ) = block(
                 x,
                 pos_emb,
                 past_key_values[i],
                 incoming_proto_state,
                 captured_spl_inputs=captured_spl_inputs,
-                captured_spl_grad_outputs=captured_spl_grad_outputs,
+                captured_masked_grad_outputs=captured_masked_grad_outputs,
             )
             presents.append(present_kv)
             all_masked.extend(masked)
             all_comp.extend(comp)
             all_spl_in.extend(spl_inputs)
-            all_raw.extend(raw_weights)
+            all_raw.extend(raw)
             all_protos.append(outgoing_proto_state)
             all_routing_logits.extend(routing_logits)
             incoming_proto_state = outgoing_proto_state

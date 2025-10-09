@@ -19,15 +19,6 @@ from .observer import Observer
 from .tokenizer import ArcColorTokenizer
 
 
-@torch.jit.script
-def _jsd_from_distributions(p_dist_unnorm: torch.Tensor, q_dist_unnorm: torch.Tensor) -> torch.Tensor:
-    epsilon = 1e-9
-    p_dist = p_dist_unnorm / (p_dist_unnorm.sum(dim=-1, keepdim=True) + epsilon)
-    q_dist = q_dist_unnorm / (q_dist_unnorm.sum(dim=-1, keepdim=True) + epsilon)
-    m_dist = 0.5 * (p_dist + q_dist)
-    kl_p_m = torch.sum(p_dist * (torch.log(p_dist + epsilon) - torch.log(m_dist + epsilon)), dim=-1)
-    kl_q_m = torch.sum(q_dist * (torch.log(q_dist + epsilon) - torch.log(m_dist + epsilon)), dim=-1)
-    return 0.5 * kl_p_m + 0.5 * kl_q_m
 
 @torch.jit.script
 def _get_task_representation(tensors: list[torch.Tensor]) -> torch.Tensor | None:
@@ -76,39 +67,33 @@ def _augment_and_map_kernel(grids: list[torch.Tensor], transform_idx: int, color
 @torch.jit.script
 def _calculate_goodness_jit(
     masked_outputs: list[torch.Tensor],
-    captured_spl_grad_outputs: list[torch.Tensor],
+    captured_masked_grad_outputs: list[torch.Tensor],
     captured_spl_inputs: list[torch.Tensor],
-) -> tuple[list[torch.Tensor], list[torch.Tensor], list[torch.Tensor]]:
-    all_goodness: list[torch.Tensor] = []
+) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
     all_goodness_logits: list[torch.Tensor] = []
     all_mu_surprises: list[torch.Tensor] = []
+    epsilon = 1e-9
 
     num_modules = len(masked_outputs)
     for i in range(num_modules):
-        grad_output = captured_spl_grad_outputs[i]
+        grad_output = captured_masked_grad_outputs[i]
         x = captured_spl_inputs[i]
         masked_output = masked_outputs[i]
-        
-        b_contrib_token = torch.abs(masked_output)
-        b_rel_token = torch.abs(grad_output)
 
+        b_contrib_raw = torch.abs(masked_output)
+        b_rel_raw = torch.abs(grad_output)
         per_token_grad_weight = torch.einsum("bso,bsi->bsoi", grad_output, x)
-        c_learn_token = torch.norm(per_token_grad_weight, p=2, dim=-1)
+        c_learn_raw = torch.norm(per_token_grad_weight, p=2, dim=-1)
+
+        all_mu_surprises.append(torch.mean(torch.mean(c_learn_raw, dim=-1), dim=(0, 1)))
         
-        all_mu_surprises.append(torch.mean(c_learn_token, dim=(0, 1)))
+        b_contrib_norm = mas_normalize(b_contrib_raw)
+        b_rel_norm = mas_normalize(b_rel_raw)
+        c_learn_norm = mas_normalize(c_learn_raw)
+        goodness_logits = (b_contrib_norm * b_rel_norm) / (c_learn_norm + epsilon)
+        all_goodness_logits.append(goodness_logits)
 
-        benefit_eff_token = mas_normalize(b_contrib_token)
-        benefit_rel_token = mas_normalize(b_rel_token)
-        synergistic_benefit_token = mas_normalize(benefit_eff_token * benefit_rel_token)
-
-        learning_cost_token = mas_normalize(c_learn_token)
-
-        goodness_logits_token = mas_normalize(synergistic_benefit_token / (learning_cost_token + 1e-9))
-        
-        all_goodness_logits.append(goodness_logits_token)
-        all_goodness.append(F.relu(goodness_logits_token))
-
-    return all_goodness, all_goodness_logits, all_mu_surprises
+    return all_goodness_logits, all_mu_surprises
 
 
 class LearningDynamics:
@@ -132,11 +117,12 @@ class LearningDynamics:
         self.spl_modules = spl_modules
 
     @staticmethod
-    @torch.jit.script
-    def _calculate_jsd_loss(p_logits: torch.Tensor, q_logits: torch.Tensor) -> torch.Tensor:
-        p_dist_unnorm = F.relu(mas_normalize(p_logits))
-        q_dist_unnorm = mas_normalize(q_logits).detach()
-        return _jsd_from_distributions(p_dist_unnorm, q_dist_unnorm)
+    def _calculate_meta_loss(logits: torch.Tensor) -> torch.Tensor:
+        epsilon = 1e-9
+        dist = F.softmax(logits, dim=-1)
+        log_dist = torch.log(dist + epsilon)
+        entropy = -torch.sum(dist * log_dist, dim=-1)
+        return entropy.mean()
 
     def compute_and_apply_gradients(
         self,
@@ -144,7 +130,7 @@ class LearningDynamics:
         model_outputs: dict,
         device: torch.device,
         captured_spl_inputs: list[torch.Tensor],
-        captured_spl_grad_outputs: list[torch.Tensor],
+        captured_masked_grad_outputs: list[torch.Tensor],
         masked_outputs: list[torch.Tensor],
     ) -> dict[str, Any]:
         self.optimizer_comp.zero_grad()
@@ -157,18 +143,18 @@ class LearningDynamics:
                 if param.grad is not None:
                     param.grad.zero_()
 
-        all_goodness, all_goodness_logits, all_mu_surprises = _calculate_goodness_jit(
-            masked_outputs, captured_spl_grad_outputs, captured_spl_inputs
+        all_goodness_logits, all_mu_surprises = _calculate_goodness_jit(
+            masked_outputs, captured_masked_grad_outputs, captured_spl_inputs
         )
-
-        meta_losses = [
-            self._calculate_jsd_loss(logit, good)
-            for logit, good in zip(model_outputs["routing_logits"], all_goodness)
-            if logit.numel() > 0 and good.numel() > 0 and logit.shape == good.shape
-        ]
         
-        avg_route_jsd_loss = torch.stack(meta_losses).mean() if meta_losses else torch.tensor(0.0, device=device)
-        total_meta_loss = self.config.w_route_jsd * avg_route_jsd_loss
+        meta_losses = [
+            self._calculate_meta_loss(p - q.detach())
+            for p, q in zip(model_outputs["routing_logits"], all_goodness_logits)
+            if p.numel() > 0 and q.numel() > 0 and p.shape == q.shape
+        ]
+
+        avg_meta_loss = torch.stack(meta_losses).mean() if meta_losses else torch.tensor(0.0, device=device)
+        total_meta_loss = self.config.w_meta * avg_meta_loss
 
         if total_meta_loss > 0:
             meta_grads = torch.autograd.grad(total_meta_loss, self.routing_params, allow_unused=True)
@@ -177,24 +163,13 @@ class LearningDynamics:
                     if grad is not None:
                         param.grad = grad
 
-        for i, module in enumerate(self.spl_modules):
-            if i < len(all_goodness):
-                goodness = all_goodness[i]
-                goodness_mask = torch.mean(goodness, dim=(0, 1)).detach()
-
-                if module.mu_weight.grad is not None:
-                    module.mu_weight.grad.mul_(goodness_mask.unsqueeze(1))
-                if module.mu_bias.grad is not None:
-                    module.mu_bias.grad.mul_(goodness_mask)
-
         torch.nn.utils.clip_grad_value_(self.computation_params, clip_value=1.0)
         self.optimizer_comp.step()
         self.optimizer_route.step()
 
         return {
-            "route_jsd_loss": avg_route_jsd_loss,
+            "meta_loss": avg_meta_loss,
             "mu_surprises": all_mu_surprises,
-            "goodness_scores": all_goodness,
             "goodness_logits": all_goodness_logits,
             "proto_weights": [p.detach() for name, p in self.routing_params_with_names if "proto_weight" in name],
         }
@@ -213,7 +188,7 @@ class Trainer:
         self.checkpoint_dir.mkdir(exist_ok=True)
         self.global_step, self.epoch, self.start_task_idx, self.start_view_idx = 0, 0, 0, 0
         self.captured_spl_inputs: list[torch.Tensor] = []
-        self.captured_spl_grad_outputs: list[torch.Tensor] = []
+        self.captured_masked_grad_outputs: list[torch.Tensor] = []
 
     def _setup_data(self):
         collator = ArcCollator(self.tokenizer, max_len=self.config.model.max_position_embeddings)
@@ -295,7 +270,7 @@ class Trainer:
         self.model.train()
         
         self.captured_spl_inputs.clear()
-        self.captured_spl_grad_outputs.clear()
+        self.captured_masked_grad_outputs.clear()
 
         with sdpa_kernel(SDPBackend.EFFICIENT_ATTENTION):
             with torch.autocast(device_type=self.config.device, dtype=torch.float32):
@@ -304,7 +279,7 @@ class Trainer:
                     coords=batch["coords"],
                     return_dict=True,
                     captured_spl_inputs=self.captured_spl_inputs,
-                    captured_spl_grad_outputs=self.captured_spl_grad_outputs,
+                    captured_masked_grad_outputs=self.captured_masked_grad_outputs,
                 )
                 main_loss = F.cross_entropy(
                     model_outputs["logits"][:, :-1, :].contiguous().view(-1, self.config.model.vocab_size),
@@ -317,7 +292,7 @@ class Trainer:
             return None
 
         signals = self.dynamics.compute_and_apply_gradients(
-            main_loss, model_outputs, self.device, self.captured_spl_inputs, self.captured_spl_grad_outputs, model_outputs["masked_outputs"]
+            main_loss, model_outputs, self.device, self.captured_spl_inputs, self.captured_masked_grad_outputs, model_outputs["masked_outputs"]
         )
         model_outputs.update({"labels": batch["labels"], "sample_entropy": batch["sample_entropy"]})
         metrics = self.observer.calculate_metrics(main_loss, model_outputs, signals, batch["input_ids"], self.model)
