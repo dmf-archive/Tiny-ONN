@@ -165,6 +165,22 @@ class LearningDynamics:
                     if grad is not None:
                         param.grad = grad
 
+        with torch.no_grad():
+            num_spl_modules = len(self.spl_modules)
+            for i in range(num_spl_modules):
+                spl_module = self.spl_modules[i]
+                goodness = all_goodness_logits[i]
+                
+                gate = (torch.mean(goodness, dim=(0, 1)) > 0).float()
+                
+                if spl_module.mu_weight.grad is not None:
+                    gated_grad_mu = spl_module.mu_weight.grad * gate.unsqueeze(1)
+                    spl_module.mu_weight.grad.copy_(gated_grad_mu)
+                
+                if spl_module.mu_bias.grad is not None:
+                    gated_grad_bias = spl_module.mu_bias.grad * gate
+                    spl_module.mu_bias.grad.copy_(gated_grad_bias)
+
         torch.nn.utils.clip_grad_value_(self.computation_params, clip_value=1.0)
         self.optimizer_comp.step()
         self.optimizer_route.step()
