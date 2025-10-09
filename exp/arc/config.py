@@ -34,7 +34,8 @@ class TrainConfig:
     w_meta: float = 1.0
 
     num_epochs: int = 20
-    num_augmentation_views: int = 2
+    num_augmentation_views: int = 8
+    max_steps_per_view: int = 5
 
     device: str = "cuda"
     seed: int = 42

@@ -53,11 +53,11 @@ class Observer:
 
             input_ids_aligned = input_ids[:, :-1]
             is_identity_transform = (input_ids_aligned == labels_acc)
-            
+
             is_computation_needed = ~is_identity_transform & mask
 
             inefficient_routing_event = token_is_fully_silent_aligned & is_computation_needed
-            
+
             num_computation_needed = is_computation_needed.sum()
             if num_computation_needed > 0:
                 inefficient_routing_rate = (inefficient_routing_event.sum() / num_computation_needed).item()

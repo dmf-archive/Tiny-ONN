@@ -330,7 +330,7 @@ class Trainer:
             if start_view > 0:
                 selected_views = all_views[start_view:]
             else:
-                selected_views = all_views
+                selected_views = random.sample(all_views, self.config.num_augmentation_views)
 
             for view_idx in selected_views:
                 batch_cpu = self._prepare_batch(task_data, view_idx, self.config.model.max_position_embeddings)
@@ -341,15 +341,13 @@ class Trainer:
                     continue
 
                 batch = {k: v.to(self.device) for k, v in batch_cpu.items() if isinstance(v, torch.Tensor)}
-                converged = False
-                for step in range(5):
+                for step in range(self.config.max_steps_per_view):
                     result = self._train_step(batch, epoch, task_idx, view_idx)
                     if not result:
                         break
-                    metrics, masked_routing_logits, routing_logits, _ = result
+                    metrics, _, _, _ = result
                     if metrics["main_loss"] <= 0.05 and metrics["token_acc"] >= 0.999:
                         self.console.print(f"Task {task_idx} view {view_idx} converged in {step + 1} steps.")
-                        converged = True
                         break
             self.start_view_idx = 0
         self.start_task_idx, self.start_view_idx = 0, 0
@@ -406,7 +404,7 @@ class Trainer:
                     self.optimizer_comp.load_state_dict(state["optimizer_comp_state_dict"])
                     self.optimizer_route.load_state_dict(state["optimizer_route_state_dict"])
                     self.global_step, self.epoch, self.start_task_idx, self.start_view_idx = (state["step"], state["epoch"], state["task_idx"], state["view_idx"])
-                
+
                 elif path.is_file():
                     ckpt = torch.load(path, map_location=self.device)
                     self.model.load_state_dict({k.replace(".sbl", ".spl"): v for k, v in ckpt["model_state_dict"].items()})
@@ -419,7 +417,7 @@ class Trainer:
 
             except Exception as e:
                 self.console.print(f"[bold red]Corrupted or invalid checkpoint {path}: {e}. Trying next.[/bold red]")
-        
+
         self.console.print("[bold yellow]No valid checkpoint found.[/bold yellow]")
 
 
