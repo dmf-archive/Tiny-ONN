@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import torch
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import Dataset
@@ -96,24 +97,59 @@ class InMemoryArcDataset(Dataset):
     def __init__(self, data_path: str, tokenizer: ArcColorTokenizer, split: str = "training"):
         self.data_path = Path(data_path) / split
         self.tasks = []
-
         file_paths = sorted(list(self.data_path.glob("*.json")))
         for path in file_paths:
             with open(path) as f:
                 task_data = json.load(f)
-
             if (split == "training" or split == "evaluation") and "test" in task_data and task_data["test"] and "output" in task_data["test"][0]:
                 self.tasks.append(task_data)
 
-        serializer_for_sorting = GridSerializer(tokenizer)
+        tasks_with_metrics = [
+            (task, self._calculate_task_difficulty(task)) for task in self.tasks
+        ]
 
-        tasks_with_lengths = []
-        for task in self.tasks:
-            input_ids, _, _ = serializer_for_sorting.serialize_task(task)
-            tasks_with_lengths.append((task, len(input_ids)))
+        metrics_df = {
+            "max_pixels": self._normalize([m["max_pixels"] for _, m in tasks_with_metrics]),
+            "entropy": self._normalize([m["entropy"] for _, m in tasks_with_metrics]),
+        }
 
-        sorted_tasks = sorted(tasks_with_lengths, key=lambda x: x[1])
-        self.tasks = [task for task, length in sorted_tasks]
+        tasks_with_scores = []
+        for i, (task, _) in enumerate(tasks_with_metrics):
+            score = metrics_df["max_pixels"][i] + metrics_df["entropy"][i]
+            tasks_with_scores.append((task, score))
+
+        sorted_tasks = sorted(tasks_with_scores, key=lambda x: x[1])
+        self.tasks = [task for task, score in sorted_tasks]
+
+    @staticmethod
+    def _normalize(values: list[float]) -> list[float]:
+        min_val, max_val = min(values), max(values)
+        if max_val == min_val:
+            return [0.0] * len(values)
+        return [(v - min_val) / (max_val - min_val) for v in values]
+
+    @staticmethod
+    def _calculate_grid_entropy(grid: list[list[int]]) -> float:
+        flat_grid = [item for sublist in grid for item in sublist]
+        if not flat_grid:
+            return 0.0
+        _, counts = np.unique(flat_grid, return_counts=True)
+        probs = counts / len(flat_grid)
+        return -np.sum(probs * np.log2(probs))
+
+    def _calculate_task_difficulty(self, task_data: dict) -> dict[str, float]:
+        max_pixels = 0
+        entropies = []
+
+        for pair in task_data["train"] + task_data["test"]:
+            input_grid, output_grid = np.array(pair["input"]), np.array(pair["output"])
+            max_pixels = max(max_pixels, input_grid.size, output_grid.size)
+            entropies.append(self._calculate_grid_entropy(pair["output"]))
+
+        return {
+            "max_pixels": float(max_pixels),
+            "entropy": np.mean(entropies) if entropies else 0.0,
+        }
 
     def __len__(self) -> int:
         return len(self.tasks)
