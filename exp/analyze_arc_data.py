@@ -9,7 +9,7 @@ from exp.arc.tokenizer import ArcColorTokenizer
 from exp.arc.data import GridSerializer
 
 def analyze_split(data_path: Path, split_name: str, console: Console):
-    console.print(f"[bold cyan]Analyzing ARC dataset at: {data_path}[/bold cyan]")
+    console.print(f"[bold cyan]Analyzing {split_name} ARC dataset at: {data_path}[/bold cyan]")
     
     tokenizer = ArcColorTokenizer()
     serializer = GridSerializer(tokenizer)
@@ -26,45 +26,48 @@ def analyze_split(data_path: Path, split_name: str, console: Console):
         with open(task_file, 'r') as f:
             task_data = json.load(f)
             
+            input_ids, _, _ = serializer.serialize_task(task_data)
+            token_lengths.append(len(input_ids))
+            
             for part in ['train', 'test']:
                 if part in task_data:
-                    for mini_task in task_data[part]:
-                        input_ids, _ = serializer.serialize_mini_task(mini_task)
-                        token_lengths.append(len(input_ids))
-                        
+                    for item in task_data[part]:
                         for grid_type in ['input', 'output']:
-                            if grid_type in mini_task:
-                                grid = mini_task[grid_type]
+                            if item.get(grid_type):
+                                grid = item[grid_type]
                                 h = len(grid)
                                 w = len(grid[0]) if h > 0 else 0
                                 grid_sizes.append(f"{h}x{w}")
 
-    console.print(f"      Token Length Distribution")
-    table = Table(box=None, show_header=True, header_style="bold magenta")
-    table.add_column("Metric", style="cyan")
-    table.add_column("Value", style="green")
+    console.print(f"\n      Token Length Distribution for {split_name}")
+    table_len = Table(box=None, show_header=True, header_style="bold magenta")
+    table_len.add_column("Metric", style="cyan")
+    table_len.add_column("Value", style="green")
+    
     if token_lengths:
         arr = np.array(token_lengths)
-        table.add_row("Total Tasks Analyzed", str(len(arr)))
-        table.add_row("Min Length", str(np.min(arr)))
-        table.add_row("Max Length", str(np.max(arr)))
-        table.add_row("Mean Length", f"{np.mean(arr):.2f}")
+        table_len.add_row("Total Tasks Analyzed", str(len(arr)))
+        table_len.add_row("Min Length", str(np.min(arr)))
+        table_len.add_row("Max Length", str(np.max(arr)))
+        table_len.add_row("Mean Length", f"{np.mean(arr):.2f}")
         for p in [50, 80, 90, 95, 98, 99]:
-            table.add_row(f"{p}th percentile", f"{np.percentile(arr, p):.2f}")
-    console.print(table)
+            table_len.add_row(f"{p}th percentile", f"{np.percentile(arr, p):.2f}")
     
-    console.print(f"     Top 15 Most Common Grid Sizes")
-    table = Table(box=None, show_header=True, header_style="bold magenta")
-    table.add_column("Grid Size (HxW)", style="cyan")
-    table.add_column("Count", style="green")
-    table.add_column("Percentage", style="yellow")
+    console.print(table_len)
+    
+    console.print(f"     Top 15 Most Common Grid Sizes for {split_name}")
+    table_grid = Table(box=None, show_header=True, header_style="bold magenta")
+    table_grid.add_column("Grid Size (HxW)", style="cyan")
+    table_grid.add_column("Count", style="green")
+    table_grid.add_column("Percentage", style="yellow")
+
     if grid_sizes:
         counts = Counter(grid_sizes)
         total = sum(counts.values())
         for size, count in counts.most_common(15):
-            table.add_row(size, str(count), f"{(count/total)*100:.2f}%")
-    console.print(table)
-
+            table_grid.add_row(size, str(count), f"{(count/total)*100:.2f}%")
+    
+    console.print(table_grid)
 
 def main():
     console = Console()

@@ -34,7 +34,7 @@ class Observer:
         self, main_loss: torch.Tensor, model_outputs: dict, signals: dict, input_ids: torch.Tensor, model: nn.Module
     ) -> dict[str, float]:
         logits, labels = model_outputs["logits"], model_outputs["labels"]
-        raw_weights = model_outputs.get("raw_weights", [])
+        masked_routing_logits = model_outputs.get("masked_routing_logits", [])
 
         logits_acc, labels_acc = logits[:, :-1, :], labels[:, 1:]
         mask = labels_acc != -100
@@ -46,8 +46,8 @@ class Observer:
         )
 
         identity_transform_rate = 0.0
-        if raw_weights:
-            token_routing_failed_full = torch.stack([torch.all(rw == 0, dim=-1) for rw in raw_weights]).all(dim=0)
+        if masked_routing_logits:
+            token_routing_failed_full = torch.stack([torch.all(mrl == 0, dim=-1) for mrl in masked_routing_logits]).all(dim=0)
             token_routing_failed = token_routing_failed_full[:, :-1]
             input_ids_aligned = input_ids[:, :-1]
             is_identity = (input_ids_aligned == labels_acc)
@@ -55,22 +55,20 @@ class Observer:
             if mask.sum() > 0:
                 identity_transform_rate = (true_identity_mask.sum() / mask.sum()).item()
 
-        mu_surp_norms = [torch.norm(s.detach(), p=2).item() for s in signals.get("mu_surprises", []) if s.numel() > 0]
-        proto_surp_norms = [torch.norm(s.detach(), p=2).item() for s in signals.get("proto_surprises", []) if s.numel() > 0]
-
-        all_surp_norms = mu_surp_norms + proto_surp_norms
+        mu_grad_norms = [s.item() for s in signals.get("mu_grad_norms", []) if s.numel() > 0]
+        all_surp_norms = mu_grad_norms
         complexity_cost = sum(all_surp_norms) if all_surp_norms else 0.0
         pi_score = torch.exp(-1.0 * main_loss.detach() - 1.0 * complexity_cost).item()
 
         num_spl_modules = self.config.model.num_layers * 4
         act_rates = [0.0] * num_spl_modules
-        if raw_weights:
-            act_rates = [rw.gt(0).float().mean().item() for rw in raw_weights]
+        if masked_routing_logits:
+            act_rates = [mrl.gt(0).float().mean().item() for mrl in masked_routing_logits]
 
         num_layers = self.config.model.num_layers
 
         routing_failures = (
-            [torch.all(rw == 0, dim=-1).float().mean().item() for rw in raw_weights] if raw_weights else [0.0]
+            [torch.all(mrl == 0, dim=-1).float().mean().item() for mrl in masked_routing_logits] if masked_routing_logits else [0.0]
         )
         routing_failure_rate = sum(routing_failures) / len(routing_failures) if routing_failures else 0.0
 
@@ -105,6 +103,15 @@ class Observer:
                 metrics["gate_logit_max"] = flat_logits.max().item()
                 metrics["gate_logit_sigma"] = flat_logits.std().item()
 
+        goodness_logits_list = signals.get("goodness_logits", [])
+        if goodness_logits_list:
+            flat_goodness = torch.cat([g.detach().float().view(-1) for g in goodness_logits_list if g.numel() > 0])
+            if flat_goodness.numel() > 0:
+                total_neurons = flat_goodness.numel()
+                metrics["goodness_rate"] = (torch.sum(flat_goodness > 0) / total_neurons).item()
+                metrics["badness_rate"] = (torch.sum(flat_goodness < 0) / total_neurons).item()
+                metrics["shutdown_rate"] = (torch.sum(flat_goodness == 0) / total_neurons).item()
+
         return metrics
 
     def log_step(
@@ -128,6 +135,7 @@ class Observer:
             f"PI: {metrics.get('pi_score', 0.0):.3f} | "
             f"Act%({metrics.get('activation_rate_l0', 0.0)*100:.1f}/{metrics.get('activation_rate_l_mid', 0.0)*100:.1f}/{metrics.get('activation_rate_ln', 0.0)*100:.1f}/{metrics.get('activation_rate_avg', 0.0)*100:.1f}) | "
             f"Gate({metrics.get('gate_logit_avg', 0.0):.3f}/{metrics.get('gate_logit_sigma', 0.0):.3f}/{metrics.get('gate_logit_max', 0.0):.3f}) | "
+            f"GBS%({metrics.get('goodness_rate', 0.0)*100:.1f}/{metrics.get('badness_rate', 0.0)*100:.1f}/{metrics.get('shutdown_rate', 0.0)*100:.1f}) | "
             f"Fail: {metrics.get('routing_failure_rate', 0.0)*100:.1f}% | "
             f"Speed: {steps_per_sec:.2f} st/s"
         )
@@ -135,10 +143,10 @@ class Observer:
 
     def visualize_prototypes(self, signals: dict, global_step: int):
         proto_weights = signals.get("proto_weights", [])
-        raw_weights = signals.get("raw_weights", [])
+        masked_routing_logits = signals.get("masked_routing_logits", [])
         goodness_logits = signals.get("goodness_logits", [])
 
-        if not proto_weights or not raw_weights or not goodness_logits:
+        if not proto_weights or not masked_routing_logits or not goodness_logits:
             return
 
         num_spl = 4
@@ -157,11 +165,11 @@ class Observer:
                 if idx >= len(proto_weights): continue
 
                 protos = proto_weights[idx].cpu().to(torch.float32)
-                rw = raw_weights[idx].cpu().to(torch.float32)
+                mrl = masked_routing_logits[idx].cpu().to(torch.float32)
                 logits_raw = goodness_logits[idx].cpu().to(torch.float32)
                 logits = torch.mean(logits_raw, dim=(0, 1)) if logits_raw.ndim == 3 else logits_raw
 
-                num_activations = (rw > 0).float().sum(dim=(0, 1))
+                num_activations = (mrl > 0).float().sum(dim=(0, 1))
 
                 statuses = []
                 for k in range(logits.shape[0]):

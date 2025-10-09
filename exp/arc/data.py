@@ -65,7 +65,7 @@ class GridSerializer:
         full_ids.append(self.tokenizer.eos_token_id)
         full_coords.append((-1, -1))
         labels.append(self.tokenizer.eos_token_id)
-        
+
         return full_ids, labels, full_coords
 
     def serialize_for_inference(self, task_data: dict[str, Any]) -> tuple[list[int], list[tuple[int, int]]]:

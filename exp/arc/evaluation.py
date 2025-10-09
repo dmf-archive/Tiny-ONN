@@ -68,7 +68,7 @@ class ArcGenerator:
                 next_token_logits = logits[:, -1, :]
                 next_token_probs = torch.softmax(next_token_logits, dim=-1)
                 next_token = torch.argmax(next_token_probs, dim=-1, keepdim=True)
-                
+
                 prob = next_token_probs[0, next_token.item()].item()
                 probabilities.append(prob)
 

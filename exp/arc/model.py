@@ -27,7 +27,7 @@ def apply_rotary_pos_emb(
 def mas_normalize(logits: torch.Tensor) -> torch.Tensor:
     max_abs_val = torch.max(torch.abs(logits), dim=-1, keepdim=True).values
     scaled_logits = logits / (max_abs_val + 1e-9)
-    return F.relu(scaled_logits)
+    return scaled_logits
 
 
 @torch.jit.script
@@ -56,8 +56,8 @@ def spl_forward(
 
 
 @torch.jit.script
-def get_routed_weights(routing_logits: torch.Tensor) -> torch.Tensor:
-    return mas_normalize(routing_logits)
+def get_masked_routing_logits(routing_logits: torch.Tensor) -> torch.Tensor:
+    return F.relu(routing_logits)
 class RotaryEmbedding(nn.Module):
     def __init__(
         self,
@@ -170,17 +170,18 @@ class MoIETransformerBlock(nn.Module):
         c_k, mv_k, pc_k = self.attn.spl_k(ln1_out, outgoing_proto_state["attn_k"])
         c_v, mv_v, pc_v = self.attn.spl_v(ln1_out, outgoing_proto_state["attn_v"])
 
-        all_masked, all_comp, all_raw, all_routing_logits, all_spl_inputs = [], [], [], [], []
+        all_masked, all_comp, all_masked_routing_logits, all_routing_logits, all_spl_inputs = [], [], [], [], []
 
         comp_qkv, match_qkv, costs_qkv = [c_q, c_k, c_v], [mv_q, mv_k, mv_v], [pc_q, pc_k, pc_v]
         q, k, v = torch.zeros_like(c_q), torch.zeros_like(c_k), torch.zeros_like(c_v)
 
         for i in range(3):
-            routing_logits = (match_qkv[i] - costs_qkv[i]) * self.routing_gain
+            cost_score = mas_normalize(costs_qkv[i])
+            routing_logits = (match_qkv[i] - cost_score) * self.routing_gain
             computation_output = comp_qkv[i]
 
-            raw_weights = get_routed_weights(routing_logits)
-            masked = computation_output * raw_weights
+            masked_routing_logits = get_masked_routing_logits(routing_logits)
+            masked = computation_output * masked_routing_logits
             if i == 0:
                 q = masked
             elif i == 1:
@@ -189,7 +190,7 @@ class MoIETransformerBlock(nn.Module):
                 v = masked
             all_masked.append(masked)
             all_comp.append(computation_output)
-            all_raw.append(raw_weights)
+            all_masked_routing_logits.append(masked_routing_logits)
             all_routing_logits.append(routing_logits)
 
         cos, sin = pos_emb
@@ -220,13 +221,13 @@ class MoIETransformerBlock(nn.Module):
 
         computation_output_o = c_o
 
-        rw_o = get_routed_weights(routing_logits_o)
-        m_o = computation_output_o * rw_o
+        masked_routing_logits_o = get_masked_routing_logits(routing_logits_o)
+        m_o = computation_output_o * masked_routing_logits_o
         x_out = x + m_o
 
         all_masked.append(m_o)
         all_comp.append(computation_output_o)
-        all_raw.append(rw_o)
+        all_masked_routing_logits.append(masked_routing_logits_o)
         all_routing_logits.append(routing_logits_o)
         all_spl_inputs.extend([ln1_out] * 3 + [attn_out])
 
@@ -243,7 +244,7 @@ class MoIETransformerBlock(nn.Module):
                 all_masked[2].register_hook(lambda grad: captured_masked_grad_outputs.insert(0, grad.clone().detach()))
                 all_masked[3].register_hook(lambda grad: captured_masked_grad_outputs.insert(0, grad.clone().detach()))
 
-        return x_out, all_masked, all_comp, all_raw, all_spl_inputs, all_routing_logits, present_kv, outgoing_proto_state
+        return x_out, all_masked, all_comp, all_masked_routing_logits, all_spl_inputs, all_routing_logits, present_kv, outgoing_proto_state
 
 
 class ArcEmbedding(nn.Module):
@@ -294,7 +295,7 @@ class ArcTransformer(nn.Module):
         pos_emb = self.rotary_emb(x, seq_len=input_ids.size(1))
         past_key_values = past_key_values if past_key_values is not None else [None] * len(self.blocks)
 
-        all_masked, all_comp, all_spl_in, all_raw, all_protos, all_routing_logits, presents = (
+        all_masked, all_comp, all_spl_in, all_masked_routing_logits, all_protos, all_routing_logits, presents = (
             [],
             [],
             [],
@@ -310,7 +311,7 @@ class ArcTransformer(nn.Module):
                 x,
                 masked,
                 comp,
-                raw,
+                masked_routing_logits,
                 spl_inputs,
                 routing_logits,
                 present_kv,
@@ -327,7 +328,7 @@ class ArcTransformer(nn.Module):
             all_masked.extend(masked)
             all_comp.extend(comp)
             all_spl_in.extend(spl_inputs)
-            all_raw.extend(raw)
+            all_masked_routing_logits.extend(masked_routing_logits)
             all_protos.append(outgoing_proto_state)
             all_routing_logits.extend(routing_logits)
             incoming_proto_state = outgoing_proto_state
@@ -335,7 +336,7 @@ class ArcTransformer(nn.Module):
         logits = self.lm_head(x)
 
         if not return_dict:
-            return logits, x, all_masked, all_comp, all_protos, all_spl_in, all_raw, all_routing_logits, presents
+            return logits, x, all_masked, all_comp, all_protos, all_spl_in, all_masked_routing_logits, all_routing_logits, presents
 
         return {
             "logits": logits,
@@ -344,7 +345,7 @@ class ArcTransformer(nn.Module):
             "computation_outputs": all_comp,
             "proto_states": all_protos,
             "spl_inputs": all_spl_in,
-            "raw_weights": all_raw,
+            "masked_routing_logits": all_masked_routing_logits,
             "routing_logits": all_routing_logits,
             "past_key_values": presents,
         }
