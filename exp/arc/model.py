@@ -251,24 +251,9 @@ class ArcEmbedding(nn.Module):
     def __init__(self, config: ModelConfig, dtype: torch.dtype = torch.float32):
         super().__init__()
         self.color_embedding = nn.Embedding(config.vocab_size, config.hidden_size, dtype=dtype)
-        self.row_embedding = nn.Embedding(31, config.hidden_size, dtype=dtype)
-        self.col_embedding = nn.Embedding(31, config.hidden_size, dtype=dtype)
 
-    def forward(self, input_ids: torch.Tensor, coords: torch.Tensor) -> torch.Tensor:
-        color_embed = self.color_embedding(input_ids)
-
-        row_coords = coords[..., 0]
-        col_coords = coords[..., 1]
-
-        row_embed = self.row_embedding(row_coords.clamp(min=0, max=30))
-        col_embed = self.col_embedding(col_coords.clamp(min=0, max=30))
-
-        is_special_token = (coords[..., 0] == -1).unsqueeze(-1)
-
-        pos_embed = row_embed + col_embed
-        final_embed = color_embed + torch.where(is_special_token, torch.zeros_like(pos_embed), pos_embed)
-
-        return final_embed
+    def forward(self, input_ids: torch.Tensor, coords: torch.Tensor | None = None) -> torch.Tensor:
+        return self.color_embedding(input_ids)
 
 class ArcTransformer(nn.Module):
     def __init__(self, config: ModelConfig, device: torch.device | str):
@@ -285,13 +270,13 @@ class ArcTransformer(nn.Module):
     def forward(
         self,
         input_ids: torch.Tensor,
-        coords: torch.Tensor,
+        coords: torch.Tensor | None = None,
         past_key_values: list | None = None,
         return_dict: bool = False,
         captured_spl_inputs: list | None = None,
         captured_masked_grad_outputs: list | None = None,
     ):
-        x = self.embedding(input_ids, coords)
+        x = self.embedding(input_ids)
         pos_emb = self.rotary_emb(x, seq_len=input_ids.size(1))
         past_key_values = past_key_values if past_key_values is not None else [None] * len(self.blocks)
 

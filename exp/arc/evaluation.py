@@ -59,9 +59,8 @@ class ArcGenerator:
         ):
             for _ in range(max_new_tokens):
                 model_input = tokens if past_key_values is None else tokens[:, -1:]
-                coords_input = coords if past_key_values is None else coords[:, -1:]
                 outputs = self.model(
-                    model_input, coords=coords_input, past_key_values=past_key_values, return_dict=True
+                    model_input, past_key_values=past_key_values, return_dict=True
                 )
                 logits, past_key_values = outputs["logits"], outputs["past_key_values"]
 
@@ -101,7 +100,7 @@ class ArcGenerator:
         with sdpa_kernel(SDPBackend.EFFICIENT_ATTENTION), torch.autocast(
             device_type=self.device.type, dtype=torch.float16
         ):
-            outputs = self.model(input_ids, coords=input_coords, return_dict=True)
+            outputs = self.model(input_ids, return_dict=True)
             logits, cache = outputs["logits"], [outputs["past_key_values"]]
 
         logits_sliced = logits[0, pos - 1 :]
@@ -144,7 +143,7 @@ class ArcGenerator:
                         next_coord = torch.tensor([[next_coord_tuple]], dtype=torch.long, device=self.device)
 
                         outputs = self.model(
-                            next_token_tensor, coords=next_coord, past_key_values=cache[0], return_dict=True
+                            next_token_tensor, past_key_values=cache[0], return_dict=True
                         )
                         new_logits, cache[0] = outputs["logits"], outputs["past_key_values"]
                         new_logits = new_logits[0]

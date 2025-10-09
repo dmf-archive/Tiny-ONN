@@ -224,7 +224,11 @@ class Trainer:
     def _prepare_batch(self, task_data: dict, view_idx: int, max_len: int) -> dict[str, torch.Tensor] | None:
         all_colors = set()
         grids_cpu_lists = []
-        for pair in task_data["train"]:
+
+        train_pairs = task_data["train"].copy()
+        random.shuffle(train_pairs)
+
+        for pair in train_pairs:
             grids_cpu_lists.extend([pair["input"], pair["output"]])
             for row in pair["input"]:
                 all_colors.update(row)
@@ -249,7 +253,7 @@ class Trainer:
         augmented_grids_list = [g.tolist() for g in augmented_grids]
 
         transformed_train, ptr = [], 0
-        for _ in task_data["train"]:
+        for _ in train_pairs:
             transformed_train.append({"input": augmented_grids_list[ptr], "output": augmented_grids_list[ptr + 1]})
             ptr += 2
 
@@ -279,7 +283,6 @@ class Trainer:
         ):
             model_outputs = self.model(
                 batch["input_ids"],
-                coords=batch["coords"],
                 return_dict=True,
                 captured_spl_inputs=self.captured_spl_inputs,
                 captured_masked_grad_outputs=self.captured_masked_grad_outputs,
