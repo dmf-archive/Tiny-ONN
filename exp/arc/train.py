@@ -328,7 +328,7 @@ class Trainer:
             if start_view > 0:
                 selected_views = all_views[start_view:]
             else:
-                selected_views = random.sample(all_views, self.config.num_augmentation_views)
+                selected_views = all_views
 
             for view_idx in selected_views:
                 batch_cpu = self._prepare_batch(task_data, view_idx, self.config.model.max_position_embeddings)
@@ -340,7 +340,7 @@ class Trainer:
 
                 batch = {k: v.to(self.device) for k, v in batch_cpu.items() if isinstance(v, torch.Tensor)}
                 converged = False
-                for step in range(100):
+                for step in range(5):
                     result = self._train_step(batch, epoch, task_idx, view_idx)
                     if not result:
                         break
@@ -349,8 +349,6 @@ class Trainer:
                         self.console.print(f"Task {task_idx} view {view_idx} converged in {step + 1} steps.")
                         converged = True
                         break
-                if not converged:
-                    self.console.print(f"[red]Task {task_idx} view {view_idx} hit MAX_STEPS.[/red]")
             self.start_view_idx = 0
         self.start_task_idx, self.start_view_idx = 0, 0
 
