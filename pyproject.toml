@@ -13,6 +13,7 @@ dependencies = [
   "matplotlib",
   "pillow>=11.3.0",
   "rich>=14.0.0",
+  "safetensors>=0.5.3",
   "scikit-learn>=1.7.0",
   "tokenizers>=0.21.2",
   "torch>=2.7.1",

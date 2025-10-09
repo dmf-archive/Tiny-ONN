@@ -45,15 +45,22 @@ class Observer:
             else 0.0
         )
 
-        identity_transform_rate = 0.0
+        inefficient_routing_rate = 0.0
         if masked_routing_logits:
-            token_routing_failed_full = torch.stack([torch.all(mrl == 0, dim=-1) for mrl in masked_routing_logits]).all(dim=0)
-            token_routing_failed = token_routing_failed_full[:, :-1]
+            all_module_silent_masks = [torch.all(mrl == 0, dim=-1) for mrl in masked_routing_logits]
+            token_is_fully_silent = torch.stack(all_module_silent_masks).all(dim=0)
+            token_is_fully_silent_aligned = token_is_fully_silent[:, :-1]
+
             input_ids_aligned = input_ids[:, :-1]
-            is_identity = (input_ids_aligned == labels_acc)
-            true_identity_mask = is_identity & token_routing_failed & mask
-            if mask.sum() > 0:
-                identity_transform_rate = (true_identity_mask.sum() / mask.sum()).item()
+            is_identity_transform = (input_ids_aligned == labels_acc)
+            
+            is_computation_needed = ~is_identity_transform & mask
+
+            inefficient_routing_event = token_is_fully_silent_aligned & is_computation_needed
+            
+            num_computation_needed = is_computation_needed.sum()
+            if num_computation_needed > 0:
+                inefficient_routing_rate = (inefficient_routing_event.sum() / num_computation_needed).item()
 
         mu_grad_norms = [s.item() for s in signals.get("mu_grad_norms", []) if s.numel() > 0]
         all_surp_norms = mu_grad_norms
@@ -66,11 +73,6 @@ class Observer:
             act_rates = [mrl.gt(0).float().mean().item() for mrl in masked_routing_logits]
 
         num_layers = self.config.model.num_layers
-
-        routing_failures = (
-            [torch.all(mrl == 0, dim=-1).float().mean().item() for mrl in masked_routing_logits] if masked_routing_logits else [0.0]
-        )
-        routing_failure_rate = sum(routing_failures) / len(routing_failures) if routing_failures else 0.0
 
         metrics = {
             "main_loss": main_loss.item(),
@@ -91,8 +93,7 @@ class Observer:
             "activation_rate_l_mid": sum(act_rates[num_layers * 2 : num_layers * 2 + 4]) / 4 if len(act_rates) > num_layers * 2 + 4 else 0.0,
             "activation_rate_ln": sum(act_rates[-4:]) / 4 if act_rates else 0.0,
             "act_rates": act_rates,
-            "routing_failure_rate": routing_failure_rate,
-            "identity_transform_rate": identity_transform_rate,
+            "inefficient_routing_rate": inefficient_routing_rate,
         }
 
         routing_logits = model_outputs.get("routing_logits", [])
@@ -136,7 +137,7 @@ class Observer:
             f"Act%({metrics.get('activation_rate_l0', 0.0)*100:.1f}/{metrics.get('activation_rate_l_mid', 0.0)*100:.1f}/{metrics.get('activation_rate_ln', 0.0)*100:.1f}/{metrics.get('activation_rate_avg', 0.0)*100:.1f}) | "
             f"Gate({metrics.get('gate_logit_avg', 0.0):.3f}/{metrics.get('gate_logit_sigma', 0.0):.3f}/{metrics.get('gate_logit_max', 0.0):.3f}) | "
             f"GBS%({metrics.get('goodness_rate', 0.0)*100:.1f}/{metrics.get('badness_rate', 0.0)*100:.1f}/{metrics.get('shutdown_rate', 0.0)*100:.1f}) | "
-            f"Fail: {metrics.get('routing_failure_rate', 0.0)*100:.1f}% | "
+            f"Ineff_Fail: {metrics.get('inefficient_routing_rate', 0.0)*100:.1f}% | "
             f"Speed: {steps_per_sec:.2f} st/s"
         )
         self.console.print(log_str)

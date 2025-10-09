@@ -1,41 +1,40 @@
-# Python
-*.py[cod]
+# --- Python ---
+# Byte-compiled / optimized / DLL files
 __pycache__/
-*.egg-info/
-*.egg
-build/
+*.py[cod]
 *.so
 *.pyd
-*.pyc
-.venv/
+*.egg
+*.egg-info/
 
-# uv
-.uv/
-
-# System Files
-.DS_Store
-Thumbs.db
-
-# IDE/Editor
-.idea/
-*.swp
-*~
-
-# Logs
-*.log
-
-# Temporary files
-tmp/
-temp/
-
-uv.lock
-.python-version
-weights/
-
-*.db
-
+# Caches
 .ruff_cache/
 .pytest_cache/
 .mypy_cache/
 
+# --- Environment ---
+.venv/
+.uv/
+uv.lock
+.python-version
+
+# --- Build & Artifacts ---
+build/
+weights/
 *.pt
+*.safetensors
+
+# --- System & OS ---
+.DS_Store
+Thumbs.db
+
+# --- IDE / Editor ---
+.idea/
+*.swp
+*~
+
+# --- Logs & Temporary ---
+*.log
+tmp/
+temp/
+*.db

@@ -1,5 +1,6 @@
 import os
 import random
+import shutil
 import time
 from pathlib import Path
 from typing import Any
@@ -8,6 +9,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from rich.console import Console
+from safetensors.torch import load_file, save_file
 from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch.utils.data import DataLoader
 
@@ -362,32 +364,62 @@ class Trainer:
         self.console.print("[bold green]Training Finished.[/bold green]")
 
     def _save_checkpoint(self, task_idx: int, view_idx: int):
-        state = {
+        checkpoint_dir = self.checkpoint_dir / f"checkpoint_{self.global_step}"
+        checkpoint_dir.mkdir(exist_ok=True)
+
+        model_path = checkpoint_dir / "model.safetensors"
+        save_file(self.model.state_dict(), model_path)
+
+        trainer_state = {
             "epoch": self.epoch, "step": self.global_step, "task_idx": task_idx, "view_idx": view_idx,
-            "model_state_dict": self.model.state_dict(), "optimizer_comp_state_dict": self.optimizer_comp.state_dict(),
+            "optimizer_comp_state_dict": self.optimizer_comp.state_dict(),
             "optimizer_route_state_dict": self.optimizer_route.state_dict(),
         }
-        path = self.checkpoint_dir / f"checkpoint_{self.global_step}.pt"
-        torch.save(state, path)
-        ckpts = sorted(self.checkpoint_dir.glob("*.pt"), key=os.path.getmtime)
-        if len(ckpts) > self.config.max_checkpoints: os.remove(ckpts[0])
+        state_path = checkpoint_dir / "trainer_state.pt"
+        torch.save(trainer_state, state_path)
+
+        ckpts = sorted(self.checkpoint_dir.glob("checkpoint_*"), key=os.path.getmtime)
+        if len(ckpts) > self.config.max_checkpoints:
+            oldest_ckpt = ckpts[0]
+            if oldest_ckpt.is_dir():
+                shutil.rmtree(oldest_ckpt)
+            else:
+                os.remove(oldest_ckpt)
 
     def _load_checkpoint(self):
-        ckpts = sorted(self.checkpoint_dir.glob("*.pt"), key=os.path.getmtime, reverse=True)
+        ckpts = sorted(self.checkpoint_dir.glob("checkpoint_*"), key=os.path.getmtime, reverse=True)
         if not ckpts:
             self.console.print("[bold yellow]No checkpoint found.[/bold yellow]")
             return
+
         for path in ckpts:
             try:
-                ckpt = torch.load(path, map_location=self.device)
-                self.model.load_state_dict({k.replace(".sbl", ".spl"): v for k, v in ckpt["model_state_dict"].items()})
-                self.optimizer_comp.load_state_dict(ckpt["optimizer_comp_state_dict"])
-                self.optimizer_route.load_state_dict(ckpt["optimizer_route_state_dict"])
-                self.global_step, self.epoch, self.start_task_idx, self.start_view_idx = (ckpt["step"], ckpt["epoch"], ckpt["task_idx"], ckpt["view_idx"])
+                if path.is_dir():
+                    model_path = path / "model.safetensors"
+                    state_path = path / "trainer_state.pt"
+                    if not model_path.exists() or not state_path.exists():
+                        continue
+
+                    model_state_dict = load_file(model_path, device=str(self.device))
+                    self.model.load_state_dict(model_state_dict)
+                    state = torch.load(state_path, map_location=self.device)
+                    self.optimizer_comp.load_state_dict(state["optimizer_comp_state_dict"])
+                    self.optimizer_route.load_state_dict(state["optimizer_route_state_dict"])
+                    self.global_step, self.epoch, self.start_task_idx, self.start_view_idx = (state["step"], state["epoch"], state["task_idx"], state["view_idx"])
+                
+                elif path.is_file():
+                    ckpt = torch.load(path, map_location=self.device)
+                    self.model.load_state_dict({k.replace(".sbl", ".spl"): v for k, v in ckpt["model_state_dict"].items()})
+                    self.optimizer_comp.load_state_dict(ckpt["optimizer_comp_state_dict"])
+                    self.optimizer_route.load_state_dict(ckpt["optimizer_route_state_dict"])
+                    self.global_step, self.epoch, self.start_task_idx, self.start_view_idx = (ckpt["step"], ckpt["epoch"], ckpt["task_idx"], ckpt["view_idx"])
+
                 self.console.print(f"[bold green]Loaded checkpoint from {path} at step {self.global_step}.[/bold green]")
                 return
+
             except Exception as e:
-                self.console.print(f"[bold red]Corrupted checkpoint {path}: {e}. Trying next.[/bold red]")
+                self.console.print(f"[bold red]Corrupted or invalid checkpoint {path}: {e}. Trying next.[/bold red]")
+        
         self.console.print("[bold yellow]No valid checkpoint found.[/bold yellow]")
 
 
