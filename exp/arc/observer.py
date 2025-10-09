@@ -137,7 +137,7 @@ class Observer:
             f"Act%({metrics.get('activation_rate_l0', 0.0)*100:.1f}/{metrics.get('activation_rate_l_mid', 0.0)*100:.1f}/{metrics.get('activation_rate_ln', 0.0)*100:.1f}/{metrics.get('activation_rate_avg', 0.0)*100:.1f}) | "
             f"Gate({metrics.get('gate_logit_avg', 0.0):.3f}/{metrics.get('gate_logit_sigma', 0.0):.3f}/{metrics.get('gate_logit_max', 0.0):.3f}) | "
             f"GBS%({metrics.get('goodness_rate', 0.0)*100:.1f}/{metrics.get('badness_rate', 0.0)*100:.1f}/{metrics.get('shutdown_rate', 0.0)*100:.1f}) | "
-            f"Ineff_Fail: {metrics.get('inefficient_routing_rate', 0.0)*100:.1f}% | "
+            f"Fail: {metrics.get('inefficient_routing_rate', 0.0)*100:.1f}% | "
             f"Speed: {steps_per_sec:.2f} st/s"
         )
         self.console.print(log_str)

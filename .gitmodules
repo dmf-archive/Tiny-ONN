@@ -7,3 +7,9 @@
 [submodule "data/ARC-AGI-2"]
 	path = data/ARC-AGI-2
 	url = https://github.com/arcprize/ARC-AGI-2.git
+[submodule "ref/CircleRoPE"]
+	path = ref/CircleRoPE
+	url = https://github.com/lose4578/CircleRoPE.git
+[submodule "ref/arc-prize-2024"]
+	path = ref/arc-prize-2024
+	url = https://github.com/da-fr/arc-prize-2024.git
