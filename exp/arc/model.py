@@ -4,6 +4,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from .circle_rope_arc import apply_arc_rope_3d, build_3d_coords_2d, normalize_3d_coords
 from .config import ModelConfig
 
 
@@ -55,34 +56,6 @@ def spl_forward(
 
 
 
-@torch.jit.script
-def get_masked_routing_logits(routing_logits: torch.Tensor) -> torch.Tensor:
-    return F.relu(routing_logits)
-class RotaryEmbedding(nn.Module):
-    def __init__(
-        self,
-        dim: int,
-        max_position_embeddings: int = 2048,
-        base: int = 10000,
-        device: torch.device | None = None,
-        dtype: torch.dtype = torch.float32,
-    ):
-        super().__init__()
-        self.dim = dim
-        self.max_position_embeddings = max_position_embeddings
-        self.base = base
-        inv_freq = 1.0 / (
-            self.base ** (torch.arange(0, self.dim, 2, dtype=torch.float32, device=device) / self.dim)
-        )
-        self.register_buffer("inv_freq", inv_freq, persistent=False)
-
-    def forward(self, x: torch.Tensor, seq_len: int) -> tuple[torch.Tensor, torch.Tensor]:
-        t = torch.arange(seq_len, device=x.device, dtype=self.inv_freq.dtype)
-        freqs = torch.outer(t, self.inv_freq)
-        emb = torch.cat((freqs, freqs), dim=-1)
-        cos = emb.cos().unsqueeze(0).to(dtype=x.dtype)
-        sin = emb.sin().unsqueeze(0).to(dtype=x.dtype)
-        return cos, sin
 
 
 class SparseProtoLinear(nn.Module):
@@ -145,7 +118,7 @@ class MoIETransformerBlock(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        pos_emb: tuple,
+        coords: torch.Tensor | None = None,
         past_kv: tuple | None = None,
         incoming_proto_state: dict | None = None,
         captured_spl_inputs: list | None = None,
@@ -180,7 +153,7 @@ class MoIETransformerBlock(nn.Module):
             routing_logits = (match_qkv[i] - cost_score) * self.routing_gain
             computation_output = comp_qkv[i]
 
-            masked_routing_logits = get_masked_routing_logits(routing_logits)
+            masked_routing_logits = F.relu(routing_logits)
             masked = computation_output * masked_routing_logits
             if i == 0:
                 q = masked
@@ -193,8 +166,16 @@ class MoIETransformerBlock(nn.Module):
             all_masked_routing_logits.append(masked_routing_logits)
             all_routing_logits.append(routing_logits)
 
-        cos, sin = pos_emb
-        q, k = apply_rotary_pos_emb(q, k, cos, sin)
+        if coords is not None:
+            # Process each batch item separately to handle varying coordinate patterns
+            batch_size = q.shape[0]
+            seq_len = q.shape[1]
+            for b in range(batch_size):
+                batch_coords = coords[b]  # (seq_len, 2)
+                seq_pos = torch.arange(seq_len, device=q.device)
+                coords_3d = build_3d_coords_2d(batch_coords, seq_pos)
+                coords_3d = normalize_3d_coords(coords_3d)
+                q[b], k[b] = apply_arc_rope_3d(q[b], k[b], coords_3d)
 
         batch_size, seq_len, _ = q.shape
         num_heads = 1
@@ -221,7 +202,7 @@ class MoIETransformerBlock(nn.Module):
 
         computation_output_o = c_o
 
-        masked_routing_logits_o = get_masked_routing_logits(routing_logits_o)
+        masked_routing_logits_o = F.relu(routing_logits_o)
         m_o = computation_output_o * masked_routing_logits_o
         x_out = x + m_o
 
@@ -261,9 +242,6 @@ class ArcTransformer(nn.Module):
         self.config, self.device = config, device
         dtype = torch.float32
         self.embedding = torch.jit.script(ArcEmbedding(config, dtype=dtype))
-        self.rotary_emb = RotaryEmbedding(
-            dim=config.hidden_size, max_position_embeddings=config.max_position_embeddings, device=device, dtype=dtype
-        )
         self.blocks = nn.ModuleList([MoIETransformerBlock(config, dtype=dtype) for _ in range(config.num_layers)])
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False, dtype=dtype)
 
@@ -277,7 +255,6 @@ class ArcTransformer(nn.Module):
         captured_masked_grad_outputs: list | None = None,
     ):
         x = self.embedding(input_ids)
-        pos_emb = self.rotary_emb(x, seq_len=input_ids.size(1))
         past_key_values = past_key_values if past_key_values is not None else [None] * len(self.blocks)
 
         all_masked, all_comp, all_spl_in, all_masked_routing_logits, all_protos, all_routing_logits, presents = (
@@ -303,7 +280,7 @@ class ArcTransformer(nn.Module):
                 outgoing_proto_state,
             ) = block(
                 x,
-                pos_emb,
+                coords,
                 past_key_values[i],
                 incoming_proto_state,
                 captured_spl_inputs=captured_spl_inputs,

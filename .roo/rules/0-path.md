@@ -8,6 +8,7 @@
 - `LINs-lab/DynMoE`
 - `da-fr/arc-prize-2024`
 - `michaelhodel/arc-dsl`
+- `lose4578/CircleRoPE`
 
 ## 标准预制件
 
@@ -17,8 +18,6 @@
 
 ## 其他
 
-- `fla-org/native-sparse-attention`
-- `IntelLabs/bayesian-torch`
 - `rusty1s/pytorch_sparse`
 - `huggingface/candle`
 
