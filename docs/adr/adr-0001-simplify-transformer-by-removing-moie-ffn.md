@@ -1,7 +1,7 @@
 ---
 title: "ADR-0001: Simplify Transformer Architecture by Removing MoIE FFN"
 status: "Proposed"
-date: "2025-10-05"
+date: "2025-10-09"
 authors: "Ω Researcher, Tiny-ONN 课题组"
 tags: ["architecture", "decision", "transformer", "sparsity", "spl", "moie"]
 supersedes: ""
@@ -37,12 +37,12 @@ Proposed | **Accepted** | Rejected | Superseded | Deprecated
 2. **路由计算路径 (Routing Path)**:
    a. **原型匹配 (Prototype Matching)**:
    `V_match = (x W_p^T) / √D_in`
-   **\*类型**: 缩放点积（稠密矩阵-向量乘法）。 **FLOPS**: O(D_in · D_out)
+   **类型**: 缩放点积（稠密矩阵-向量乘法）。 **FLOPS**: O(D_in · D_out)
    b. **门控成本 (Gating Cost)**:
-   `L_gate = x W_g^T`
-   **\*类型**: 稠密矩阵-向量乘法。 **FLOPS**: O(D_in · D_out)
-
-**分析**: 总计算开销 `Cost_total ≈ 3 · O(D_in · D_out)`。而路由开销占比为 2/3。这个结论是颠覆性的：我们模型的性能瓶颈是一个完全稠密的、占据绝对主导地位的路由计算，任何针对主计算路径的稀疏优化都注定无效。
+   `L_gate = g` (静态偏置)
+   **类型**: 参数查找。 **FLOPS**: O(1)
+ 
+ **分析**: 总计算开销 `Cost_total ≈ 2 · O(D_in · D_out)`。路由开销（原型匹配）和主计算开销各占一半。虽然开销依然巨大，但已显著低于早期实现。
 
 ### 2. SPL 作为两层 MLP 的计算等价性
 
@@ -88,6 +88,8 @@ Proposed | **Accepted** | Rejected | Superseded | Deprecated
 ## 决策 (Decision)
 
 基于以上形式化分析，我们提出"`MoIE` FFN 过剩假说"：`DynSIHA` 模块强大的非线性变换能力与 `MoIE` FFN 的功能存在严重重叠。
+
+我们最新的研究进一步强化了此论点：`DynSIHA` 中的 `SPL_o` 模块本身在功能上就是一个动态合成的、上下文感知的 FFN。因此，一个独立的、静态的 `MoIE` FFN 模块在计算上是完全冗余的。
 
 因此，我们决定，下一阶段的核心实验方向是**完全移除 `MoIETransformerBlock` 中的 `MoIE` (FFN) 模块**，并评估一个仅由 `DynSIHA` 驱动的简化 Transformer 架构。
 
