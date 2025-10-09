@@ -93,7 +93,7 @@ class GridSerializer:
 
 
 class InMemoryArcDataset(Dataset):
-    def __init__(self, data_path: str, split: str = "training"):
+    def __init__(self, data_path: str, tokenizer: ArcColorTokenizer, split: str = "training"):
         self.data_path = Path(data_path) / split
         self.tasks = []
 
@@ -105,8 +105,7 @@ class InMemoryArcDataset(Dataset):
             if (split == "training" or split == "evaluation") and "test" in task_data and task_data["test"] and "output" in task_data["test"][0]:
                 self.tasks.append(task_data)
 
-        tokenizer_for_sorting = ArcColorTokenizer()
-        serializer_for_sorting = GridSerializer(tokenizer_for_sorting)
+        serializer_for_sorting = GridSerializer(tokenizer)
 
         tasks_with_lengths = []
         for task in self.tasks:

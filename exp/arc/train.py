@@ -193,11 +193,11 @@ class Trainer:
     def _setup_data(self):
         collator = ArcCollator(self.tokenizer, max_len=self.config.model.max_position_embeddings)
         self.train_loader = DataLoader(
-            InMemoryArcDataset(data_path=self.config.data.data_path, split="training"),
+            InMemoryArcDataset(data_path=self.config.data.data_path, tokenizer=self.tokenizer, split="training"),
             batch_size=self.config.data.batch_size, collate_fn=collator, num_workers=self.config.data.num_workers, shuffle=False, pin_memory=True,
         )
         self.eval_loader = DataLoader(
-            InMemoryArcDataset(data_path=self.config.data.data_path, split="evaluation"),
+            InMemoryArcDataset(data_path=self.config.data.data_path, tokenizer=self.tokenizer, split="evaluation"),
             batch_size=1, collate_fn=collator, num_workers=self.config.data.num_workers, shuffle=False, pin_memory=True,
         )
 
