@@ -22,7 +22,7 @@ dependencies = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-norecursedirs = ["ref", "exp", ".venv"]
+norecursedirs = ["ref", ".venv"]
 
 [tool.setuptools.packages.find]
 where = ["."]

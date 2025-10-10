@@ -7,8 +7,6 @@ class ModelConfig:
     hidden_size: int = 512
     num_layers: int = 6
     max_position_embeddings: int = 4096
-    d_ffn_factor: int = 1
-    routing_gain: float = 1.0
 
 @dataclass
 class GenerationConfig:
@@ -34,8 +32,8 @@ class TrainConfig:
     w_meta: float = 1.0
 
     num_epochs: int = 20
-    num_augmentation_views: int = 8
-    max_steps_per_view: int = 5
+    num_augmentation_views: int = 4
+    max_steps_per_view: int = 10
 
     device: str = "cuda"
     seed: int = 42

@@ -16,7 +16,7 @@ from torch.utils.data import DataLoader
 from .config import TrainConfig
 from .data import ArcCollator, GridDeserializer, GridSerializer, InMemoryArcDataset
 from .evaluation import EvaluationStep
-from .model import ArcTransformer, mas_normalize
+from .model import ArcTransformer
 from .observer import Observer
 from .tokenizer import ArcColorTokenizer
 
@@ -88,9 +88,9 @@ def _calculate_goodness_jit(
 
         all_mu_grad_norms.append(torch.mean(torch.mean(mu_grad_norm, dim=-1), dim=(0, 1)))
 
-        norm_masked_output = mas_normalize(masked_output_abs)
-        norm_masked_output_grad = mas_normalize(masked_output_grad_abs)
-        norm_mu_grad = mas_normalize(mu_grad_norm)
+        norm_masked_output = torch.sigmoid(masked_output_abs)
+        norm_masked_output_grad = torch.sigmoid(masked_output_grad_abs)
+        norm_mu_grad = torch.sigmoid(mu_grad_norm)
 
         goodness_logits = norm_masked_output_grad * (norm_masked_output - norm_mu_grad)
         all_goodness_logits.append(goodness_logits)
@@ -170,15 +170,15 @@ class LearningDynamics:
             for i in range(num_spl_modules):
                 spl_module = self.spl_modules[i]
                 goodness = all_goodness_logits[i]
-                
-                gate = (torch.mean(goodness, dim=(0, 1)) > 0).float()
-                
+
+                gated_goodness = F.relu(torch.mean(goodness, dim=(0, 1)))
+
                 if spl_module.mu_weight.grad is not None:
-                    gated_grad_mu = spl_module.mu_weight.grad * gate.unsqueeze(1)
+                    gated_grad_mu = spl_module.mu_weight.grad * gated_goodness.unsqueeze(1)
                     spl_module.mu_weight.grad.copy_(gated_grad_mu)
-                
+
                 if spl_module.mu_bias.grad is not None:
-                    gated_grad_bias = spl_module.mu_bias.grad * gate
+                    gated_grad_bias = spl_module.mu_bias.grad * gated_goodness
                     spl_module.mu_bias.grad.copy_(gated_grad_bias)
 
         torch.nn.utils.clip_grad_value_(self.computation_params, clip_value=1.0)

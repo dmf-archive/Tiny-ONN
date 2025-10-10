@@ -4,7 +4,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .circle_rope_arc import apply_arc_rope_3d, build_3d_coords_2d, normalize_3d_coords
+from .circle_rope_arc import (
+    build_3d_coords_2d,
+    get_arc_rope_3d_index,
+    normalize_3d_coords,
+)
 from .config import ModelConfig
 
 
@@ -13,15 +17,6 @@ def rotate_half(x: torch.Tensor) -> torch.Tensor:
     x1 = x[..., : x.shape[-1] // 2]
     x2 = x[..., x.shape[-1] // 2 :]
     return torch.cat((-x2, x1), dim=-1)
-
-
-@torch.jit.script
-def apply_rotary_pos_emb(
-    q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
-) -> tuple[torch.Tensor, torch.Tensor]:
-    q_embed = (q * cos) + (rotate_half(q) * sin)
-    k_embed = (k * cos) + (rotate_half(k) * sin)
-    return q_embed, k_embed
 
 
 @torch.jit.script
@@ -53,9 +48,6 @@ def spl_forward(
     computation_output = F.linear(F.silu(x), mu_weight, mu_bias)
 
     return computation_output, match_values, gate_logit
-
-
-
 
 
 class SparseProtoLinear(nn.Module):
@@ -97,7 +89,6 @@ class MoIETransformerBlock(nn.Module):
         self.ln1 = nn.LayerNorm(config.hidden_size, eps=1e-5)
         self.d_model = config.hidden_size
         self.attn = DynamicInfiniteHeadAttention(config, dtype=dtype)
-        self.routing_gain = config.routing_gain
         self.proto_transforms = nn.ModuleDict(
             {
                 "attn_q": nn.Linear(config.hidden_size, config.hidden_size, bias=False, dtype=dtype),
@@ -150,7 +141,7 @@ class MoIETransformerBlock(nn.Module):
 
         for i in range(3):
             cost_score = mas_normalize(costs_qkv[i])
-            routing_logits = (match_qkv[i] - cost_score) * self.routing_gain
+            routing_logits = match_qkv[i] - cost_score
             computation_output = comp_qkv[i]
 
             masked_routing_logits = F.relu(routing_logits)
@@ -165,17 +156,6 @@ class MoIETransformerBlock(nn.Module):
             all_comp.append(computation_output)
             all_masked_routing_logits.append(masked_routing_logits)
             all_routing_logits.append(routing_logits)
-
-        if coords is not None:
-            # Process each batch item separately to handle varying coordinate patterns
-            batch_size = q.shape[0]
-            seq_len = q.shape[1]
-            for b in range(batch_size):
-                batch_coords = coords[b]  # (seq_len, 2)
-                seq_pos = torch.arange(seq_len, device=q.device)
-                coords_3d = build_3d_coords_2d(batch_coords, seq_pos)
-                coords_3d = normalize_3d_coords(coords_3d)
-                q[b], k[b] = apply_arc_rope_3d(q[b], k[b], coords_3d)
 
         batch_size, seq_len, _ = q.shape
         num_heads = 1
@@ -198,7 +178,7 @@ class MoIETransformerBlock(nn.Module):
 
         c_o, mv_o, pc_o = self.attn.spl_o(attn_out, outgoing_proto_state["attn_o"])
         cost_score_o = mas_normalize(pc_o)
-        routing_logits_o = (mv_o - cost_score_o) * self.routing_gain
+        routing_logits_o = mv_o - cost_score_o
 
         computation_output_o = c_o
 
@@ -231,10 +211,28 @@ class MoIETransformerBlock(nn.Module):
 class ArcEmbedding(nn.Module):
     def __init__(self, config: ModelConfig, dtype: torch.dtype = torch.float32):
         super().__init__()
-        self.color_embedding = nn.Embedding(config.vocab_size, config.hidden_size, dtype=dtype)
+        self.hidden_size = config.hidden_size
+        self.color_embedding = nn.Embedding(config.vocab_size, self.hidden_size, dtype=dtype)
 
     def forward(self, input_ids: torch.Tensor, coords: torch.Tensor | None = None) -> torch.Tensor:
-        return self.color_embedding(input_ids)
+        color_emb = self.color_embedding(input_ids)
+        if coords is None:
+            return color_emb
+
+        batch_size, seq_len, _ = color_emb.shape
+        pos_aware_embs = []
+        for b in range(batch_size):
+            batch_coords = coords[b]
+            seq_pos = torch.arange(seq_len, device=input_ids.device)
+            coords_3d = build_3d_coords_2d(batch_coords, seq_pos)
+            coords_3d = normalize_3d_coords(coords_3d)
+
+            cos, sin = get_arc_rope_3d_index(coords_3d, self.hidden_size)
+
+            rotated_emb = (color_emb[b] * cos) + (rotate_half(color_emb[b]) * sin)
+            pos_aware_embs.append(rotated_emb)
+
+        return torch.stack(pos_aware_embs)
 
 class ArcTransformer(nn.Module):
     def __init__(self, config: ModelConfig, device: torch.device | str):
@@ -254,7 +252,7 @@ class ArcTransformer(nn.Module):
         captured_spl_inputs: list | None = None,
         captured_masked_grad_outputs: list | None = None,
     ):
-        x = self.embedding(input_ids)
+        x = self.embedding(input_ids, coords)
         past_key_values = past_key_values if past_key_values is not None else [None] * len(self.blocks)
 
         all_masked, all_comp, all_spl_in, all_masked_routing_logits, all_protos, all_routing_logits, presents = (
