@@ -34,6 +34,7 @@ class Observer:
         self, main_loss: torch.Tensor, model_outputs: dict, signals: dict, input_ids: torch.Tensor, model: nn.Module
     ) -> dict[str, float]:
         logits, labels = model_outputs["logits"], model_outputs["labels"]
+        routing_logits = model_outputs.get("routing_logits", [])
         masked_routing_logits = model_outputs.get("masked_routing_logits", [])
 
         logits_acc, labels_acc = logits[:, :-1, :], labels[:, 1:]
@@ -69,8 +70,8 @@ class Observer:
 
         num_spl_modules = self.config.model.num_layers * 4
         act_rates = [0.0] * num_spl_modules
-        if masked_routing_logits:
-            act_rates = [mrl.gt(0).float().mean().item() for mrl in masked_routing_logits]
+        if routing_logits:
+            act_rates = [rl.gt(0).float().mean().item() for rl in routing_logits]
 
         num_layers = self.config.model.num_layers
 
@@ -144,10 +145,10 @@ class Observer:
 
     def visualize_prototypes(self, signals: dict, global_step: int):
         proto_weights = signals.get("proto_weights", [])
-        masked_routing_logits = signals.get("masked_routing_logits", [])
+        routing_logits = signals.get("routing_logits", [])
         goodness_logits = signals.get("goodness_logits", [])
-
-        if not proto_weights or not masked_routing_logits or not goodness_logits:
+ 
+        if not proto_weights or not routing_logits or not goodness_logits:
             return
 
         num_spl = 4
@@ -166,11 +167,11 @@ class Observer:
                 if idx >= len(proto_weights): continue
 
                 protos = proto_weights[idx].cpu().to(torch.float32)
-                mrl = masked_routing_logits[idx].cpu().to(torch.float32)
+                rl = routing_logits[idx].cpu().to(torch.float32)
                 logits_raw = goodness_logits[idx].cpu().to(torch.float32)
                 logits = torch.mean(logits_raw, dim=(0, 1)) if logits_raw.ndim == 3 else logits_raw
-
-                num_activations = (mrl > 0).float().sum(dim=(0, 1))
+ 
+                num_activations = (rl > 0).float().sum(dim=(0, 1))
 
                 statuses = []
                 for k in range(logits.shape[0]):

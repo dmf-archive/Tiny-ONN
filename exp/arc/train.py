@@ -70,13 +70,15 @@ def _calculate_goodness_jit(
     masked_outputs: list[torch.Tensor],
     captured_masked_grad_outputs: list[torch.Tensor],
     captured_spl_inputs: list[torch.Tensor],
+    routing_logits: list[torch.Tensor],
 ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
     all_goodness_logits: list[torch.Tensor] = []
     all_mu_grad_norms: list[torch.Tensor] = []
-
+ 
     num_modules = len(masked_outputs)
     for i in range(num_modules):
-        masked_output_grad = captured_masked_grad_outputs[i]
+        grad_mask = (routing_logits[i] > 0).float()
+        masked_output_grad = captured_masked_grad_outputs[i] * grad_mask
         spl_input = captured_spl_inputs[i]
         masked_output = masked_outputs[i]
 
@@ -93,7 +95,9 @@ def _calculate_goodness_jit(
         norm_mu_grad = torch.sigmoid(mu_grad_norm)
 
         goodness_logits = norm_masked_output_grad * (norm_masked_output - norm_mu_grad)
-        all_goodness_logits.append(goodness_logits)
+        
+        final_goodness = goodness_logits * grad_mask
+        all_goodness_logits.append(final_goodness)
 
     return all_goodness_logits, all_mu_grad_norms
 
@@ -146,7 +150,10 @@ class LearningDynamics:
                     param.grad.zero_()
 
         all_goodness_logits, all_mu_grad_norms = _calculate_goodness_jit(
-            masked_outputs, captured_masked_grad_outputs, captured_spl_inputs
+            masked_outputs,
+            captured_masked_grad_outputs,
+            captured_spl_inputs,
+            model_outputs["routing_logits"],
         )
 
         meta_losses = [
@@ -320,6 +327,7 @@ class Trainer:
         metrics = self.observer.calculate_metrics(main_loss, model_outputs, signals, batch["input_ids"], self.model)
 
         signals["masked_routing_logits"] = model_outputs.get("masked_routing_logits")
+        signals["routing_logits"] = model_outputs.get("routing_logits")
         self.observer.maybe_log_and_visualize(
             epoch,
             self.global_step,

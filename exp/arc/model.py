@@ -30,7 +30,7 @@ def mas_normalize(logits: torch.Tensor) -> torch.Tensor:
 def mas_normalize_negative(logits: torch.Tensor) -> torch.Tensor:
     return -F.relu(-mas_normalize(logits))
 
-
+@torch.jit.script
 def spl_forward(
     x: torch.Tensor,
     proto_state: torch.Tensor,
@@ -45,7 +45,7 @@ def spl_forward(
 
     match_values = F.linear(x, proto_state) / math.sqrt(x.size(-1))
     gate_logit = gate_param
-    computation_output = F.linear(F.silu(x), mu_weight, mu_bias)
+    computation_output = F.silu(F.linear(x, mu_weight, mu_bias))
 
     return computation_output, match_values, gate_logit
 
@@ -144,15 +144,20 @@ class MoIETransformerBlock(nn.Module):
             routing_logits = match_qkv[i] - cost_score
             computation_output = comp_qkv[i]
 
+            mask_active = (routing_logits > 0).float()
             masked_routing_logits = F.relu(routing_logits)
-            masked = computation_output * masked_routing_logits
+
+            processed_part = computation_output * masked_routing_logits
+            passthrough_part = ln1_out * (1.0 - mask_active)
+            masked_output = processed_part + passthrough_part
+
             if i == 0:
-                q = masked
+                q = masked_output
             elif i == 1:
-                k = masked
+                k = masked_output
             else:
-                v = masked
-            all_masked.append(masked)
+                v = masked_output
+            all_masked.append(masked_output)
             all_comp.append(computation_output)
             all_masked_routing_logits.append(masked_routing_logits)
             all_routing_logits.append(routing_logits)
@@ -182,11 +187,16 @@ class MoIETransformerBlock(nn.Module):
 
         computation_output_o = c_o
 
+        mask_active_o = (routing_logits_o > 0).float()
         masked_routing_logits_o = F.relu(routing_logits_o)
-        m_o = computation_output_o * masked_routing_logits_o
-        x_out = x + m_o
 
-        all_masked.append(m_o)
+        processed_part_o = computation_output_o * masked_routing_logits_o
+        passthrough_part_o = attn_out * (1.0 - mask_active_o)
+        masked_output_o = processed_part_o + passthrough_part_o
+
+        x_out = x + masked_output_o
+ 
+        all_masked.append(masked_output_o)
         all_comp.append(computation_output_o)
         all_masked_routing_logits.append(masked_routing_logits_o)
         all_routing_logits.append(routing_logits_o)
