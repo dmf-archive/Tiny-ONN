@@ -18,6 +18,7 @@
 
 ## 其他
 
+- `SamsungSAILMontreal/TinyRecursiveModels`
 - `rusty1s/pytorch_sparse`
 - `huggingface/candle`
 
