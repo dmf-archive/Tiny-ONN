@@ -66,6 +66,12 @@ def _augment_and_map_kernel(grids: list[torch.Tensor], transform_idx: int, color
 
 
 @torch.jit.script
+def mas_normalize_jit(logits: torch.Tensor) -> torch.Tensor:
+    max_abs_val = torch.max(torch.abs(logits), dim=-1, keepdim=True).values
+    scaled_logits = logits / (max_abs_val + 1e-9)
+    return scaled_logits
+
+@torch.jit.script
 def _calculate_goodness_jit(
     masked_outputs: list[torch.Tensor],
     captured_masked_grad_outputs: list[torch.Tensor],
@@ -90,11 +96,11 @@ def _calculate_goodness_jit(
 
         all_mu_grad_norms.append(torch.mean(torch.mean(mu_grad_norm, dim=-1), dim=(0, 1)))
 
-        norm_masked_output = torch.sigmoid(masked_output_abs)
-        norm_masked_output_grad = torch.sigmoid(masked_output_grad_abs)
-        norm_mu_grad = torch.sigmoid(mu_grad_norm)
+        norm_logits = mas_normalize_jit(routing_logits[i])
+        norm_masked_output_grad = mas_normalize_jit(masked_output_grad_abs)
+        norm_mu_grad = mas_normalize_jit(mu_grad_norm)
 
-        goodness_logits = norm_masked_output_grad * (norm_masked_output - norm_mu_grad)
+        goodness_logits = norm_masked_output_grad * (norm_logits - norm_mu_grad)
         
         final_goodness = goodness_logits * grad_mask
         all_goodness_logits.append(final_goodness)
@@ -142,12 +148,7 @@ class LearningDynamics:
         self.optimizer_comp.zero_grad()
         self.optimizer_route.zero_grad()
 
-        main_loss.backward(retain_graph=True)
-
-        with torch.no_grad():
-            for param in self.routing_params:
-                if param.grad is not None:
-                    param.grad.zero_()
+        main_loss.backward(inputs=self.computation_params, retain_graph=True)
 
         all_goodness_logits, all_mu_grad_norms = _calculate_goodness_jit(
             masked_outputs,
@@ -157,20 +158,13 @@ class LearningDynamics:
         )
 
         meta_losses = [
-            self._calculate_meta_loss(p - q.detach())
-            for p, q in zip(model_outputs["routing_logits"], all_goodness_logits)
-            if p.numel() > 0 and q.numel() > 0 and p.shape == q.shape
+            self._calculate_meta_loss(p) for p in model_outputs["routing_logits"]
         ]
-
         avg_meta_loss = torch.stack(meta_losses).mean() if meta_losses else torch.tensor(0.0, device=device)
         total_meta_loss = self.config.w_meta * avg_meta_loss
 
-        if total_meta_loss > 0:
-            meta_grads = torch.autograd.grad(total_meta_loss, self.routing_params, allow_unused=True)
-            with torch.no_grad():
-                for param, grad in zip(self.routing_params, meta_grads):
-                    if grad is not None:
-                        param.grad = grad
+        if total_meta_loss.requires_grad:
+            total_meta_loss.backward(inputs=self.routing_params)
 
         with torch.no_grad():
             num_spl_modules = len(self.spl_modules)
@@ -178,14 +172,14 @@ class LearningDynamics:
                 spl_module = self.spl_modules[i]
                 goodness = all_goodness_logits[i]
 
-                gated_goodness = F.relu(torch.mean(goodness, dim=(0, 1)))
+                binary_mask = (torch.mean(goodness, dim=(0, 1)) > 0).float()
 
                 if spl_module.mu_weight.grad is not None:
-                    gated_grad_mu = spl_module.mu_weight.grad * gated_goodness.unsqueeze(1)
+                    gated_grad_mu = spl_module.mu_weight.grad * binary_mask.unsqueeze(1)
                     spl_module.mu_weight.grad.copy_(gated_grad_mu)
 
                 if spl_module.mu_bias.grad is not None:
-                    gated_grad_bias = spl_module.mu_bias.grad * gated_goodness
+                    gated_grad_bias = spl_module.mu_bias.grad * binary_mask
                     spl_module.mu_bias.grad.copy_(gated_grad_bias)
 
         torch.nn.utils.clip_grad_value_(self.computation_params, clip_value=1.0)
@@ -343,7 +337,6 @@ class Trainer:
         )
 
         self.global_step += 1
-        torch.cuda.empty_cache()
         return metrics, model_outputs.get("masked_routing_logits"), model_outputs.get("routing_logits"), signals
 
 
@@ -377,6 +370,7 @@ class Trainer:
                         self.console.print(f"Task {task_idx} view {view_idx} converged in {step + 1} steps.")
                         break
             self.start_view_idx = 0
+            torch.cuda.empty_cache()
         self.start_task_idx, self.start_view_idx = 0, 0
 
 

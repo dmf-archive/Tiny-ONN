@@ -38,7 +38,7 @@ class Observer:
         masked_routing_logits = model_outputs.get("masked_routing_logits", [])
 
         logits_acc, labels_acc = logits[:, :-1, :], labels[:, 1:]
-        mask = labels_acc != -100
+        mask = (labels_acc != -100) & (labels_acc != 0)
         active_logits = logits_acc[mask] if mask.any() else torch.empty(0, device=logits.device)
         acc = (
             (torch.argmax(active_logits, dim=-1) == labels_acc[mask]).float().mean().item()

@@ -7,7 +7,6 @@
 # without interfering with the main training loop.
 
 # %%
-import argparse
 import json
 import sys
 from dataclasses import dataclass
@@ -253,7 +252,7 @@ class DebugGenerator:
             next_score = state.score + s.item()
             if next_score >= state.max_score:
                 continue
-            
+
             # Forbid EOS in the first few tokens to force a minimal length
             if i == self.eos_token_id and state.pos < 10:
                 continue
@@ -320,7 +319,7 @@ import random
 def _find_and_load_latest_checkpoint(model: ArcTransformer, device: str, console: Console) -> bool:
     console.print("Searching for the latest checkpoint...")
     checkpoint_dir = Path(__file__).parent.parent / "exp" / "arc" / "checkpoints"
-    
+
     if not checkpoint_dir.exists():
         console.print(f"Error: Checkpoint directory not found at {checkpoint_dir}", style="bold red")
         return False
@@ -342,7 +341,7 @@ def _find_and_load_latest_checkpoint(model: ArcTransformer, device: str, console
                 return True
             except Exception as e:
                 console.print(f"Failed to load {ckpt_path}: {e}", style="bold red")
-    
+
     console.print("No valid checkpoint found.", style="bold yellow")
     return False
 
@@ -350,19 +349,19 @@ def _find_and_load_latest_checkpoint(model: ArcTransformer, device: str, console
 def _load_random_task(console: Console) -> dict | None:
     console.print("Selecting a random task...")
     task_dir = Path(__file__).parent.parent / "data" / "ARC-AGI-2" / "data" / "training"
-    
+
     if not task_dir.exists():
         console.print(f"Error: Task directory not found at {task_dir}", style="bold red")
         return None
-        
+
     task_files = list(task_dir.glob("*.json"))
     if not task_files:
         console.print(f"Error: No task files found in {task_dir}", style="bold red")
         return None
-        
+
     random_task_path = random.choice(task_files)
     console.print(f"Selected task: {random_task_path.name}")
-    
+
     with open(random_task_path) as f:
         return json.load(f)
 

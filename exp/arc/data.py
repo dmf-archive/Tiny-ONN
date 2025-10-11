@@ -107,19 +107,12 @@ class InMemoryArcDataset(Dataset):
         tasks_with_metrics = [
             (task, self._calculate_task_difficulty(task)) for task in self.tasks
         ]
-
-        metrics_df = {
-            "max_pixels": self._normalize([m["max_pixels"] for _, m in tasks_with_metrics]),
-            "entropy": self._normalize([m["entropy"] for _, m in tasks_with_metrics]),
-        }
-
-        tasks_with_scores = []
-        for i, (task, _) in enumerate(tasks_with_metrics):
-            score = metrics_df["max_pixels"][i] + metrics_df["entropy"][i]
-            tasks_with_scores.append((task, score))
-
-        sorted_tasks = sorted(tasks_with_scores, key=lambda x: x[1])
-        self.tasks = [task for task, score in sorted_tasks]
+        
+        sorted_tasks = sorted(
+            tasks_with_metrics, key=lambda x: (x[1]["max_pixels"], x[1]["entropy"])
+        )
+        
+        self.tasks = [task for task, metrics in sorted_tasks]
 
     @staticmethod
     def _normalize(values: list[float]) -> list[float]:
