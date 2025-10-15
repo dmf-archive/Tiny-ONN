@@ -100,7 +100,7 @@ def _calculate_goodness_jit(
         norm_masked_output_grad = mas_normalize_jit(masked_output_grad_abs)
         norm_mu_grad = mas_normalize_jit(mu_grad_norm)
 
-        goodness_logits = norm_masked_output_grad * (norm_logits - norm_mu_grad)
+        goodness_logits = norm_masked_output_grad * (norm_mu_grad - norm_logits)
         
         final_goodness = goodness_logits * grad_mask
         all_goodness_logits.append(final_goodness)

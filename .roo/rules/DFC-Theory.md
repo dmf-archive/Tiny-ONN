@@ -86,11 +86,13 @@ SARS 是驱动 SPL 自组织的核心机制。经过最新的理论重构（见 
 `Goodness` 函数被重新定义为对数似然的工程代理：
 
 ```python
-goodness_logits = norm_masked_output_grad * (norm_masked_output - norm_mu_grad)
+goodness_logits = norm_masked_output_grad * (norm_mu_grad - norm_logits)
 ```
 
 - `norm_masked_output_grad` & `norm_masked_output`: **正面证据**（任务相关性与前向贡献）
-- `norm_mu_grad`: **负面证据**（信息增益惩罚）
+- `norm_mu_grad`: **负面证据**（信息增益惩罚），数值越大代表事件越“意外”
+- `norm_logits`: 当前路由信念（后验/先验）
+- **符号约定**: 采用“成本 − 信念”形式，使 `goodness_logits` 天然带负号，与反向传播梯度符号约定一致，避免模式坍塌
 - **内部归一化**: 所有组件经过独立的 `mas_normalize`，确保在相同尺度上比较
 
 ### 3.5. 技术实现：逐令牌梯度提取与稳定性加固

@@ -4,8 +4,8 @@ from dataclasses import dataclass, field
 @dataclass
 class ModelConfig:
     vocab_size: int = 16
-    hidden_size: int = 384
-    num_layers: int = 12
+    hidden_size: int = 512
+    num_layers: int = 6
     max_position_embeddings: int = 4096
 
 @dataclass
