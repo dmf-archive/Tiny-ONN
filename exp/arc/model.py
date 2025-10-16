@@ -147,9 +147,7 @@ class MoIETransformerBlock(nn.Module):
             mask_active = (routing_logits > 0).float()
             masked_routing_logits = F.relu(routing_logits)
 
-            processed_part = computation_output * mask_active
-            passthrough_part = ln1_out * (1.0 - mask_active)
-            masked_output = processed_part + passthrough_part
+            masked_output = computation_output * mask_active
 
             if i == 0:
                 q = masked_output
@@ -190,9 +188,7 @@ class MoIETransformerBlock(nn.Module):
         mask_active_o = (routing_logits_o > 0).float()
         masked_routing_logits_o = F.relu(routing_logits_o)
 
-        processed_part_o = computation_output_o * mask_active_o
-        passthrough_part_o = attn_out * (1.0 - mask_active_o)
-        masked_output_o = processed_part_o + passthrough_part_o
+        masked_output_o = computation_output_o * mask_active_o
 
         x_out = x + masked_output_o
  

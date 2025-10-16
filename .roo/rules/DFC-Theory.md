@@ -47,53 +47,51 @@ SPL 的一个关键设计在于马尔科夫毯，这源于对神经科学原理�
 
 ## 3. 元学习框架：Surprise-Aware Routing Shaping (SARS)
 
-SARS 是驱动 SPL 自组织的核心机制。经过最新的理论重构（见 ADR-0010），我们从错误的"分布对齐"范式转向了严格的**贝叶斯反演 (Bayesian Inversion)** 框架。
+SARS 是驱动 SPL 自组织的核心机制。其理论基础是**可微分变分分析 (DVA)**，它在确定性框架下，通过**贝叶斯反演 (Bayesian Inversion)**，实现了对模型隐式路由**先验 (Prior)** 的优化。
 
-### 3.1. 从分布对齐到贝叶斯反演
+### 3.1. DVA 作为确定性贝叶斯反演
 
-我们最终认识到，之前所有失败的根源在于对系统本质的误解：
+贝叶斯定理的核心关系是 `Posterior = (Likelihood * Prior) / Evidence`。为了求解我们关心的隐式先验 `p(z)`，我们移项并取对数，得到优化的核心关系式：
 
-- **错误的"分布对齐"范式**: 将 `goodness_logits` 视为理想的目标后验，试图用 MSE 等损失让模型的实际后验 `routing_logits` 去直接拟合它。这忽略了 `goodness_logits` 只是充满噪声的启发式信号。
-- **错误的"贝叶斯更新"范式**: 将元学习目标设定为 `L_meta = Entropy(Softmax(posterior + likelihood))`，旨在"更新"后验而非塑造我们真正关心的**先验**。
+`log p(z) ∝ log p(z|x) - log p(x|z)`
 
-我们系统的本质是**可微分变分分析 (DVA)**，这意味着：
+- **先验 (Prior) `log p(z)`**: 这是元学习的优化目标，一个独立于输入的、模型的内在路由偏好。在计算中由 `prior_logits` 代表。
+- **后验 (Posterior) `log p(z|x)`**: 模型在观察到数据 `x` 后，对应该激活哪个神经元 `z` 的信念。这由可训练的 `routing_logits` 直接表示。
+- **似然 (Likelihood) `log p(x|z)`**: 在激活了神经元 `z` 的条件下，观察到数据 `x` 的概率。它衡量了神经元 `z` 解释数据的能力。我们必须为其构建一个工程代理，在代码中由 `goodness_logits` 表示。
 
-- **后验 (Posterior)** 是可解析的，由 `routing_logits` 直接表示
-- **似然 (Likelihood)** 可以被代理，由 `goodness_logits` 近似表示
-- 我们真正想要优化的是那个不可解的、隐式的**先验 (Prior)**
+### 3.2. 理论基础：似然的代理 (Proxy for Likelihood)
 
-因此，我们必须采用**贝叶斯反演 (Bayesian Inversion)**。
+为了让 `goodness_logits` 成为 `log p(x|z)` 的有效代理，它必须捕捉神经元 `z` 解释数据的“能力”。其核心思想根植于自由能原理：
 
-### 3.2. 理论基础：从信息增益推导似然
-
-我们建立了梯度与似然之间的理论桥梁：
-
-- **信息增益 (Information Gain)**: 参数的梯度范数，尤其是 `mu_grad_norm`（学习成本），衡量了为了拟合数据，模型信念需要更新的幅度。这在信息论上等价于后验与先验之间的 KL 散度。
-- **似然与信息增益的反比关系**: 高似然事件意味着模型的先验能很好地解释数据，信息增益低；低似然事件（高"惊奇度"）需要高信息增益。
-- **结论**: `log(Likelihood) ∝ -Information Gain`。这为我们将 `goodness_logits` 中的 `-mu_grad_norm` 惩罚项视为对数似然的合理组成部分提供了理论依据。
+- **高效解释意味着低成本**: 如果一个神经元能很好地解释数据（高似然），那么模型为了拟合该数据所需的信念更新就应该很小。
+- **学习成本**: 我们使用参数 `μ` 的梯度范数 `mu_grad_norm` 作为学习成本（即信息增益）的代理。
+- **反比关系**: 因此，似然 `log p(x|z)` 必须与学习成本 `mu_grad_norm` **负相关**。
+  `log p(x|z) ∝ -Information Gain (Cost)`
 
 ### 3.3. 最终公式：最小化先验熵
 
-基于此，我们确立了最终的元学习框架：
+基于上述映射：
 
 1. **推断先验**: `prior_logits = routing_logits - goodness_logits.detach()`
+    这精确地实现了 `Prior = Posterior - Likelihood`。
 2. **最小化其熵**: `L_meta = Entropy(Softmax(prior_logits))`
+    通过梯度下降最小化此损失，可以驱动模型的隐式先验 `p(z)` 朝着更确定、更稀疏的方向演进。
 
-最小化这个损失函数，等价于驱动模型的隐式路由偏好（先验）向一个更"尖锐"、更稀疏、更确定的状态演进。
+### 3.4. `goodness_logits` 函数：似然的工程代理
 
-### 3.4. Goodness 函数：似然的工程代理
-
-`Goodness` 函数被重新定义为对数似然的工程代理：
+`goodness_logits` 作为对数似然 `log p(x|z)` 的工程代理，其计算公式如下：
 
 ```python
-goodness_logits = norm_masked_output_grad * (norm_mu_grad - norm_logits)
+goodness_logits = norm_masked_output_grad * (norm_logits - norm_mu_grad)
 ```
 
-- `norm_masked_output_grad` & `norm_masked_output`: **正面证据**（任务相关性与前向贡献）
-- `norm_mu_grad`: **负面证据**（信息增益惩罚），数值越大代表事件越“意外”
-- `norm_logits`: 当前路由信念（后验/先验）
-- **符号约定**: 采用“成本 − 信念”形式，使 `goodness_logits` 天然带负号，与反向传播梯度符号约定一致，避免模式坍塌
-- **内部归一化**: 所有组件经过独立的 `mas_normalize`，确保在相同尺度上比较
+此公式的构成部分及其意义如下：
+
+- `norm_logits`: **信念贡献**。代表当前的后验信念 `log p(z|x)`。一个模型已经相信的神经元，更有可能是一个好的解释者，这构成了似然的基础。
+- `- norm_mu_grad`: **成本惩罚**。代表学习成本的负向贡献。这实现了 `log p(x|z) ∝ -Cost` 的核心理论关系，是整个代理函数有效性的基石。
+- `norm_masked_output_grad`: **重要性加权**。代表神经元 `z` 的输出对主任务损失的贡献程度，作为一个重要性权重。
+
+综上，`Belief - Cost` 的形式构建了一个合理的似然代理：它奖励模型已有的信念，同时惩罚为拟合数据所需付出的高昂学习成本。
 
 ### 3.5. 技术实现：逐令牌梯度提取与稳定性加固
 

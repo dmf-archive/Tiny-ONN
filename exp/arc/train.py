@@ -83,16 +83,13 @@ def _calculate_goodness_jit(
  
     num_modules = len(masked_outputs)
     for i in range(num_modules):
-        grad_mask = (routing_logits[i] > 0).float()
-        masked_output_grad = captured_masked_grad_outputs[i] * grad_mask
+        masked_output_grad = captured_masked_grad_outputs[i]
         spl_input = captured_spl_inputs[i]
-        masked_output = masked_outputs[i]
 
-        masked_output_abs = torch.abs(masked_output)
         masked_output_grad_abs = torch.abs(masked_output_grad)
 
-        per_token_mu_grad = torch.einsum("bso,bsi->bsoi", masked_output_grad, spl_input)
-        mu_grad_norm = torch.norm(per_token_mu_grad, p=2, dim=-1)
+        spl_input_norm = torch.norm(spl_input, p=2, dim=-1, keepdim=True)
+        mu_grad_norm = torch.abs(masked_output_grad) * spl_input_norm
 
         all_mu_grad_norms.append(torch.mean(torch.mean(mu_grad_norm, dim=-1), dim=(0, 1)))
 
@@ -100,10 +97,9 @@ def _calculate_goodness_jit(
         norm_masked_output_grad = mas_normalize_jit(masked_output_grad_abs)
         norm_mu_grad = mas_normalize_jit(mu_grad_norm)
 
-        goodness_logits = norm_masked_output_grad * (norm_mu_grad - norm_logits)
+        goodness_logits = norm_masked_output_grad * (norm_logits - norm_mu_grad)
         
-        final_goodness = goodness_logits * grad_mask
-        all_goodness_logits.append(final_goodness)
+        all_goodness_logits.append(goodness_logits)
 
     return all_goodness_logits, all_mu_grad_norms
 
@@ -157,9 +153,11 @@ class LearningDynamics:
             model_outputs["routing_logits"],
         )
 
-        meta_losses = [
-            self._calculate_meta_loss(p) for p in model_outputs["routing_logits"]
-        ]
+        meta_losses = []
+        for i in range(len(model_outputs["routing_logits"])):
+            if i < len(all_goodness_logits):
+                prior_logits = model_outputs["routing_logits"][i] + all_goodness_logits[i].detach()
+                meta_losses.append(self._calculate_meta_loss(prior_logits))
         avg_meta_loss = torch.stack(meta_losses).mean() if meta_losses else torch.tensor(0.0, device=device)
         total_meta_loss = self.config.w_meta * avg_meta_loss
 
