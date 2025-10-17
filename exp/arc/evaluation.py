@@ -51,16 +51,24 @@ class ArcGenerator:
         tokens = input_ids.clone()
         coords = input_coords.clone()
         past_key_values = None
-        current_r, current_c = 0, -1
+        position_ids = None
         probabilities = []
+        
+        current_r, current_c = 0, -1
 
         with sdpa_kernel(SDPBackend.EFFICIENT_ATTENTION), torch.autocast(
             device_type=self.device.type, dtype=torch.float16
         ):
-            for _ in range(max_new_tokens):
-                model_input = tokens if past_key_values is None else tokens[:, -1:]
+            for i in range(max_new_tokens):
+                if i == 0:
+                    model_input = tokens
+                    position_ids = torch.arange(tokens.shape[1], device=self.device).unsqueeze(0)
+                else:
+                    model_input = tokens[:, -1:]
+                    position_ids = torch.tensor([[position_ids[0, -1] + 1]], device=self.device)
+
                 outputs = self.model(
-                    model_input, past_key_values=past_key_values, return_dict=True
+                    model_input, coords=coords, position_ids=position_ids, past_key_values=past_key_values, return_dict=True
                 )
                 logits, past_key_values = outputs["logits"], outputs["past_key_values"]
 
@@ -79,8 +87,8 @@ class ArcGenerator:
                     next_coord_tuple = (current_r, current_c)
                 elif next_token_item == self.serializer.tokenizer.row_sep_token_id:
                     current_r += 1
-                    current_c = 0
-                    next_coord_tuple = (current_r, 0)
+                    current_c = -1
+                    next_coord_tuple = (-1, -1)
                 else:
                     next_coord_tuple = (-1, -1)
 
@@ -94,22 +102,23 @@ class ArcGenerator:
 
     def _dfs_search(self, input_ids: torch.Tensor, input_coords: torch.Tensor, max_new_tokens: int) -> list[tuple[np.ndarray, float]]:
         sys.setrecursionlimit(1000 + max_new_tokens)
-        input_ids_squeezed = input_ids.squeeze(0)
-        pos = len(input_ids_squeezed)
+        pos = input_ids.shape[1]
+        position_ids = torch.arange(pos, device=self.device).unsqueeze(0)
 
         with sdpa_kernel(SDPBackend.EFFICIENT_ATTENTION), torch.autocast(
             device_type=self.device.type, dtype=torch.float16
         ):
-            outputs = self.model(input_ids, return_dict=True)
+            outputs = self.model(input_ids, coords=input_coords, position_ids=position_ids, return_dict=True)
             logits, cache = outputs["logits"], [outputs["past_key_values"]]
 
         logits_sliced = logits[0, pos - 1 :]
+        
         result = self._explore(
-            logits_sliced, [], max_new_tokens, -np.log(self.config.min_prob), pos, cache, input_coords
+            logits_sliced, [], max_new_tokens, -np.log(self.config.min_prob), pos, cache, input_coords, position_ids, 0, -1
         )
         return sorted([(np.array(suffix[::-1]), score_val) for suffix, score_val in result], key=lambda x: x[1])
 
-    def _explore(self, logits: torch.Tensor, path: list[int], max_new_tokens: int, max_score: float, pos: int, cache: list, coords: torch.Tensor, score: float = 0.0) -> list[tuple[list[int], float]]:
+    def _explore(self, logits: torch.Tensor, path: list[int], max_new_tokens: int, max_score: float, pos: int, cache: list, coords: torch.Tensor, position_ids: torch.Tensor, current_r: int, current_c: int, score: float = 0.0) -> list[tuple[list[int], float]]:
         first_token_logits, remaining_logits = logits[0], (logits[1:] if len(logits) > 1 else None)
         nll = -first_token_logits.detach().float().log_softmax(-1).cpu()
         softmax = list(enumerate(nll))
@@ -118,39 +127,42 @@ class ArcGenerator:
             softmax[0], softmax[path[0]], path = softmax[path[0]], softmax[0], path[1:]
 
         return_suffixes = []
-        current_r, current_c = coords[0, -1, 0].item(), coords[0, -1, 1].item()
-
+        
         for i, s in softmax:
             next_score = score + s.item()
             if next_score < max_score:
                 if i == self.eos_token_id:
                     suffixes = [([], next_score)]
                 elif max_new_tokens > 1:
+                    new_r, new_c = current_r, current_c
+                    if self.serializer.tokenizer.token_id_to_color(i) is not None:
+                        new_c += 1
+                        next_coord_tuple = (new_r, new_c)
+                    elif i == self.serializer.tokenizer.row_sep_token_id:
+                        new_r += 1
+                        new_c = -1
+                        next_coord_tuple = (-1, -1)
+                    else:
+                        next_coord_tuple = (-1, -1)
+                    
+                    next_coord = torch.cat([coords, torch.tensor([[next_coord_tuple]], dtype=torch.long, device=self.device)], dim=1)
+                    next_position_ids = torch.tensor([[position_ids[0, -1] + 1]], device=self.device)
+
                     if remaining_logits is None:
                         if pos < cache[0][0][0].shape[2]:
                             cache[0] = tuple(tuple(c[:, :, :pos] for c in l) for l in cache[0])
 
                         next_token_tensor = torch.tensor([[i]], device=self.device)
-                        if self.serializer.tokenizer.token_id_to_color(i) is not None:
-                            current_c += 1
-                            next_coord_tuple = (current_r, current_c)
-                        elif i == self.serializer.tokenizer.row_sep_token_id:
-                            current_r += 1
-                            current_c = 0
-                            next_coord_tuple = (current_r, 0)
-                        else:
-                            next_coord_tuple = (-1, -1)
-                        next_coord = torch.tensor([[next_coord_tuple]], dtype=torch.long, device=self.device)
-
+                        
                         outputs = self.model(
-                            next_token_tensor, past_key_values=cache[0], return_dict=True
+                            next_token_tensor, coords=next_coord, position_ids=next_position_ids, past_key_values=cache[0], return_dict=True
                         )
                         new_logits, cache[0] = outputs["logits"], outputs["past_key_values"]
                         new_logits = new_logits[0]
                     else:
-                        new_logits, next_coord = remaining_logits, coords
+                        new_logits = remaining_logits
 
-                    suffixes = self._explore(new_logits, path, max_new_tokens - 1, max_score, pos + 1, cache, next_coord, next_score)
+                    suffixes = self._explore(new_logits, path, max_new_tokens - 1, max_score, pos + 1, cache, next_coord, next_position_ids, new_r, new_c, next_score)
                 else:
                     suffixes = []
 

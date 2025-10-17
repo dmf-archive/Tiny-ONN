@@ -1,46 +1,63 @@
 
+import math
 import torch
 
-
+@torch.jit.script
 def _rotate_half(x: torch.Tensor) -> torch.Tensor:
     x1 = x[..., : x.shape[-1] // 2]
     x2 = x[..., x.shape[-1] // 2 :]
     return torch.cat((-x2, x1), dim=-1)
 
-def get_arc_rope_3d_index(coords_3d: torch.Tensor, hidden_size: int) -> tuple[torch.Tensor, torch.Tensor]:
-    coords_3d.shape[0]
+@torch.jit.script
+def get_circle_rope_embeddings(
+    coords_3d: torch.Tensor, hidden_size: int, radius: float = 10.0, alpha: float = 0.5
+) -> tuple[torch.Tensor, torch.Tensor]:
+    
+    coords_2d = coords_3d[:, :2]
+    x, y = coords_2d[:, 0], coords_2d[:, 1]
+    
+    valid_mask = (x != -1) & (y != -1)
+    projected_coords_2d = coords_2d.clone()
+
+    if valid_mask.any():
+        x_valid, y_valid = x[valid_mask], y[valid_mask]
+        
+        theta_orig = torch.atan2(y_valid, x_valid)
+        theta_min, theta_max = theta_orig.min(), theta_orig.max()
+        theta_range = theta_max - theta_min
+        theta_norm = (
+            (theta_orig - theta_min) / theta_range * (2 * math.pi)
+            if theta_range > 0
+            else theta_orig
+        )
+        
+        indices = torch.arange(x_valid.shape[0], dtype=torch.float32, device=x.device)
+        theta_index = indices / x_valid.shape[0] * (2 * math.pi)
+        
+        theta_uniform = alpha * theta_norm + (1 - alpha) * theta_index
+
+        new_x_valid = radius * torch.cos(theta_uniform)
+        new_y_valid = radius * torch.sin(theta_uniform)
+
+        projected_coords_2d[valid_mask, 0] = new_x_valid
+        projected_coords_2d[valid_mask, 1] = new_y_valid
+
+    projected_coords_3d = torch.cat([projected_coords_2d, coords_3d[:, 2].unsqueeze(-1)], dim=-1)
+
     dim = hidden_size // 3
+    inv_freq = 1.0 / (10000.0 ** (torch.arange(0, dim, 2, device=coords_3d.device).float() / dim))
 
-    inv_freq = 1.0 / (10000 ** (torch.arange(0, dim, 2).float() / dim))
+    pos_emb = torch.einsum("i,j->ij", projected_coords_3d[:, 0], inv_freq)
+    grid_y_emb = torch.einsum("i,j->ij", projected_coords_3d[:, 1], inv_freq)
+    grid_x_emb = torch.einsum("i,j->ij", projected_coords_3d[:, 2], inv_freq)
 
-    x_emb = torch.outer(coords_3d[:, 0].float(), inv_freq)
-    y_emb = torch.outer(coords_3d[:, 1].float(), inv_freq)
-    z_emb = torch.outer(coords_3d[:, 2].float(), inv_freq)
-
-    x_cos = torch.cos(x_emb)
-    x_sin = torch.sin(x_emb)
-    y_cos = torch.cos(y_emb)
-    y_sin = torch.sin(y_emb)
-    z_cos = torch.cos(z_emb)
-    z_sin = torch.sin(z_emb)
-
-    cos = torch.cat([x_cos, y_cos, z_cos], dim=-1)
-    sin = torch.cat([x_sin, y_sin, z_sin], dim=-1)
-
+    cos = torch.cat([torch.cos(pos_emb), torch.cos(grid_y_emb), torch.cos(grid_x_emb)], dim=-1)
+    sin = torch.cat([torch.sin(pos_emb), torch.sin(grid_y_emb), torch.sin(grid_x_emb)], dim=-1)
+    
     return cos, sin
 
-def apply_arc_rope_3d(q: torch.Tensor, k: torch.Tensor, coords_3d: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    cos, sin = get_arc_rope_3d_index(coords_3d, q.shape[-1])
-
-    q_rot = (q * cos) + (_rotate_half(q) * sin)
-    k_rot = (k * cos) + (_rotate_half(k) * sin)
-
-    return q_rot, k_rot
-
-def build_3d_coords_1d(seq_len: int, device: torch.device) -> torch.Tensor:
-    return torch.arange(seq_len, device=device).unsqueeze(-1).expand(seq_len, 3).float()
-
-def build_3d_coords_2d(grid_coords: torch.Tensor, seq_positions: torch.Tensor) -> torch.Tensor:
+@torch.jit.script
+def build_3d_coords(grid_coords: torch.Tensor, seq_positions: torch.Tensor) -> torch.Tensor:
     coords_3d = torch.zeros((seq_positions.shape[0], 3), device=grid_coords.device, dtype=torch.float32)
     valid_mask = (grid_coords[:, 0] != -1) & (grid_coords[:, 1] != -1)
     coords_3d[valid_mask, 0] = grid_coords[valid_mask, 1].float()
@@ -48,14 +65,22 @@ def build_3d_coords_2d(grid_coords: torch.Tensor, seq_positions: torch.Tensor) -
     coords_3d[:, 2] = seq_positions.float()
     return coords_3d
 
-def normalize_3d_coords(coords_3d: torch.Tensor) -> torch.Tensor:
-    norm_coords = coords_3d.clone()
-    for i in range(3):
-        col = coords_3d[:, i]
-        min_val = col.min()
-        max_val = col.max()
-        if max_val > min_val:
-            norm_coords[:, i] = (col - min_val) / (max_val - min_val + 1e-8)
-        else:
-            norm_coords[:, i] = 0.0
-    return norm_coords
+@torch.jit.script
+def apply_arc_rope(q: torch.Tensor, k: torch.Tensor, coords_2d: torch.Tensor, position_ids: torch.Tensor, hidden_size: int) -> tuple[torch.Tensor, torch.Tensor]:
+    gathered_coords = coords_2d.squeeze(0)[position_ids.squeeze(0)].unsqueeze(0)
+    
+    coords_3d = build_3d_coords(gathered_coords.squeeze(0), position_ids.squeeze(0).float())
+    cos, sin = get_circle_rope_embeddings(coords_3d, hidden_size)
+
+    cos_emb = cos.unsqueeze(0).unsqueeze(0)
+    sin_emb = sin.unsqueeze(0).unsqueeze(0)
+    
+    q_rot = (q * cos_emb) + (_rotate_half(q) * sin_emb)
+    k_rot = (k * cos_emb) + (_rotate_half(k) * sin_emb)
+    return q_rot, k_rot
+    coords_3d = torch.zeros((seq_positions.shape[0], 3), device=grid_coords.device, dtype=torch.float32)
+    valid_mask = (grid_coords[:, 0] != -1) & (grid_coords[:, 1] != -1)
+    coords_3d[valid_mask, 0] = grid_coords[valid_mask, 1].float()
+    coords_3d[valid_mask, 1] = grid_coords[valid_mask, 0].float()
+    coords_3d[:, 2] = seq_positions.float()
+    return coords_3d

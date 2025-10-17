@@ -5,30 +5,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .circle_rope_arc import (
-    build_3d_coords_2d,
-    get_arc_rope_3d_index,
-    normalize_3d_coords,
+    apply_arc_rope,
 )
 from .config import ModelConfig
 
 
-@torch.jit.script
-def rotate_half(x: torch.Tensor) -> torch.Tensor:
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return torch.cat((-x2, x1), dim=-1)
-
-
-@torch.jit.script
-def mas_normalize(logits: torch.Tensor) -> torch.Tensor:
-    max_abs_val = torch.max(torch.abs(logits), dim=-1, keepdim=True).values
-    scaled_logits = logits / (max_abs_val + 1e-9)
-    return scaled_logits
-
-
-@torch.jit.script
-def mas_normalize_negative(logits: torch.Tensor) -> torch.Tensor:
-    return -F.relu(-mas_normalize(logits))
 
 @torch.jit.script
 def spl_forward(
@@ -109,7 +90,8 @@ class MoIETransformerBlock(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        coords: torch.Tensor | None = None,
+        coords_2d: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
         past_kv: tuple | None = None,
         incoming_proto_state: dict | None = None,
         captured_spl_inputs: list | None = None,
@@ -140,7 +122,8 @@ class MoIETransformerBlock(nn.Module):
         q, k, v = torch.zeros_like(c_q), torch.zeros_like(c_k), torch.zeros_like(c_v)
 
         for i in range(3):
-            cost_score = mas_normalize(costs_qkv[i])
+            max_abs_val = torch.max(torch.abs(costs_qkv[i]), dim=-1, keepdim=True).values
+            cost_score = costs_qkv[i] / (max_abs_val + 1e-9)
             routing_logits = match_qkv[i] - cost_score
             computation_output = comp_qkv[i]
 
@@ -164,6 +147,9 @@ class MoIETransformerBlock(nn.Module):
         num_heads = 1
         head_dim = self.d_model
 
+        if coords_2d is not None and position_ids is not None:
+            q, k = apply_arc_rope(q, k, coords_2d, position_ids, self.d_model)
+
         q = q.view(batch_size, seq_len, num_heads, head_dim).transpose(1, 2)
         k = k.view(batch_size, seq_len, num_heads, head_dim).transpose(1, 2)
         v = v.view(batch_size, seq_len, num_heads, head_dim).transpose(1, 2)
@@ -180,7 +166,8 @@ class MoIETransformerBlock(nn.Module):
         attn_out = attn_out.transpose(1, 2).contiguous().view(batch_size, seq_len, self.d_model)
 
         c_o, mv_o, pc_o = self.attn.spl_o(attn_out, outgoing_proto_state["attn_o"])
-        cost_score_o = mas_normalize(pc_o)
+        max_abs_val_o = torch.max(torch.abs(pc_o), dim=-1, keepdim=True).values
+        cost_score_o = pc_o / (max_abs_val_o + 1e-9)
         routing_logits_o = mv_o - cost_score_o
 
         computation_output_o = c_o
@@ -220,32 +207,15 @@ class ArcEmbedding(nn.Module):
         self.hidden_size = config.hidden_size
         self.color_embedding = nn.Embedding(config.vocab_size, self.hidden_size, dtype=dtype)
 
-    def forward(self, input_ids: torch.Tensor, coords: torch.Tensor | None = None) -> torch.Tensor:
-        color_emb = self.color_embedding(input_ids)
-        if coords is None:
-            return color_emb
-
-        batch_size, seq_len, _ = color_emb.shape
-        pos_aware_embs = []
-        for b in range(batch_size):
-            batch_coords = coords[b]
-            seq_pos = torch.arange(seq_len, device=input_ids.device)
-            coords_3d = build_3d_coords_2d(batch_coords, seq_pos)
-            coords_3d = normalize_3d_coords(coords_3d)
-
-            cos, sin = get_arc_rope_3d_index(coords_3d, self.hidden_size)
-
-            rotated_emb = (color_emb[b] * cos) + (rotate_half(color_emb[b]) * sin)
-            pos_aware_embs.append(rotated_emb)
-
-        return torch.stack(pos_aware_embs)
+    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.color_embedding(input_ids)
 
 class ArcTransformer(nn.Module):
     def __init__(self, config: ModelConfig, device: torch.device | str):
         super().__init__()
         self.config, self.device = config, device
         dtype = torch.float32
-        self.embedding = torch.jit.script(ArcEmbedding(config, dtype=dtype))
+        self.embedding = ArcEmbedding(config, dtype=dtype)
         self.blocks = nn.ModuleList([MoIETransformerBlock(config, dtype=dtype) for _ in range(config.num_layers)])
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False, dtype=dtype)
 
@@ -253,22 +223,23 @@ class ArcTransformer(nn.Module):
         self,
         input_ids: torch.Tensor,
         coords: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
         past_key_values: list | None = None,
         return_dict: bool = False,
         captured_spl_inputs: list | None = None,
         captured_masked_grad_outputs: list | None = None,
     ):
-        x = self.embedding(input_ids, coords)
-        past_key_values = past_key_values if past_key_values is not None else [None] * len(self.blocks)
+        x = self.embedding(input_ids)
 
+        if position_ids is None:
+            past_seen_tokens = past_key_values[0][0].shape[2] if past_key_values is not None else 0
+            position_ids = torch.arange(
+                past_seen_tokens, past_seen_tokens + x.shape[1], device=x.device
+            ).unsqueeze(0)
+
+        past_key_values = past_key_values if past_key_values is not None else [None] * len(self.blocks)
         all_masked, all_comp, all_spl_in, all_masked_routing_logits, all_protos, all_routing_logits, presents = (
-            [],
-            [],
-            [],
-            [],
-            [],
-            [],
-            [],
+            [], [], [], [], [], [], [],
         )
         incoming_proto_state = None
 
@@ -285,6 +256,7 @@ class ArcTransformer(nn.Module):
             ) = block(
                 x,
                 coords,
+                position_ids,
                 past_key_values[i],
                 incoming_proto_state,
                 captured_spl_inputs=captured_spl_inputs,
