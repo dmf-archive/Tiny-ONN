@@ -204,13 +204,20 @@ class Trainer:
         self.checkpoint_dir = Path(__file__).parent / "checkpoints"
         self.checkpoint_dir.mkdir(exist_ok=True)
         self.global_step, self.epoch, self.start_task_idx, self.start_view_idx = 0, 0, 0, 0
+        self.curriculum_stage = 1
         self.captured_spl_inputs: list[torch.Tensor] = []
         self.captured_masked_grad_outputs: list[torch.Tensor] = []
 
     def _setup_data(self):
         collator = ArcCollator(self.tokenizer, max_len=self.config.model.max_position_embeddings)
+        train_dataset = InMemoryArcDataset(
+            data_path=self.config.data.data_path,
+            tokenizer=self.tokenizer,
+            split="training",
+            warmup_ratio=self.config.data.warmup_dataset_ratio,
+        )
         self.train_loader = DataLoader(
-            InMemoryArcDataset(data_path=self.config.data.data_path, tokenizer=self.tokenizer, split="training"),
+            train_dataset,
             batch_size=self.config.data.batch_size, collate_fn=collator, num_workers=self.config.data.num_workers, shuffle=False, pin_memory=True,
         )
         self.eval_loader = DataLoader(
@@ -332,17 +339,33 @@ class Trainer:
             self.eval_loader,
             task_idx if isinstance(task_idx, int) else -1,
             self._save_checkpoint,
+            self.advance_curriculum,
+            self.curriculum_stage,
         )
 
         self.global_step += 1
         return metrics, model_outputs.get("masked_routing_logits"), model_outputs.get("routing_logits"), signals
 
 
+    def advance_curriculum(self):
+        if self.curriculum_stage == 1:
+            self.curriculum_stage = 2
+            self.train_loader.dataset.set_stage(2)
+            self.console.print("[bold magenta]Curriculum stage advanced to 2. Using full dataset.[/bold magenta]")
+            self.start_task_idx, self.start_view_idx = 0, 0
+            self.epoch = 0
+
     def _train_epoch(self, epoch: int):
         dataset = self.train_loader.dataset
-        for task_idx in range(self.start_task_idx, len(dataset)):
+        num_tasks_in_stage = len(dataset)
+        
+        # Determine the starting task index for the current epoch run
+        current_epoch_start_task_idx = self.start_task_idx if self.start_task_idx < num_tasks_in_stage else 0
+
+        for task_idx_offset, task_idx in enumerate(range(current_epoch_start_task_idx, num_tasks_in_stage)):
             task_data = dataset[task_idx]
             start_view = self.start_view_idx if task_idx == self.start_task_idx else 0
+            self.start_task_idx = task_idx
 
             all_views = list(range(8))
             if start_view > 0:
@@ -351,6 +374,7 @@ class Trainer:
                 selected_views = random.sample(all_views, self.config.num_augmentation_views)
 
             for view_idx in selected_views:
+                self.start_view_idx = view_idx
                 batch_cpu = self._prepare_batch(task_data, view_idx, self.config.model.max_position_embeddings)
                 if not batch_cpu:
                     self.console.print(
@@ -369,7 +393,9 @@ class Trainer:
                         break
             self.start_view_idx = 0
             torch.cuda.empty_cache()
-        self.start_task_idx, self.start_view_idx = 0, 0
+            
+        # Reset for the next full epoch pass
+        self.start_task_idx = 0
 
 
     def train(self):

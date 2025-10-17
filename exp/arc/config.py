@@ -19,6 +19,7 @@ class DataConfig:
     data_path: str = "data/ARC-AGI-2/data"
     batch_size: int = 1
     num_workers: int = 4
+    warmup_dataset_ratio: float = 0.1
 
 
 @dataclass

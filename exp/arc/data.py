@@ -94,25 +94,33 @@ class GridSerializer:
 
 
 class InMemoryArcDataset(Dataset):
-    def __init__(self, data_path: str, tokenizer: ArcColorTokenizer, split: str = "training"):
+    def __init__(self, data_path: str, tokenizer: ArcColorTokenizer, split: str = "training", warmup_ratio: float = 1.0):
         self.data_path = Path(data_path) / split
-        self.tasks = []
+        self.split = split
+        self.warmup_ratio = warmup_ratio
+        
+        all_tasks = []
         file_paths = sorted(list(self.data_path.glob("*.json")))
         for path in file_paths:
             with open(path) as f:
                 task_data = json.load(f)
             if (split == "training" or split == "evaluation") and "test" in task_data and task_data["test"] and "output" in task_data["test"][0]:
-                self.tasks.append(task_data)
+                all_tasks.append(task_data)
 
         tasks_with_metrics = [
-            (task, self._calculate_task_difficulty(task)) for task in self.tasks
+            (task, self._calculate_task_difficulty(task)) for task in all_tasks
         ]
         
         sorted_tasks = sorted(
             tasks_with_metrics, key=lambda x: (x[1]["max_pixels"], x[1]["entropy"])
         )
         
-        self.tasks = [task for task, metrics in sorted_tasks]
+        self.full_tasks = [task for task, metrics in sorted_tasks]
+        self.warmup_size = int(len(self.full_tasks) * self.warmup_ratio)
+        
+        self.tasks = self.full_tasks
+        if self.split == "training":
+            self.set_stage(1)
 
     @staticmethod
     def _normalize(values: list[float]) -> list[float]:
@@ -143,6 +151,14 @@ class InMemoryArcDataset(Dataset):
             "max_pixels": float(max_pixels),
             "entropy": np.mean(entropies) if entropies else 0.0,
         }
+
+    def set_stage(self, stage: int):
+        if self.split != "training":
+            return
+        if stage == 1:
+            self.tasks = self.full_tasks[:self.warmup_size]
+        else:
+            self.tasks = self.full_tasks
 
     def __len__(self) -> int:
         return len(self.tasks)

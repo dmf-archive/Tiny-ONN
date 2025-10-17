@@ -216,6 +216,8 @@ class Observer:
         eval_loader,
         current_task_idx: int,
         save_checkpoint_fn,
+        advance_curriculum_fn: callable,
+        curriculum_stage: int,
     ):
         if step % self.config.log_interval == 0:
             self.log_step(epoch, step, task_idx, view_idx, metrics, elapsed_time)
@@ -223,7 +225,7 @@ class Observer:
             save_checkpoint_fn(task_idx, view_idx)
 
         if step > 0 and step % self.config.eval_interval == 0:
-            evaluator.run(eval_loader, current_task_idx, step)
+            evaluator.run(eval_loader, current_task_idx, step, curriculum_stage, advance_curriculum_fn)
 
     def _create_grid_text(self, grid: torch.Tensor) -> Text:
         text = Text()

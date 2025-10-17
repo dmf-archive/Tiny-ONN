@@ -203,9 +203,9 @@ class EvaluationStep:
 
         return total_correct, evaluated_count
 
-    def run(self, eval_loader: Any, current_task_idx: int, global_step: int, verbose: bool = False) -> dict[str, float]:
+    def run(self, eval_loader: Any, current_task_idx: int, global_step: int, curriculum_stage: int, advance_curriculum_fn: callable, verbose: bool = False) -> dict[str, float]:
         self.model.eval()
-        self.observer.console.print(f"\n[bold cyan]--- Running 3-Phase Evaluation @ Step {global_step} ---[/bold cyan]")
+        self.observer.console.print(f"\n[bold cyan]--- Running 3-Phase Evaluation @ Step {global_step} (Stage {curriculum_stage}) ---[/bold cyan]")
 
         num_historical = current_task_idx
         if num_historical == 0:
@@ -221,6 +221,11 @@ class EvaluationStep:
                 self.model.train()
                 return {"eval_grid_acc": correct / total if total > 0 else 0}
             self.observer.console.print(f"[bold green]Phase 1 PASSED: No forgetting detected ({correct}/{total}).[/bold green]")
+
+            if curriculum_stage == 1:
+                advance_curriculum_fn()
+                self.model.train()
+                return {"eval_grid_acc": 1.0}
 
         num_to_sample_quick = min(5, len(eval_loader.dataset))
         correct_quick, total_quick = self._run_eval_loop(eval_loader, num_to_sample_quick, "Phase 2: Quick Generalization", global_step)
