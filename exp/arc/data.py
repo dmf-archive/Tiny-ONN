@@ -104,7 +104,9 @@ class InMemoryArcDataset(Dataset):
         for path in file_paths:
             with open(path) as f:
                 task_data = json.load(f)
-            if (split == "training" or split == "evaluation") and "test" in task_data and task_data["test"] and "output" in task_data["test"][0]:
+            if split == "training" and "test" in task_data and task_data["test"] and "output" in task_data["test"][0]:
+                all_tasks.append(task_data)
+            elif split == "evaluation" and "test" in task_data and task_data["test"]:
                 all_tasks.append(task_data)
 
         tasks_with_metrics = [

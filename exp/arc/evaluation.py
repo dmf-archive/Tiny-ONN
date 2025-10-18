@@ -215,11 +215,11 @@ class EvaluationStep:
 
         return total_correct, evaluated_count
 
-    def run(self, eval_loader: Any, current_task_idx: int, global_step: int, curriculum_stage: int, advance_curriculum_fn: callable, verbose: bool = False) -> dict[str, float]:
+    def run(self, eval_loader: Any, total_tasks_processed: int, global_step: int, curriculum_stage: int, advance_curriculum_fn: callable, verbose: bool = False) -> dict[str, float]:
         self.model.eval()
         self.observer.console.print(f"\n[bold cyan]--- Running 3-Phase Evaluation @ Step {global_step} (Stage {curriculum_stage}) ---[/bold cyan]")
 
-        num_historical = current_task_idx
+        num_historical = total_tasks_processed
         if num_historical == 0:
             self.observer.console.print("[yellow]Phase 1 skipped (no historical tasks to check for forgetting).[/yellow]")
         else:

@@ -44,8 +44,8 @@ def get_circle_rope_embeddings(
 
     projected_coords_3d = torch.cat([projected_coords_2d, coords_3d[:, 2].unsqueeze(-1)], dim=-1)
 
-    dim = hidden_size // 3
-    inv_freq = 1.0 / (10000.0 ** (torch.arange(0, dim, 2, device=coords_3d.device).float() / dim))
+    dim_per_component = hidden_size // 3
+    inv_freq = 1.0 / (10000.0 ** (torch.arange(0, 2 * dim_per_component, 2, device=coords_3d.device).float() / dim_per_component))
 
     pos_emb = torch.einsum("i,j->ij", projected_coords_3d[:, 0], inv_freq)
     grid_y_emb = torch.einsum("i,j->ij", projected_coords_3d[:, 1], inv_freq)
@@ -78,9 +78,3 @@ def apply_arc_rope(q: torch.Tensor, k: torch.Tensor, coords_2d: torch.Tensor, po
     q_rot = (q * cos_emb) + (_rotate_half(q) * sin_emb)
     k_rot = (k * cos_emb) + (_rotate_half(k) * sin_emb)
     return q_rot, k_rot
-    coords_3d = torch.zeros((seq_positions.shape[0], 3), device=grid_coords.device, dtype=torch.float32)
-    valid_mask = (grid_coords[:, 0] != -1) & (grid_coords[:, 1] != -1)
-    coords_3d[valid_mask, 0] = grid_coords[valid_mask, 1].float()
-    coords_3d[valid_mask, 1] = grid_coords[valid_mask, 0].float()
-    coords_3d[:, 2] = seq_positions.float()
-    return coords_3d

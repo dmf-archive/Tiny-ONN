@@ -204,6 +204,7 @@ class Trainer:
         self.checkpoint_dir = Path(__file__).parent / "checkpoints"
         self.checkpoint_dir.mkdir(exist_ok=True)
         self.global_step, self.epoch, self.start_task_idx, self.start_view_idx = 0, 0, 0, 0
+        self.total_tasks_processed = 0
         self.curriculum_stage = 1
         self.captured_spl_inputs: list[torch.Tensor] = []
         self.captured_masked_grad_outputs: list[torch.Tensor] = []
@@ -337,7 +338,7 @@ class Trainer:
             signals,
             self.evaluator,
             self.eval_loader,
-            task_idx if isinstance(task_idx, int) else -1,
+            self.total_tasks_processed,
             self._save_checkpoint,
             self.advance_curriculum,
             self.curriculum_stage,
@@ -359,14 +360,12 @@ class Trainer:
         dataset = self.train_loader.dataset
         num_tasks_in_stage = len(dataset)
         
-        # Determine the starting task index for the current epoch run
-        current_epoch_start_task_idx = self.start_task_idx if self.start_task_idx < num_tasks_in_stage else 0
+        for task_idx, task_data in enumerate(dataset):
+            if task_idx < self.start_task_idx:
+                continue
 
-        for task_idx_offset, task_idx in enumerate(range(current_epoch_start_task_idx, num_tasks_in_stage)):
-            task_data = dataset[task_idx]
             start_view = self.start_view_idx if task_idx == self.start_task_idx else 0
-            self.start_task_idx = task_idx
-
+            
             all_views = list(range(8))
             if start_view > 0:
                 selected_views = all_views[start_view:]
@@ -393,10 +392,8 @@ class Trainer:
                         break
             self.start_view_idx = 0
             torch.cuda.empty_cache()
-            
-        # Reset for the next full epoch pass
+            self.total_tasks_processed = task_idx + 1
         self.start_task_idx = 0
-
 
     def train(self):
         self._load_checkpoint()
@@ -415,6 +412,7 @@ class Trainer:
 
         trainer_state = {
             "epoch": self.epoch, "step": self.global_step, "task_idx": task_idx, "view_idx": view_idx,
+            "total_tasks_processed": self.total_tasks_processed,
             "optimizer_comp_state_dict": self.optimizer_comp.state_dict(),
             "optimizer_route_state_dict": self.optimizer_route.state_dict(),
         }
@@ -449,6 +447,7 @@ class Trainer:
                     self.optimizer_comp.load_state_dict(state["optimizer_comp_state_dict"])
                     self.optimizer_route.load_state_dict(state["optimizer_route_state_dict"])
                     self.global_step, self.epoch, self.start_task_idx, self.start_view_idx = (state["step"], state["epoch"], state["task_idx"], state["view_idx"])
+                    self.total_tasks_processed = state["total_tasks_processed"]
 
                 elif path.is_file():
                     ckpt = torch.load(path, map_location=self.device)
@@ -456,6 +455,7 @@ class Trainer:
                     self.optimizer_comp.load_state_dict(ckpt["optimizer_comp_state_dict"])
                     self.optimizer_route.load_state_dict(ckpt["optimizer_route_state_dict"])
                     self.global_step, self.epoch, self.start_task_idx, self.start_view_idx = (ckpt["step"], ckpt["epoch"], ckpt["task_idx"], ckpt["view_idx"])
+                    self.total_tasks_processed = ckpt["total_tasks_processed"]
 
                 self.console.print(f"[bold green]Loaded checkpoint from {path} at step {self.global_step}.[/bold green]")
                 return
