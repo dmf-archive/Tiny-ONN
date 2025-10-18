@@ -73,31 +73,29 @@ def mas_normalize_jit(logits: torch.Tensor) -> torch.Tensor:
 
 @torch.jit.script
 def _calculate_goodness_jit(
-    masked_outputs: list[torch.Tensor],
-    captured_masked_grad_outputs: list[torch.Tensor],
+    captured_computation_grads: list[torch.Tensor],
     captured_spl_inputs: list[torch.Tensor],
     routing_logits: list[torch.Tensor],
 ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
     all_goodness_logits: list[torch.Tensor] = []
     all_mu_grad_norms: list[torch.Tensor] = []
  
-    num_modules = len(masked_outputs)
+    num_modules = len(captured_computation_grads)
     for i in range(num_modules):
-        masked_output_grad = captured_masked_grad_outputs[i]
+        computation_grad = captured_computation_grads[i]
         spl_input = captured_spl_inputs[i]
 
-        masked_output_grad_abs = torch.abs(masked_output_grad)
+        computation_grad_abs = torch.abs(computation_grad)
 
         spl_input_norm = torch.norm(spl_input, p=2, dim=-1, keepdim=True)
-        mu_grad_norm = torch.abs(masked_output_grad) * spl_input_norm
+        mu_grad_norm = torch.abs(computation_grad) * spl_input_norm
 
         all_mu_grad_norms.append(torch.mean(torch.mean(mu_grad_norm, dim=-1), dim=(0, 1)))
 
-        norm_logits = mas_normalize_jit(routing_logits[i])
-        norm_masked_output_grad = mas_normalize_jit(masked_output_grad_abs)
+        norm_computation_grad = mas_normalize_jit(computation_grad_abs)
         norm_mu_grad = mas_normalize_jit(mu_grad_norm)
 
-        goodness_logits = norm_masked_output_grad * (norm_logits - norm_mu_grad)
+        goodness_logits = norm_computation_grad * (routing_logits[i] - norm_mu_grad)
         
         all_goodness_logits.append(goodness_logits)
 
@@ -138,17 +136,15 @@ class LearningDynamics:
         model_outputs: dict,
         device: torch.device,
         captured_spl_inputs: list[torch.Tensor],
-        captured_masked_grad_outputs: list[torch.Tensor],
-        masked_outputs: list[torch.Tensor],
+        captured_computation_grads: list[torch.Tensor],
     ) -> dict[str, Any]:
         self.optimizer_comp.zero_grad()
         self.optimizer_route.zero_grad()
 
-        main_loss.backward(inputs=self.computation_params, retain_graph=True)
+        main_loss.backward()
 
         all_goodness_logits, all_mu_grad_norms = _calculate_goodness_jit(
-            masked_outputs,
-            captured_masked_grad_outputs,
+            captured_computation_grads,
             captured_spl_inputs,
             model_outputs["routing_logits"],
         )
@@ -207,7 +203,7 @@ class Trainer:
         self.total_tasks_processed = 0
         self.curriculum_stage = 1
         self.captured_spl_inputs: list[torch.Tensor] = []
-        self.captured_masked_grad_outputs: list[torch.Tensor] = []
+        self.captured_computation_grads: list[torch.Tensor] = []
 
     def _setup_data(self):
         collator = ArcCollator(self.tokenizer, max_len=self.config.model.max_position_embeddings)
@@ -299,7 +295,7 @@ class Trainer:
         self.model.train()
 
         self.captured_spl_inputs.clear()
-        self.captured_masked_grad_outputs.clear()
+        self.captured_computation_grads.clear()
 
         with sdpa_kernel(SDPBackend.EFFICIENT_ATTENTION), torch.autocast(
             device_type=self.config.device, dtype=torch.float32
@@ -308,7 +304,7 @@ class Trainer:
                 batch["input_ids"],
                 return_dict=True,
                 captured_spl_inputs=self.captured_spl_inputs,
-                captured_masked_grad_outputs=self.captured_masked_grad_outputs,
+                captured_computation_grads=self.captured_computation_grads,
             )
         main_loss = F.cross_entropy(
             model_outputs["logits"][:, :-1, :].contiguous().view(-1, self.config.model.vocab_size),
@@ -321,7 +317,7 @@ class Trainer:
             return None
 
         signals = self.dynamics.compute_and_apply_gradients(
-            main_loss, model_outputs, self.device, self.captured_spl_inputs, self.captured_masked_grad_outputs, model_outputs["masked_outputs"]
+            main_loss, model_outputs, self.device, self.captured_spl_inputs, self.captured_computation_grads
         )
         model_outputs.update({"labels": batch["labels"], "sample_entropy": batch["sample_entropy"]})
         metrics = self.observer.calculate_metrics(main_loss, model_outputs, signals, batch["input_ids"], self.model)
