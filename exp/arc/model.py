@@ -95,7 +95,7 @@ class MoIETransformerBlock(nn.Module):
         past_kv: tuple | None = None,
         incoming_proto_state: dict | None = None,
         captured_spl_inputs: list | None = None,
-        captured_computation_grads: list | None = None,
+        captured_masked_grad_outputs: list | None = None,
     ) -> tuple:
         outgoing_proto_state = {}
         spl_modules = {
@@ -121,29 +121,27 @@ class MoIETransformerBlock(nn.Module):
         comp_qkv, match_qkv, costs_qkv = [c_q, c_k, c_v], [mv_q, mv_k, mv_v], [pc_q, pc_k, pc_v]
         q, k, v = torch.zeros_like(c_q), torch.zeros_like(c_k), torch.zeros_like(c_v)
 
-        if self.training:
-            q, k, v = c_q, c_k, c_v
-            for i in range(3):
-                max_abs_val = torch.max(torch.abs(costs_qkv[i]), dim=-1, keepdim=True).values
-                cost_score = costs_qkv[i] / (max_abs_val + 1e-9)
-                routing_logits = match_qkv[i] - cost_score
-                all_routing_logits.append(routing_logits)
-                all_masked_routing_logits.append(F.relu(routing_logits))
-        else:
-            q, k, v = torch.zeros_like(c_q), torch.zeros_like(c_k), torch.zeros_like(c_v)
-            for i in range(3):
-                max_abs_val = torch.max(torch.abs(costs_qkv[i]), dim=-1, keepdim=True).values
-                cost_score = costs_qkv[i] / (max_abs_val + 1e-9)
-                routing_logits = match_qkv[i] - cost_score
-                mask_active = (routing_logits > 0).float()
-                masked_output = comp_qkv[i] * mask_active
-                if i == 0: q = masked_output
-                elif i == 1: k = masked_output
-                else: v = masked_output
-                all_routing_logits.append(routing_logits)
-                all_masked_routing_logits.append(F.relu(routing_logits))
+        for i in range(3):
+            max_abs_val = torch.max(torch.abs(costs_qkv[i]), dim=-1, keepdim=True).values
+            cost_score = costs_qkv[i] / (max_abs_val + 1e-9)
+            routing_logits = match_qkv[i] - cost_score
+            computation_output = comp_qkv[i]
 
-        all_comp.extend([c_q, c_k, c_v])
+            mask_active = (routing_logits > 0).float()
+            masked_routing_logits = F.relu(routing_logits)
+
+            masked_output = computation_output * mask_active
+
+            if i == 0:
+                q = masked_output
+            elif i == 1:
+                k = masked_output
+            else:
+                v = masked_output
+            all_masked.append(masked_output)
+            all_comp.append(computation_output)
+            all_masked_routing_logits.append(masked_routing_logits)
+            all_routing_logits.append(routing_logits)
 
         batch_size, seq_len, _ = q.shape
         num_heads = 1
@@ -171,29 +169,35 @@ class MoIETransformerBlock(nn.Module):
         max_abs_val_o = torch.max(torch.abs(pc_o), dim=-1, keepdim=True).values
         cost_score_o = pc_o / (max_abs_val_o + 1e-9)
         routing_logits_o = mv_o - cost_score_o
-        all_routing_logits.append(routing_logits_o)
-        all_masked_routing_logits.append(F.relu(routing_logits_o))
 
         computation_output_o = c_o
-        all_comp.append(computation_output_o)
 
-        if self.training:
-            masked_output_o = computation_output_o
-        else:
-            mask_active_o = (routing_logits_o > 0).float()
-            masked_output_o = computation_output_o * mask_active_o
+        mask_active_o = (routing_logits_o > 0).float()
+        masked_routing_logits_o = F.relu(routing_logits_o)
+
+        masked_output_o = computation_output_o * mask_active_o
 
         x_out = x + masked_output_o
+ 
+        all_masked.append(masked_output_o)
+        all_comp.append(computation_output_o)
+        all_masked_routing_logits.append(masked_routing_logits_o)
+        all_routing_logits.append(routing_logits_o)
         all_spl_inputs.extend([ln1_out] * 3 + [attn_out])
 
         if self.training:
             if captured_spl_inputs is not None:
-                captured_spl_inputs.extend([ln1_out.clone().detach()] * 3 + [attn_out.clone().detach()])
+                captured_spl_inputs.append(ln1_out.clone().detach())
+                captured_spl_inputs.append(ln1_out.clone().detach())
+                captured_spl_inputs.append(ln1_out.clone().detach())
+                captured_spl_inputs.append(attn_out.clone().detach())
 
-            if captured_computation_grads is not None:
-                for comp_out in all_comp:
-                    comp_out.register_hook(lambda grad, comp_out=comp_out: captured_computation_grads.insert(0, grad.clone().detach()))
-        
+            if captured_masked_grad_outputs is not None:
+                all_masked[0].register_hook(lambda grad: captured_masked_grad_outputs.insert(0, grad.clone().detach()))
+                all_masked[1].register_hook(lambda grad: captured_masked_grad_outputs.insert(0, grad.clone().detach()))
+                all_masked[2].register_hook(lambda grad: captured_masked_grad_outputs.insert(0, grad.clone().detach()))
+                all_masked[3].register_hook(lambda grad: captured_masked_grad_outputs.insert(0, grad.clone().detach()))
+
         return x_out, all_masked, all_comp, all_masked_routing_logits, all_spl_inputs, all_routing_logits, present_kv, outgoing_proto_state
 
 
@@ -223,7 +227,7 @@ class ArcTransformer(nn.Module):
         past_key_values: list | None = None,
         return_dict: bool = False,
         captured_spl_inputs: list | None = None,
-        captured_computation_grads: list | None = None,
+        captured_masked_grad_outputs: list | None = None,
     ):
         x = self.embedding(input_ids)
 
@@ -256,7 +260,7 @@ class ArcTransformer(nn.Module):
                 past_key_values[i],
                 incoming_proto_state,
                 captured_spl_inputs=captured_spl_inputs,
-                captured_computation_grads=captured_computation_grads,
+                captured_masked_grad_outputs=captured_masked_grad_outputs,
             )
             presents.append(present_kv)
             all_masked.extend(masked)
