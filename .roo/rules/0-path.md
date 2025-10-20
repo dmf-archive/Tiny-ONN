@@ -15,6 +15,7 @@
 - `huggingface/transformers`
 - `huggingface/accelerate`
 - `bitsandbytes-foundation/bitsandbytes`
+- `jettify/pytorch-optimizer`
 
 ## 其他
 
@@ -27,6 +28,6 @@
 
 以下是重要的参考源代码在工作区内的路径：
 
-- `Qwen3` 模型架构定义： `.venv\Lib\site-packages\transformers\models\qwen3\modeling_qwen3.py`
+- `Qwen3` 模型架构定义： `.venv-win\Lib\site-packages\transformers\models\qwen3\modeling_qwen3.py`
 - `DynMoE`的动态 MoE：`ref\DynMoE\DeepSpeed-0.9.5\deepspeed\moe\sharded_moe.py`
 - `DynMoE`的 SDL ：`ref\DynMoE\DeepSpeed-0.9.5\deepspeed\moe\loss.py`

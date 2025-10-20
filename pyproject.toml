@@ -12,6 +12,7 @@ dependencies = [
   "jupytext>=1.17.3",
   "matplotlib",
   "pillow>=11.3.0",
+  "pytorch-optimizer>=3.8.1",
   "rich>=14.0.0",
   "safetensors>=0.5.3",
   "scikit-learn>=1.7.0",

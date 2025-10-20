@@ -64,6 +64,7 @@ tags: ["process", "agent", "guidelines", "development"]
 - **PAT-301**: **特定版本依赖安装**: 对于需要特定 CUDA 和 PyTorch 版本的依赖，应将 `.whl` 索引添加到 `pyproject.toml` 的 `[[tool.uv.index]]` 部分，然后运行 `uv add`。
 - **PAT-302**: **库修改模式**: 修改上游库时，必须优先采用继承和替换最小组件的“模型手术”模式，而不是覆写庞杂的 `forward` 方法。
 - **REQ-301**: **环境管理**: 必须通过 `uv add` 命令将所有项目依赖项添加到 `pyproject.toml` 文件中。必须通过 `uv remove` 命令安全移除依赖项。非用户批准，禁止使用`uv pip`。
+- **REQ-302**: **`uv` 环境指定**: 在执行任何 `uv` 命令之前，必须通过设置环境变量 `$env:UV_PROJECT_ENVIRONMENT=".venv-win"` 来明确指定要操作的虚拟环境。这是为了防止 `uv` 自动在项目根目录创建新的、不正确的 `.venv` 目录。
 
 ### 工作流与安全
 
