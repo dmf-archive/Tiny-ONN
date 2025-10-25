@@ -1,6 +1,6 @@
 Analyzing training ARC dataset at: data\ARC-AGI-2\data\training
 
-      Token Length Distribution for training
+Token Length Distribution for training
 
 | Metric | Value |
 | :--- | :--- |
@@ -15,7 +15,7 @@ Analyzing training ARC dataset at: data\ARC-AGI-2\data\training
 | 98th percentile | 5588.00 |
 | 99th percentile | 6971.10 |
 
-     Top 15 Most Common Grid Sizes for training
+Top 15 Most Common Grid Sizes for training
 
 | Grid Size (HxW) | Count | Percentage |
 | :--- | :--- | :--- |
@@ -37,7 +37,7 @@ Analyzing training ARC dataset at: data\ARC-AGI-2\data\training
 
 Analyzing evaluation ARC dataset at: data\ARC-AGI-2\data\evaluation
 
-      Token Length Distribution for evaluation
+Token Length Distribution for evaluation
 
 | Metric | Value |
 | :--- | :--- |
@@ -52,7 +52,7 @@ Analyzing evaluation ARC dataset at: data\ARC-AGI-2\data\evaluation
 | 98th percentile | 7267.60 |
 | 99th percentile | 8133.64 |
 
-     Top 15 Most Common Grid Sizes for evaluation
+Top 15 Most Common Grid Sizes for evaluation
      
 | Grid Size (HxW) | Count | Percentage |
 | :--- | :--- | :--- |

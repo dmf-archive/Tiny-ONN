@@ -23,6 +23,7 @@ build/
 weights/
 *.pt
 *.safetensors
+exp/arc_dyntrm/checkpoints/
 
 # --- System & OS ---
 .DS_Store

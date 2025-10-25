@@ -12,6 +12,9 @@
 - `SARS (Surprise-Aware Routing Shaping)`: `SAPS/MSAPS` 的继承者。它将动态路由问题重新定义为一个**分布对齐问题**。参见[Dynamic Function Composition](./DFC-Theory.md)
 - `SPL (Sparse Proto Linear)`: 它将其可学习参数明确解耦为三个功能正交的状态空间：**内部状态 `μ` (`mu_weight`)** - 计算核心；**感知状态 `p` (`proto_weight`)** - 模式匹配器；**行动状态 `g` (`gate_param`)** - 激活门控。SPL 的核心特性是其**双模态学习能力**：它既可以通过**反向传播 (BP)**，利用全局损失信号进行精确、高效的梯度优化（如 SARS）；也可以切换到**前向-前向 (FF)** 模式，通过本地的“好度”函数（如原型匹配度）进行学习。这种等效性源于两者都在优化同一个理论目标——最小化系统的变分自由能（VFE），SARS on BP 是其解析解，而 FF 是其蒙特卡洛近似。
 - `DynSIHA (Dynamic Sparse Infinite-Head Attention)`: 它采用单一的 `SPL` 模块一次性地合成出 `Query`、`Key`、`Value`，将注意力机制从一个固定的信息查询系统，升级为一个端到端可学习的、可编程的动态信息路由与处理系统。"无限专家"指有效神经元的组合空间是无限的，远超传统多头注意力的表达能力。
+- `DynTRM (Dynamic Tiny Recursive Model)`: 基于Universal Transformer架构的动态递归模型，通过全局共享专家库和自适应计算深度实现极致参数效率。采用递归块替代传统堆叠式Transformer，支持基于τ（输出熵）的自适应停止机制。
+- `DynSIHA+ (Dynamic Sparse Infinite-Head Attention Plus)`: DynSIHA的演进版本，保留了 SPL 的 CAPR 机制并移植到更传统的 MHA 动态合成和 MoE 加权路由中。
+- `CAPR (Cross-Attention Prototype Routing)`: 跨注意力原型路由机制，通过对输入和原型进行交叉注意力，实现 `TopAny` 动态激活`Head/Expert`。
 
 ## 动态专家混合 [Legacy]
 
