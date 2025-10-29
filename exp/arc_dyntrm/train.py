@@ -91,14 +91,14 @@ def _calculate_exact_grad_norms_jit(
         
         grad_w1_out = grad_expert_output * silu_derivative
         
-        grad_w1_norm_sq = torch.sum(grad_w1_out**2, dim=-1) * torch.sum(active_inputs**2, dim=-1)
+        grad_w1_norm_sq = torch.sum(grad_w1_out**2, dim=-1)
         
         silu_w1_out = F.silu(w1_out_active)
-        grad_w2_norm_sq = torch.sum(grad_expert_output**2, dim=-1) * torch.sum(silu_w1_out**2, dim=-1)
+        grad_w2_norm_sq = torch.sum(grad_expert_output**2, dim=-1)
         
         # 使用 L-inf 范数计算学习成本，拉开差距
         total_grad_norm_sq = grad_w1_norm_sq + grad_w2_norm_sq
-        mu_grad_norm_active = torch.sqrt(total_grad_norm_sq + 1e-9) # L-inf 范数直接就是幅值本身
+        mu_grad_norm_active = torch.sqrt(total_grad_norm_sq + 1e-9)
         
         mu_grad_norm = torch.zeros_like(logits.view(-1))
         flat_indices = token_indices * P + expert_indices

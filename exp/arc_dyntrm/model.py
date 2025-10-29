@@ -60,64 +60,29 @@ class DynSIHA(nn.Module):
 
         routing_logits_flat = routing_logits.reshape(S, P)
         active_mask = routing_logits_flat > 1e-6
-        token_indices, expert_indices = torch.where(active_mask)
 
-        if token_indices.numel() == 0:
-            synthetic_outputs = torch.zeros_like(x_proj)
-            raw_outputs_for_return = torch.zeros_like(routing_logits)
-            active_inputs = torch.empty((0, D_h), dtype=x_proj.dtype, device=x_proj.device)
-            w1_out_active = torch.empty((0, D_h), dtype=x_proj.dtype, device=x_proj.device)
-            active_token_indices = torch.empty((0,), dtype=token_indices.dtype, device=token_indices.device)
-            active_expert_indices = torch.empty((0,), dtype=expert_indices.dtype, device=expert_indices.device)
-            if self.training and captured_raw_inputs is not None:
-                captured_raw_inputs.append(x_proj.clone().detach())
-            return synthetic_outputs, routing_logits, raw_outputs_for_return, active_inputs, w1_out_active, active_token_indices, active_expert_indices
-
-        active_inputs = x_reshaped[token_indices]
-        active_routing_logits = routing_logits_flat[token_indices, expert_indices]
-
-        sorted_expert_indices, perm_indices = torch.sort(expert_indices)
-        sorted_inputs = active_inputs[perm_indices]
-
-        expert_counts = torch.bincount(sorted_expert_indices, minlength=P)
-        expert_offsets = torch.cumsum(expert_counts, dim=0) - expert_counts
-
-        expert_outputs_sorted = torch.empty_like(sorted_inputs)
-        w1_out_active_sorted = torch.empty_like(sorted_inputs)
+        all_outputs = torch.zeros(S, P, D_h, dtype=x_proj.dtype, device=x_proj.device)
 
         for i in range(P):
-            if expert_counts[i] > 0:
-                start, end = expert_offsets[i], expert_offsets[i] + expert_counts[i]
-                expert_in = sorted_inputs[start:end]
+            expert_mask = active_mask[:, i]
+            if expert_mask.any():
+                expert_in = x_reshaped[expert_mask]
                 expert_out, w1_out = expert_library[i](expert_in)
-                expert_outputs_sorted[start:end] = expert_out
-                w1_out_active_sorted[start:end] = w1_out
+                gated_out = expert_out * routing_logits_flat[expert_mask, i].unsqueeze(-1)
+                all_outputs[expert_mask, i] = gated_out
 
-        gated_outputs_sorted = expert_outputs_sorted * active_routing_logits[perm_indices].unsqueeze(-1)
-
-        inverse_perm_indices = torch.argsort(perm_indices)
-        unpermuted_outputs = gated_outputs_sorted[inverse_perm_indices]
-        unpermuted_w1_out = w1_out_active_sorted[inverse_perm_indices]
-
-        raw_outputs = torch.zeros(S, P, D_h, dtype=x_proj.dtype, device=x_proj.device)
-        
-        flat_indices = token_indices * P + expert_indices
-        index_for_scatter = flat_indices.unsqueeze(-1).expand(-1, D_h)
-        
-        raw_outputs.view(S * P, D_h).scatter_add_(0, index_for_scatter, unpermuted_outputs)
-
-        synthetic_outputs_flat = raw_outputs.sum(dim=1)
+        synthetic_outputs_flat = all_outputs.sum(dim=1)
         synthetic_outputs = synthetic_outputs_flat.view(B, T, H, D_h)
-        
+
         if self.training:
             if captured_raw_inputs is not None:
                 captured_raw_inputs.append(x_proj.clone().detach())
-            if captured_raw_output_grads is not None and raw_outputs.requires_grad:
-                raw_outputs.register_hook(lambda grad: captured_raw_output_grads.append(grad.clone().detach()))
-        
-        raw_outputs_for_return = raw_outputs.norm(dim=-1)
+            if captured_raw_output_grads is not None and all_outputs.requires_grad:
+                all_outputs.register_hook(lambda grad: captured_raw_output_grads.append(grad.clone().detach()))
 
-        return synthetic_outputs, routing_logits, raw_outputs_for_return, active_inputs, unpermuted_w1_out, token_indices, expert_indices
+        raw_outputs_for_return = all_outputs.norm(dim=-1)
+
+        return synthetic_outputs, routing_logits, raw_outputs_for_return, x_reshaped[active_mask.any(dim=1)], all_outputs[active_mask], torch.where(active_mask)[0], torch.where(active_mask)[1]
 
     def forward(self, x: torch.Tensor, expert_library: nn.ModuleList, position_ids: torch.Tensor, captured_raw_inputs: list | None = None, captured_raw_output_grads: list | None = None) -> tuple[torch.Tensor, list, list[torch.Tensor], list[torch.Tensor], list[torch.Tensor], list[torch.Tensor], list[torch.Tensor]]:
         B, T, _ = x.shape

@@ -5,11 +5,11 @@ from dataclasses import dataclass, field
 class ModelConfig:
     vocab_size: int = 16
     hidden_size: int = 512
-    max_refinement_steps: int = 8
+    max_refinement_steps: int = 7
     max_position_embeddings: int = 4096
 
-    physical_num_heads: int = 4
-    latent_attn_expert: int = 32
+    physical_num_heads: int = 8
+    latent_attn_expert: int = 64
 
 @dataclass
 class GenerationConfig:
