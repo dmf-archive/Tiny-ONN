@@ -22,6 +22,7 @@ uv.lock
 build/
 weights/
 *.pt
+*.pth
 *.safetensors
 exp/arc_dyntrm/checkpoints/
 
