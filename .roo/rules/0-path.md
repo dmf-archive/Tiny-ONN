@@ -2,28 +2,20 @@
 
 为了方便快速查找常用依赖库的文档或咨询 Deepwiki，以下是其对应的 GitHub Repository 地址：
 
-## 核心参考
-
 - `pytorch/pytorch`
 - `LINs-lab/DynMoE`
 - `da-fr/arc-prize-2024`
 - `michaelhodel/arc-dsl`
-- `lose4578/CircleRoPE`
-
-## 标准预制件
-
 - `huggingface/transformers`
 - `huggingface/accelerate`
-- `bitsandbytes-foundation/bitsandbytes`
-- `jettify/pytorch-optimizer`
 - `amirgholami/adahessian`
-
-## 其他
-
 - `SamsungSAILMontreal/TinyRecursiveModels`
 - `KellerJordan/Muon`
 - `rusty1s/pytorch_sparse`
 - `huggingface/candle`
+- `bitsandbytes-foundation/bitsandbytes`
+- `jettify/pytorch-optimizer`
+- `lose4578/CircleRoPE`
 
 ## 源代码文件
 
