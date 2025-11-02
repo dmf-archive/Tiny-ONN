@@ -16,3 +16,6 @@
 [submodule "ref/trm"]
 	path = ref/trm
 	url = https://github.com/SamsungSAILMontreal/TinyRecursiveModels.git
+[submodule "ref/adafisher"]
+	path = ref/adafisher
+	url = https://github.com/AtlasAnalyticsLab/AdaFisher.git

@@ -220,8 +220,24 @@ class Observer:
                 protos_2d = pca.fit_transform(protos_expanded.numpy())
                 colors = [color_map.get(s, "black") for s in statuses]
                 ax.scatter(protos_2d[:, 0], protos_2d[:, 1], c=colors, alpha=0.7, s=20)
+                
+                x_min, x_max = protos_2d[:, 0].min(), protos_2d[:, 0].max()
+                y_min, y_max = protos_2d[:, 1].min(), protos_2d[:, 1].max()
+                
+                x_range = x_max - x_min
+                y_range = y_max - y_min
+                
+                max_range = max(x_range, y_range) * 1.1
+                
+                x_center = (x_min + x_max) / 2
+                y_center = (y_min + y_max) / 2
+                
+                ax.set_xlim(x_center - max_range / 2, x_center + max_range / 2)
+                ax.set_ylim(y_center - max_range / 2, y_center + max_range / 2)
+                ax.set_aspect('equal', adjustable='box')
             else:
                 ax.text(0.5, 0.5, "Not enough data for PCA", ha='center', va='center')
+                ax.set_aspect('equal', adjustable='box')
 
             ax.set_title(module_names[i] if i < len(module_names) else f"Module {i}")
             ax.grid(True)

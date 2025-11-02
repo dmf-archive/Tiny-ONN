@@ -16,6 +16,7 @@
 - `huggingface/accelerate`
 - `bitsandbytes-foundation/bitsandbytes`
 - `jettify/pytorch-optimizer`
+- `amirgholami/adahessian`
 
 ## 其他
 

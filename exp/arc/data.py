@@ -187,10 +187,10 @@ class ArcCollator:
         return -torch.sum(probs * torch.log2(probs)).item()
 
     def __call__(self, batch: list[dict[str, Any]]) -> dict[str, Any]:
-        all_input_ids, all_labels, all_coords, all_entropies = [], [], [], []
+        all_input_ids, all_labels, all_entropies = [], [], []
 
         for task_data in batch:
-            input_ids, labels, coords = self.serializer.serialize_task(task_data)
+            input_ids, labels, _ = self.serializer.serialize_task(task_data)
 
             if len(input_ids) > self.max_len:
                 continue
@@ -199,19 +199,16 @@ class ArcCollator:
             all_entropies.append(entropy)
             all_input_ids.append(torch.tensor(input_ids, dtype=torch.long))
             all_labels.append(torch.tensor(labels, dtype=torch.long))
-            all_coords.append(torch.tensor(coords, dtype=torch.long))
 
         if not all_input_ids:
             return {}
 
         padded_input_ids = pad_sequence(all_input_ids, batch_first=True, padding_value=self.tokenizer.pad_token_id)
         padded_labels = pad_sequence(all_labels, batch_first=True, padding_value=-100)
-        padded_coords = pad_sequence(all_coords, batch_first=True, padding_value=-1)
 
         return {
             "input_ids": padded_input_ids,
             "labels": padded_labels,
-            "coords": padded_coords,
             "task_data": batch,
             "sample_entropy": torch.tensor(all_entropies, dtype=torch.float32),
         }

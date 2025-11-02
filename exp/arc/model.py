@@ -4,11 +4,37 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .circle_rope_arc import (
-    apply_arc_rope,
-)
 from .config import ModelConfig
 
+
+@torch.jit.script
+def _rotate_half(x: torch.Tensor) -> torch.Tensor:
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
+
+@torch.jit.script
+def apply_rope(q: torch.Tensor, k: torch.Tensor, position_ids: torch.Tensor, hidden_size: int) -> tuple[torch.Tensor, torch.Tensor]:
+    # Standard 1D RoPE
+    seq_len = position_ids.max() + 1
+    inv_freq = 1.0 / (10000.0 ** (torch.arange(0, hidden_size, 2, device=q.device).float() / hidden_size))
+    t = torch.arange(seq_len, device=q.device).type_as(inv_freq)
+    freqs = torch.einsum("i,j->ij", t, inv_freq)
+    emb = torch.cat((freqs, freqs), dim=-1)
+    
+    cos = emb.cos()[position_ids, :].unsqueeze(0).unsqueeze(0)
+    sin = emb.sin()[position_ids, :].unsqueeze(0).unsqueeze(0)
+
+    q_rot = (q * cos) + (_rotate_half(q) * sin)
+    k_rot = (k * cos) + (_rotate_half(k) * sin)
+    return q_rot, k_rot
+
+
+@torch.jit.script
+def mas_normalize_jit(logits: torch.Tensor) -> torch.Tensor:
+    max_abs_val = torch.max(torch.abs(logits), dim=-1, keepdim=True).values
+    scaled_logits = logits / (max_abs_val + 1e-9)
+    return scaled_logits
 
 
 @torch.jit.script
@@ -94,8 +120,6 @@ class MoIETransformerBlock(nn.Module):
         position_ids: torch.Tensor | None = None,
         past_kv: tuple | None = None,
         incoming_proto_state: dict | None = None,
-        captured_spl_inputs: list | None = None,
-        captured_masked_grad_outputs: list | None = None,
     ) -> tuple:
         outgoing_proto_state = {}
         spl_modules = {
@@ -112,25 +136,36 @@ class MoIETransformerBlock(nn.Module):
                 outgoing_proto_state[name] = module.proto_weight
 
         ln1_out = self.ln1(x)
-        c_q, mv_q, pc_q = self.attn.spl_q(ln1_out, outgoing_proto_state["attn_q"])
-        c_k, mv_k, pc_k = self.attn.spl_k(ln1_out, outgoing_proto_state["attn_k"])
-        c_v, mv_v, pc_v = self.attn.spl_v(ln1_out, outgoing_proto_state["attn_v"])
+        
+        # --- Sequence-Level Routing ---
+        context_vector = ln1_out.mean(dim=1) # (B, D)
+        
+        # We need to compute sequence-level logits for all SPL modules
+        # This requires calling them with the context_vector
+        # Let's compute computation outputs first, as they are per-token
+        c_q, _, _ = self.attn.spl_q(ln1_out, outgoing_proto_state["attn_q"])
+        c_k, _, _ = self.attn.spl_k(ln1_out, outgoing_proto_state["attn_k"])
+        c_v, _, _ = self.attn.spl_v(ln1_out, outgoing_proto_state["attn_v"])
+
+        # Now compute sequence-level routing logits
+        _, mv_q_seq, pc_q_seq = self.attn.spl_q(context_vector, outgoing_proto_state["attn_q"])
+        _, mv_k_seq, pc_k_seq = self.attn.spl_k(context_vector, outgoing_proto_state["attn_k"])
+        _, mv_v_seq, pc_v_seq = self.attn.spl_v(context_vector, outgoing_proto_state["attn_v"])
 
         all_masked, all_comp, all_masked_routing_logits, all_routing_logits, all_spl_inputs = [], [], [], [], []
 
-        comp_qkv, match_qkv, costs_qkv = [c_q, c_k, c_v], [mv_q, mv_k, mv_v], [pc_q, pc_k, pc_v]
+        comp_qkv = [c_q, c_k, c_v]
+        match_qkv_seq = [mv_q_seq, mv_k_seq, mv_v_seq]
+        costs_qkv_seq = [pc_q_seq, pc_k_seq, pc_v_seq]
         q, k, v = torch.zeros_like(c_q), torch.zeros_like(c_k), torch.zeros_like(c_v)
 
         for i in range(3):
-            max_abs_val = torch.max(torch.abs(costs_qkv[i]), dim=-1, keepdim=True).values
-            cost_score = costs_qkv[i] / (max_abs_val + 1e-9)
-            routing_logits = match_qkv[i] - cost_score
-            computation_output = comp_qkv[i]
+            # Sequence-level logits
+            routing_logits_seq = match_qkv_seq[i] + costs_qkv_seq[i] # Shape: (B, D_out)
+            gating_weights_seq = mas_normalize_jit(routing_logits_seq) # Shape: (B, D_out)
 
-            mask_active = (routing_logits > 0).float()
-            masked_routing_logits = F.relu(routing_logits)
-
-            masked_output = computation_output * mask_active
+            # Broadcast gating weights to all tokens
+            masked_output = gating_weights_seq.unsqueeze(1) * comp_qkv[i] # (B, 1, D_out) * (B, T, D_out)
 
             if i == 0:
                 q = masked_output
@@ -138,17 +173,18 @@ class MoIETransformerBlock(nn.Module):
                 k = masked_output
             else:
                 v = masked_output
+
             all_masked.append(masked_output)
-            all_comp.append(computation_output)
-            all_masked_routing_logits.append(masked_routing_logits)
-            all_routing_logits.append(routing_logits)
+            all_comp.append(comp_qkv[i])
+            all_masked_routing_logits.append(gating_weights_seq)
+            all_routing_logits.append(routing_logits_seq)
 
         batch_size, seq_len, _ = q.shape
         num_heads = 1
         head_dim = self.d_model
 
-        if coords_2d is not None and position_ids is not None:
-            q, k = apply_arc_rope(q, k, coords_2d, position_ids, self.d_model)
+        if position_ids is not None:
+            q, k = apply_rope(q, k, position_ids, self.d_model)
 
         q = q.view(batch_size, seq_len, num_heads, head_dim).transpose(1, 2)
         k = k.view(batch_size, seq_len, num_heads, head_dim).transpose(1, 2)
@@ -165,38 +201,24 @@ class MoIETransformerBlock(nn.Module):
         attn_out = F.scaled_dot_product_attention(q, k, v, is_causal=is_causal)
         attn_out = attn_out.transpose(1, 2).contiguous().view(batch_size, seq_len, self.d_model)
 
-        c_o, mv_o, pc_o = self.attn.spl_o(attn_out, outgoing_proto_state["attn_o"])
-        max_abs_val_o = torch.max(torch.abs(pc_o), dim=-1, keepdim=True).values
-        cost_score_o = pc_o / (max_abs_val_o + 1e-9)
-        routing_logits_o = mv_o - cost_score_o
-
-        computation_output_o = c_o
-
-        mask_active_o = (routing_logits_o > 0).float()
-        masked_routing_logits_o = F.relu(routing_logits_o)
-
-        masked_output_o = computation_output_o * mask_active_o
+        # Sequence-level routing for output projection
+        context_attn_out = attn_out.mean(dim=1)
+        c_o, _, _ = self.attn.spl_o(attn_out, outgoing_proto_state["attn_o"])
+        _, mv_o_seq, pc_o_seq = self.attn.spl_o(context_attn_out, outgoing_proto_state["attn_o"])
+        
+        routing_logits_o_seq = mv_o_seq + pc_o_seq
+        gating_weights_o_seq = mas_normalize_jit(routing_logits_o_seq)
+        masked_output_o = gating_weights_o_seq.unsqueeze(1) * c_o
 
         x_out = x + masked_output_o
- 
+
         all_masked.append(masked_output_o)
-        all_comp.append(computation_output_o)
-        all_masked_routing_logits.append(masked_routing_logits_o)
-        all_routing_logits.append(routing_logits_o)
+        all_comp.append(c_o)
+        all_masked_routing_logits.append(gating_weights_o_seq)
+        all_routing_logits.append(routing_logits_o_seq)
+        all_routing_logits.append(routing_logits_o_seq)
         all_spl_inputs.extend([ln1_out] * 3 + [attn_out])
 
-        if self.training:
-            if captured_spl_inputs is not None:
-                captured_spl_inputs.append(ln1_out.clone().detach())
-                captured_spl_inputs.append(ln1_out.clone().detach())
-                captured_spl_inputs.append(ln1_out.clone().detach())
-                captured_spl_inputs.append(attn_out.clone().detach())
-
-            if captured_masked_grad_outputs is not None:
-                all_masked[0].register_hook(lambda grad: captured_masked_grad_outputs.insert(0, grad.clone().detach()))
-                all_masked[1].register_hook(lambda grad: captured_masked_grad_outputs.insert(0, grad.clone().detach()))
-                all_masked[2].register_hook(lambda grad: captured_masked_grad_outputs.insert(0, grad.clone().detach()))
-                all_masked[3].register_hook(lambda grad: captured_masked_grad_outputs.insert(0, grad.clone().detach()))
 
         return x_out, all_masked, all_comp, all_masked_routing_logits, all_spl_inputs, all_routing_logits, present_kv, outgoing_proto_state
 
@@ -226,8 +248,6 @@ class ArcTransformer(nn.Module):
         position_ids: torch.Tensor | None = None,
         past_key_values: list | None = None,
         return_dict: bool = False,
-        captured_spl_inputs: list | None = None,
-        captured_masked_grad_outputs: list | None = None,
     ):
         x = self.embedding(input_ids)
 
@@ -259,8 +279,6 @@ class ArcTransformer(nn.Module):
                 position_ids,
                 past_key_values[i],
                 incoming_proto_state,
-                captured_spl_inputs=captured_spl_inputs,
-                captured_masked_grad_outputs=captured_masked_grad_outputs,
             )
             presents.append(present_kv)
             all_masked.extend(masked)

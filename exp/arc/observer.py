@@ -47,21 +47,8 @@ class Observer:
         )
 
         inefficient_routing_rate = 0.0
-        if masked_routing_logits:
-            all_module_silent_masks = [torch.all(mrl == 0, dim=-1) for mrl in masked_routing_logits]
-            token_is_fully_silent = torch.stack(all_module_silent_masks).all(dim=0)
-            token_is_fully_silent_aligned = token_is_fully_silent[:, :-1]
-
-            input_ids_aligned = input_ids[:, :-1]
-            is_identity_transform = (input_ids_aligned == labels_acc)
-
-            is_computation_needed = ~is_identity_transform & mask
-
-            inefficient_routing_event = token_is_fully_silent_aligned & is_computation_needed
-
-            num_computation_needed = is_computation_needed.sum()
-            if num_computation_needed > 0:
-                inefficient_routing_rate = (inefficient_routing_event.sum() / num_computation_needed).item()
+        # [REMOVED] The logic for inefficient_routing_rate is based on token-level
+        # routing, which is no longer the case. This metric is disabled.
 
         mu_grad_norms = [s.item() for s in signals.get("mu_grad_norms", []) if s.numel() > 0]
         all_surp_norms = mu_grad_norms
@@ -114,6 +101,18 @@ class Observer:
                 metrics["badness_rate"] = (torch.sum(flat_goodness < 0) / total_neurons).item()
                 metrics["shutdown_rate"] = (torch.sum(flat_goodness == 0) / total_neurons).item()
 
+        grad_outputs = signals.get("captured_masked_grad_outputs", [])
+        if grad_outputs:
+            flat_grads = torch.cat([g.detach().float().view(-1) for g in grad_outputs if g.numel() > 0])
+            if flat_grads.numel() > 0:
+                metrics["grad_shutdown_rate"] = (torch.sum(flat_grads == 0) / flat_grads.numel()).item()
+
+        grad_outputs = signals.get("captured_masked_grad_outputs", [])
+        if grad_outputs:
+            flat_grads = torch.cat([g.detach().float().view(-1) for g in grad_outputs if g.numel() > 0])
+            if flat_grads.numel() > 0:
+                metrics["grad_shutdown_rate"] = (torch.sum(flat_grads == 0) / flat_grads.numel()).item()
+
         return metrics
 
     def log_step(
@@ -138,6 +137,7 @@ class Observer:
             f"Act%({metrics.get('activation_rate_l0', 0.0)*100:.1f}/{metrics.get('activation_rate_l_mid', 0.0)*100:.1f}/{metrics.get('activation_rate_ln', 0.0)*100:.1f}/{metrics.get('activation_rate_avg', 0.0)*100:.1f}) | "
             f"Gate({metrics.get('gate_logit_avg', 0.0):.3f}/{metrics.get('gate_logit_sigma', 0.0):.3f}/{metrics.get('gate_logit_max', 0.0):.3f}) | "
             f"GBS%({metrics.get('goodness_rate', 0.0)*100:.1f}/{metrics.get('badness_rate', 0.0)*100:.1f}/{metrics.get('shutdown_rate', 0.0)*100:.1f}) | "
+            f"Grad_SD%: {metrics.get('grad_shutdown_rate', 0.0)*100:.1f} | "
             f"Fail: {metrics.get('inefficient_routing_rate', 0.0)*100:.1f}% | "
             f"Speed: {steps_per_sec:.2f} st/s"
         )

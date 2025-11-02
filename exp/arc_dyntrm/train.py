@@ -44,24 +44,13 @@ def _calculate_exact_grad_norms_jit(
         grad_raw_output = captured_raw_output_grads[i]
         logits = routing_logits[i]
         
-        # grad_raw_output 是 (S, P, D_h)
         S, P, D_h = grad_raw_output.shape
-        # 从 logits 获取 B, T, H
         B, T, H, _ = logits.shape
         S = B * T * H
 
-        # 1. 计算 output_grad_norm (重要性权重) - 使用 L-inf 范数捕捉最显著信号
-        # grad_raw_output 的形状是 (S, P, D_h)
-        # 我们需要将其 reshape 以匹配 (B, T, H, P, D_h)
         grad_raw_output_reshaped = grad_raw_output.view(B, T, H, P, D_h)
-        output_grad_norm = torch.max(torch.abs(grad_raw_output_reshaped), dim=-1).values
+        output_grad_norm = torch.sqrt(torch.sum(grad_raw_output_reshaped**2, dim=-1) + 1e-9)
 
-        # 2. 计算 mu_grad_norm (学习成本)
-        # grad_raw_output 是 dL/dy，其中 y = z * E(x)
-        # 我们需要 dL/dE = dL/dy * z
-        # 然后计算 ||dL/dE||
-        
-        # 重新计算 active_routing_logits, 因为它在 _compose 中没有返回
         routing_logits_flat = logits.reshape(S, P)
         active_mask = routing_logits_flat > 1e-6
         token_indices, expert_indices = torch.where(active_mask)
@@ -73,16 +62,12 @@ def _calculate_exact_grad_norms_jit(
 
         active_routing_logits = routing_logits_flat[token_indices, expert_indices]
         
-        # 从稠密梯度中 gather 出激活位置的梯度
         grad_output_flat = grad_raw_output.view(S * P, D_h)
         flat_indices = token_indices * P + expert_indices
-        # 使用 gather 从 flat 梯度中获取激活的梯度
         grad_output_active = grad_output_flat.gather(0, flat_indices.unsqueeze(-1).expand(-1, D_h))
 
-        # grad_E = grad_y * z
         grad_expert_output = grad_output_active * active_routing_logits.unsqueeze(-1)
 
-        # --- 手工链式法则 ---
         active_inputs = all_active_inputs[i]
         w1_out_active = all_w1_out_active[i]
         
@@ -96,7 +81,6 @@ def _calculate_exact_grad_norms_jit(
         silu_w1_out = F.silu(w1_out_active)
         grad_w2_norm_sq = torch.sum(grad_expert_output**2, dim=-1)
         
-        # 使用 L-inf 范数计算学习成本，拉开差距
         total_grad_norm_sq = grad_w1_norm_sq + grad_w2_norm_sq
         mu_grad_norm_active = torch.sqrt(total_grad_norm_sq + 1e-9)
         
@@ -106,10 +90,9 @@ def _calculate_exact_grad_norms_jit(
         mu_grad_norm = mu_grad_norm.view_as(logits)
         all_mu_grad_norms.append(mu_grad_norm)
 
-        # 3. 归一化和计算 goodness_logits
-        norm_logits = mas_normalize_jit(logits)
-        norm_mu_grad = mas_normalize_jit(mu_grad_norm)
-        norm_output_grad = mas_normalize_jit(output_grad_norm)
+        norm_logits = mas_normalize_jit(logits.detach())
+        norm_mu_grad = mas_normalize_jit(mu_grad_norm.detach())
+        norm_output_grad = mas_normalize_jit(output_grad_norm.detach())
         
         goodness_logits = norm_output_grad * (norm_logits - norm_mu_grad)
         all_goodness_logits.append(goodness_logits)
@@ -138,10 +121,9 @@ class LearningDynamics:
         self.accelerator = accelerator
 
     @staticmethod
-    def _calculate_meta_loss(logits: torch.Tensor) -> torch.Tensor:
-        epsilon = 1e-9
-        dist = F.softmax(logits, dim=-1)
-        log_dist = torch.log(dist + epsilon)
+    def _calculate_meta_loss(goodness_logits: torch.Tensor) -> torch.Tensor:
+        dist = F.softmax(goodness_logits, dim=-1)
+        log_dist = torch.log(dist + 1e-9)
         entropy = -torch.sum(dist * log_dist, dim=-1)
         return entropy.mean()
 

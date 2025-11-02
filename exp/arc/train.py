@@ -3,7 +3,7 @@ import random
 import shutil
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Dict, List, Tuple
 
 import torch
 import torch.nn as nn
@@ -16,9 +16,10 @@ from torch.utils.data import DataLoader
 from .config import TrainConfig
 from .data import ArcCollator, GridDeserializer, GridSerializer, InMemoryArcDataset
 from .evaluation import EvaluationStep
-from .model import ArcTransformer
+from .model import ArcTransformer, SparseProtoLinear
 from .observer import Observer
 from .tokenizer import ArcColorTokenizer
+from .fisher import Compute_H_D, Compute_S_D, update_running_avg, MinMaxNormalization, kron
 
 
 @torch.jit.script
@@ -71,38 +72,6 @@ def mas_normalize_jit(logits: torch.Tensor) -> torch.Tensor:
     scaled_logits = logits / (max_abs_val + 1e-9)
     return scaled_logits
 
-@torch.jit.script
-def _calculate_goodness_jit(
-    masked_outputs: list[torch.Tensor],
-    captured_masked_grad_outputs: list[torch.Tensor],
-    captured_spl_inputs: list[torch.Tensor],
-    routing_logits: list[torch.Tensor],
-) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
-    all_goodness_logits: list[torch.Tensor] = []
-    all_mu_grad_norms: list[torch.Tensor] = []
- 
-    num_modules = len(masked_outputs)
-    for i in range(num_modules):
-        masked_output_grad = captured_masked_grad_outputs[i]
-        spl_input = captured_spl_inputs[i]
-
-        masked_output_grad_abs = torch.abs(masked_output_grad)
-
-        spl_input_norm = torch.norm(spl_input, p=2, dim=-1, keepdim=True)
-        mu_grad_norm = torch.abs(masked_output_grad) * spl_input_norm
-
-        all_mu_grad_norms.append(torch.mean(torch.mean(mu_grad_norm, dim=-1), dim=(0, 1)))
-
-        norm_logits = mas_normalize_jit(routing_logits[i])
-        norm_masked_output_grad = mas_normalize_jit(masked_output_grad_abs)
-        norm_mu_grad = mas_normalize_jit(mu_grad_norm)
-
-        goodness_logits = norm_masked_output_grad * (norm_logits - norm_mu_grad)
-        
-        all_goodness_logits.append(goodness_logits)
-
-    return all_goodness_logits, all_mu_grad_norms
-
 
 class LearningDynamics:
     def __init__(
@@ -113,7 +82,6 @@ class LearningDynamics:
         routing_params_with_names: list[tuple[str, nn.Parameter]],
         optimizer_comp: torch.optim.Optimizer,
         optimizer_route: torch.optim.Optimizer,
-        spl_modules: list[nn.Module],
     ):
         self.config = config
         self.model = model
@@ -122,72 +90,118 @@ class LearningDynamics:
         self.routing_params = [p for _, p in routing_params_with_names]
         self.optimizer_comp = optimizer_comp
         self.optimizer_route = optimizer_route
-        self.spl_modules = spl_modules
 
-    @staticmethod
-    def _calculate_meta_loss(logits: torch.Tensor) -> torch.Tensor:
-        epsilon = 1e-9
-        dist = F.softmax(logits, dim=-1)
-        log_dist = torch.log(dist + epsilon)
-        entropy = -torch.sum(dist * log_dist, dim=-1)
-        return entropy.mean()
+        self.H_D: Dict[nn.Module, torch.Tensor] = {}
+        self.S_D: Dict[nn.Module, torch.Tensor] = {}
+        self.modules: List[nn.Module] = []
+        self.captured_inputs: Dict[nn.Module, torch.Tensor] = {}
+        self.captured_grad_outputs: Dict[nn.Module, torch.Tensor] = {}
+        self.steps = 0
+        self._prepare_model()
+
+    def _save_input(self, module: nn.Module, input: Tuple[torch.Tensor], output: torch.Tensor):
+        if torch.is_grad_enabled():
+            self.captured_inputs[module] = input[0].data.detach()
+
+    def _save_grad_output(self, module: nn.Module, grad_input: Tuple[torch.Tensor], grad_output: Tuple[torch.Tensor]):
+         if torch.is_grad_enabled():
+            self.captured_grad_outputs[module] = grad_output[0].data.detach()
+
+    def _prepare_model(self):
+        for module in self.model.modules():
+            if isinstance(module, SparseProtoLinear):
+                self.modules.append(module)
+                module.register_forward_hook(self._save_input)
+                module.register_full_backward_hook(self._save_grad_output)
+
+    def _update_fisher_diagonals(self):
+        for module in self.modules:
+            if module in self.captured_inputs and module in self.captured_grad_outputs:
+                h = self.captured_inputs[module]
+                s = self.captured_grad_outputs[module]
+                
+                H_D_i = Compute_H_D.linear(h, module)
+                S_D_i = Compute_S_D.linear(s, module)
+
+                if module not in self.H_D:
+                    self.H_D[module] = torch.ones_like(H_D_i)
+                    self.S_D[module] = torch.ones_like(S_D_i)
+
+                update_running_avg(MinMaxNormalization(H_D_i), self.H_D[module], 0.9)
+                update_running_avg(MinMaxNormalization(S_D_i), self.S_D[module], 0.9)
+        
+        self.captured_inputs.clear()
+        self.captured_grad_outputs.clear()
 
     def compute_and_apply_gradients(
         self,
         main_loss: torch.Tensor,
         model_outputs: dict,
         device: torch.device,
-        captured_spl_inputs: list[torch.Tensor],
-        captured_masked_grad_outputs: list[torch.Tensor],
-        masked_outputs: list[torch.Tensor],
     ) -> dict[str, Any]:
+        
         self.optimizer_comp.zero_grad()
         self.optimizer_route.zero_grad()
 
-        main_loss.backward(inputs=self.computation_params, retain_graph=True)
+        # Decoupled learning:
+        # 1. Store main loss gradients for computation params
+        comp_grads = [p.grad.clone() for p in self.computation_params if p.grad is not None]
+        
+        # 2. Zero all gradients before meta-loss backward
+        self.optimizer_comp.zero_grad()
+        self.optimizer_route.zero_grad()
+        
+        # 3. L_meta Calculation
+        # 3a. Entropy Term
+        entropy_losses = []
+        for routing_logits in model_outputs["routing_logits"]:
+            if routing_logits.numel() > 0:
+                probs = F.softmax(routing_logits, dim=-1)
+                log_probs = F.log_softmax(routing_logits, dim=-1)
+                entropy = -(probs * log_probs).sum(dim=-1).mean()
+                entropy_losses.append(entropy)
+        l_entropy = torch.stack(entropy_losses).mean() if entropy_losses else torch.tensor(0.0, device=device)
 
-        all_goodness_logits, all_mu_grad_norms = _calculate_goodness_jit(
-            masked_outputs,
-            captured_masked_grad_outputs,
-            captured_spl_inputs,
-            model_outputs["routing_logits"],
-        )
+        # 3b. Exploration Term
+        explore_losses = []
+        if self.steps % 10 == 0:
+            self._update_fisher_diagonals()
+        
+        for module in self.modules:
+            if module in self.H_D and module in self.S_D:
+                fisher_diag = torch.kron(self.H_D[module], self.S_D[module]) + 1e-8
+                log_det_F = torch.log(fisher_diag).sum()
+                explore_losses.append(-log_det_F)
 
-        meta_losses = []
-        for i in range(len(model_outputs["routing_logits"])):
-            if i < len(all_goodness_logits):
-                prior_logits = model_outputs["routing_logits"][i] + all_goodness_logits[i].detach()
-                meta_losses.append(self._calculate_meta_loss(prior_logits))
-        avg_meta_loss = torch.stack(meta_losses).mean() if meta_losses else torch.tensor(0.0, device=device)
-        total_meta_loss = self.config.w_meta * avg_meta_loss
+        l_explore = torch.stack(explore_losses).mean() if explore_losses else torch.tensor(0.0, device=device)
+        
+        avg_meta_loss = self.config.w_meta * (l_entropy - 0.1 * l_explore)
 
-        if total_meta_loss.requires_grad:
-            total_meta_loss.backward(inputs=self.routing_params)
+        # 4. Backward pass for meta-loss (updates routing params)
+        if avg_meta_loss.requires_grad:
+            avg_meta_loss.backward()
 
-        with torch.no_grad():
-            num_spl_modules = len(self.spl_modules)
-            for i in range(num_spl_modules):
-                spl_module = self.spl_modules[i]
-                goodness = all_goodness_logits[i]
+        # 5. Restore main loss gradients for computation params
+        for p, g in zip([p for p in self.computation_params if p.grad is not None], comp_grads):
+            p.grad = g
 
-                binary_mask = (torch.mean(goodness, dim=(0, 1)) > 0).float()
-
-                if spl_module.mu_weight.grad is not None:
-                    gated_grad_mu = spl_module.mu_weight.grad * binary_mask.unsqueeze(1)
-                    spl_module.mu_weight.grad.copy_(gated_grad_mu)
-
-                if spl_module.mu_bias.grad is not None:
-                    gated_grad_bias = spl_module.mu_bias.grad * binary_mask
-                    spl_module.mu_bias.grad.copy_(gated_grad_bias)
-
+        # 6. Clip and step both optimizers
         torch.nn.utils.clip_grad_value_(self.computation_params, clip_value=1.0)
+        
+        # Manually clip routing param grads if they exist
+        for p in self.routing_params:
+            if p.grad is not None:
+                p.grad.data.clamp_(-1.0, 1.0)
+            
         self.optimizer_comp.step()
         self.optimizer_route.step()
+        
+        self.steps += 1
 
         return {
             "meta_loss": avg_meta_loss,
-            "mu_grad_norms": all_mu_grad_norms,
-            "goodness_logits": all_goodness_logits,
+            "mu_grad_norms": [],
+            "goodness_logits": [],
             "proto_weights": [p.detach() for name, p in self.routing_params_with_names if "proto_weight" in name],
         }
 
@@ -206,8 +220,6 @@ class Trainer:
         self.global_step, self.epoch, self.start_task_idx, self.start_view_idx = 0, 0, 0, 0
         self.total_tasks_processed = 0
         self.curriculum_stage = 1
-        self.captured_spl_inputs: list[torch.Tensor] = []
-        self.captured_masked_grad_outputs: list[torch.Tensor] = []
 
     def _setup_data(self):
         collator = ArcCollator(self.tokenizer, max_len=self.config.model.max_position_embeddings)
@@ -232,16 +244,9 @@ class Trainer:
         computation_params = [p for name, p in self.model.named_parameters() if "proto_weight" not in name and "gate_param" not in name]
         routing_params_with_names = [(name, p) for name, p in self.model.named_parameters() if "proto_weight" in name or "gate_param" in name]
 
-        spl_modules = []
-        for block in self.model.blocks:
-            spl_modules.append(block.attn.spl_q)
-            spl_modules.append(block.attn.spl_k)
-            spl_modules.append(block.attn.spl_v)
-            spl_modules.append(block.attn.spl_o)
-
         self.optimizer_comp = torch.optim.AdamW(computation_params, lr=self.config.lr)
         self.optimizer_route = torch.optim.AdamW([p for _, p in routing_params_with_names], lr=self.config.lr)
-        self.dynamics = LearningDynamics(self.config, self.model, computation_params, routing_params_with_names, self.optimizer_comp, self.optimizer_route, spl_modules)
+        self.dynamics = LearningDynamics(self.config, self.model, computation_params, routing_params_with_names, self.optimizer_comp, self.optimizer_route)
         self.evaluator = EvaluationStep(self.model, self.serializer, GridDeserializer(self.tokenizer), self.observer, self.device, self.train_loader.dataset, self.config)
 
     def _prepare_batch(self, task_data: dict, view_idx: int, max_len: int) -> dict[str, torch.Tensor] | None:
@@ -283,14 +288,13 @@ class Trainer:
         transformed_test = [{"input": augmented_grids_list[ptr], "output": augmented_grids_list[ptr + 1]}]
         augmented_task = {"train": transformed_train, "test": transformed_test}
 
-        ids, labels, coords = self.serializer.serialize_task(augmented_task)
+        ids, labels, _ = self.serializer.serialize_task(augmented_task)
         if len(ids) > max_len:
             return None
 
         return {
             "input_ids": torch.tensor([ids], dtype=torch.long),
             "labels": torch.tensor([labels], dtype=torch.long),
-            "coords": torch.tensor([coords], dtype=torch.long),
             "sample_entropy": torch.tensor([ArcCollator._calculate_sample_entropy(labels)], dtype=torch.float32),
         }
 
@@ -298,17 +302,13 @@ class Trainer:
         start_time = time.time()
         self.model.train()
 
-        self.captured_spl_inputs.clear()
-        self.captured_masked_grad_outputs.clear()
-
         with sdpa_kernel(SDPBackend.EFFICIENT_ATTENTION), torch.autocast(
             device_type=self.config.device, dtype=torch.float32
         ):
             model_outputs = self.model(
                 batch["input_ids"],
+                coords=None,
                 return_dict=True,
-                captured_spl_inputs=self.captured_spl_inputs,
-                captured_masked_grad_outputs=self.captured_masked_grad_outputs,
             )
         main_loss = F.cross_entropy(
             model_outputs["logits"][:, :-1, :].contiguous().view(-1, self.config.model.vocab_size),
@@ -321,7 +321,7 @@ class Trainer:
             return None
 
         signals = self.dynamics.compute_and_apply_gradients(
-            main_loss, model_outputs, self.device, self.captured_spl_inputs, self.captured_masked_grad_outputs, model_outputs["masked_outputs"]
+            main_loss, model_outputs, self.device
         )
         model_outputs.update({"labels": batch["labels"], "sample_entropy": batch["sample_entropy"]})
         metrics = self.observer.calculate_metrics(main_loss, model_outputs, signals, batch["input_ids"], self.model)
