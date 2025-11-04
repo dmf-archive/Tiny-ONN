@@ -42,7 +42,7 @@ class TrainConfig:
     device: str = "cuda"
     seed: int = 42
 
-    eval_interval: int = 10000
+    eval_interval: int = 5000
     log_interval: int = 10
     max_checkpoints: int = 3
 

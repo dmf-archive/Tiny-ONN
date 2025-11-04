@@ -1,5 +1,4 @@
 import torch
-import math
 from torch.optim.optimizer import Optimizer
 
 
@@ -73,20 +72,13 @@ class F3EO(Optimizer):
                     if meta_grad is None:
                         effective_grad = first_grad
                     else:
-                        # PI-based adaptive coupling: λ = PI = exp(-(loss + grad_norm))
-                        # This uses the current PI score as natural coupling strength
-                        pi_score = math.exp(-(closure().item() if closure else 0.0) - self.grad_norm)
-                        lambda_coupling = max(0.1, min(0.9, pi_score))  # Clamp to [0.1, 0.9]
-                        
-                        # Compute overlap term for natural gradient alignment
-                        if torch.dot(first_grad.reshape(-1), first_grad.reshape(-1)) > 1e-8:
-                            overlap_scale = torch.dot(meta_grad.reshape(-1), first_grad.reshape(-1)) / torch.dot(first_grad.reshape(-1), first_grad.reshape(-1))
-                            overlap_term = overlap_scale * first_grad
-                        else:
-                            overlap_term = torch.zeros_like(first_grad)
-                        
-                        # PI-adaptive coupling: maintains consistency while allowing structure optimization
-                        effective_grad = first_grad + lambda_coupling * meta_grad + (1 - lambda_coupling) * overlap_term
+                        if group['orthogonalize']:
+                            first_grad_dot = torch.dot(first_grad.reshape(-1), first_grad.reshape(-1))
+                            if first_grad_dot > 1e-8:
+                                projection_scale = torch.dot(meta_grad.reshape(-1), first_grad.reshape(-1)) / first_grad_dot
+                                meta_grad = meta_grad - projection_scale * first_grad
+
+                        effective_grad = first_grad + meta_grad
 
 
                     state = self.state[p]
