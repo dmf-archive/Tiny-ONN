@@ -4,9 +4,11 @@ from dataclasses import dataclass, field
 @dataclass
 class ModelConfig:
     vocab_size: int = 16
-    hidden_size: int = 504
+    hidden_size: int = 512
+    num_heads: int = 8
     num_layers: int = 6
     max_position_embeddings: int = 4096
+    ffn_scale: int = 2
 
 @dataclass
 class GenerationConfig:
@@ -29,9 +31,10 @@ class TrainConfig:
     generation: GenerationConfig = field(default_factory=GenerationConfig)
 
     lr: float = 1e-3
-
-    w_meta: float = 1.0
-
+    betas: tuple[float, float] = (0.9, 0.999)
+    weight_decay: float = 0.01
+    task_batch_size: int = 2
+    
     num_epochs: int = 20
     num_augmentation_views: int = 4
     max_steps_per_view: int = 10

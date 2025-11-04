@@ -10,36 +10,15 @@ import torch.nn as nn
 import torch.nn.functional as F
 from rich.console import Console
 from safetensors.torch import load_file, save_file
-from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch.utils.data import DataLoader
 
 from .config import TrainConfig
 from .data import ArcCollator, GridDeserializer, GridSerializer, InMemoryArcDataset
 from .evaluation import EvaluationStep
-from .model import ArcTransformer, SparseProtoLinear
+from .model import ArcTransformer
 from .observer import Observer
 from .tokenizer import ArcColorTokenizer
-from .fisher import Compute_H_D, Compute_S_D, update_running_avg, MinMaxNormalization, kron
-
-
-@torch.jit.script
-def _get_task_representation(tensors: list[torch.Tensor]) -> torch.Tensor | None:
-    if not tensors or any(t.ndim != 3 for t in tensors) or tensors[0].shape[0] > 1:
-        return None
-
-    matrix = torch.cat(tensors, dim=2).squeeze(0).float()
-
-    if matrix.numel() == 0:
-        return None
-
-    if matrix.shape[0] < 2:
-        mean_vec = matrix.mean(dim=0)
-        std_vec = torch.zeros_like(mean_vec)
-    else:
-        mean_vec = matrix.mean(dim=0)
-        std_vec = matrix.std(dim=0, unbiased=False)
-
-    return torch.cat([mean_vec, std_vec], dim=0)
+from .F3EO import F3EO
 
 
 @torch.jit.script
@@ -66,146 +45,6 @@ def _augment_and_map_kernel(grids: list[torch.Tensor], transform_idx: int, color
     return transformed_grids
 
 
-@torch.jit.script
-def mas_normalize_jit(logits: torch.Tensor) -> torch.Tensor:
-    max_abs_val = torch.max(torch.abs(logits), dim=-1, keepdim=True).values
-    scaled_logits = logits / (max_abs_val + 1e-9)
-    return scaled_logits
-
-
-class LearningDynamics:
-    def __init__(
-        self,
-        config: TrainConfig,
-        model: nn.Module,
-        computation_params: list,
-        routing_params_with_names: list[tuple[str, nn.Parameter]],
-        optimizer_comp: torch.optim.Optimizer,
-        optimizer_route: torch.optim.Optimizer,
-    ):
-        self.config = config
-        self.model = model
-        self.computation_params = computation_params
-        self.routing_params_with_names = routing_params_with_names
-        self.routing_params = [p for _, p in routing_params_with_names]
-        self.optimizer_comp = optimizer_comp
-        self.optimizer_route = optimizer_route
-
-        self.H_D: Dict[nn.Module, torch.Tensor] = {}
-        self.S_D: Dict[nn.Module, torch.Tensor] = {}
-        self.modules: List[nn.Module] = []
-        self.captured_inputs: Dict[nn.Module, torch.Tensor] = {}
-        self.captured_grad_outputs: Dict[nn.Module, torch.Tensor] = {}
-        self.steps = 0
-        self._prepare_model()
-
-    def _save_input(self, module: nn.Module, input: Tuple[torch.Tensor], output: torch.Tensor):
-        if torch.is_grad_enabled():
-            self.captured_inputs[module] = input[0].data.detach()
-
-    def _save_grad_output(self, module: nn.Module, grad_input: Tuple[torch.Tensor], grad_output: Tuple[torch.Tensor]):
-         if torch.is_grad_enabled():
-            self.captured_grad_outputs[module] = grad_output[0].data.detach()
-
-    def _prepare_model(self):
-        for module in self.model.modules():
-            if isinstance(module, SparseProtoLinear):
-                self.modules.append(module)
-                module.register_forward_hook(self._save_input)
-                module.register_full_backward_hook(self._save_grad_output)
-
-    def _update_fisher_diagonals(self):
-        for module in self.modules:
-            if module in self.captured_inputs and module in self.captured_grad_outputs:
-                h = self.captured_inputs[module]
-                s = self.captured_grad_outputs[module]
-                
-                H_D_i = Compute_H_D.linear(h, module)
-                S_D_i = Compute_S_D.linear(s, module)
-
-                if module not in self.H_D:
-                    self.H_D[module] = torch.ones_like(H_D_i)
-                    self.S_D[module] = torch.ones_like(S_D_i)
-
-                update_running_avg(MinMaxNormalization(H_D_i), self.H_D[module], 0.9)
-                update_running_avg(MinMaxNormalization(S_D_i), self.S_D[module], 0.9)
-        
-        self.captured_inputs.clear()
-        self.captured_grad_outputs.clear()
-
-    def compute_and_apply_gradients(
-        self,
-        main_loss: torch.Tensor,
-        model_outputs: dict,
-        device: torch.device,
-    ) -> dict[str, Any]:
-        
-        self.optimizer_comp.zero_grad()
-        self.optimizer_route.zero_grad()
-
-        # Decoupled learning:
-        # 1. Store main loss gradients for computation params
-        comp_grads = [p.grad.clone() for p in self.computation_params if p.grad is not None]
-        
-        # 2. Zero all gradients before meta-loss backward
-        self.optimizer_comp.zero_grad()
-        self.optimizer_route.zero_grad()
-        
-        # 3. L_meta Calculation
-        # 3a. Entropy Term
-        entropy_losses = []
-        for routing_logits in model_outputs["routing_logits"]:
-            if routing_logits.numel() > 0:
-                probs = F.softmax(routing_logits, dim=-1)
-                log_probs = F.log_softmax(routing_logits, dim=-1)
-                entropy = -(probs * log_probs).sum(dim=-1).mean()
-                entropy_losses.append(entropy)
-        l_entropy = torch.stack(entropy_losses).mean() if entropy_losses else torch.tensor(0.0, device=device)
-
-        # 3b. Exploration Term
-        explore_losses = []
-        if self.steps % 10 == 0:
-            self._update_fisher_diagonals()
-        
-        for module in self.modules:
-            if module in self.H_D and module in self.S_D:
-                fisher_diag = torch.kron(self.H_D[module], self.S_D[module]) + 1e-8
-                log_det_F = torch.log(fisher_diag).sum()
-                explore_losses.append(-log_det_F)
-
-        l_explore = torch.stack(explore_losses).mean() if explore_losses else torch.tensor(0.0, device=device)
-        
-        avg_meta_loss = self.config.w_meta * (l_entropy - 0.1 * l_explore)
-
-        # 4. Backward pass for meta-loss (updates routing params)
-        if avg_meta_loss.requires_grad:
-            avg_meta_loss.backward()
-
-        # 5. Restore main loss gradients for computation params
-        for p, g in zip([p for p in self.computation_params if p.grad is not None], comp_grads):
-            p.grad = g
-
-        # 6. Clip and step both optimizers
-        torch.nn.utils.clip_grad_value_(self.computation_params, clip_value=1.0)
-        
-        # Manually clip routing param grads if they exist
-        for p in self.routing_params:
-            if p.grad is not None:
-                p.grad.data.clamp_(-1.0, 1.0)
-            
-        self.optimizer_comp.step()
-        self.optimizer_route.step()
-        
-        self.steps += 1
-
-        return {
-            "meta_loss": avg_meta_loss,
-            "mu_grad_norms": [],
-            "goodness_logits": [],
-            "proto_weights": [p.detach() for name, p in self.routing_params_with_names if "proto_weight" in name],
-        }
-
-
 class Trainer:
     def __init__(self, config: TrainConfig):
         self.config, self.device = config, torch.device(config.device)
@@ -217,7 +56,7 @@ class Trainer:
         self._setup_model_and_optimizer()
         self.checkpoint_dir = Path(__file__).parent / "checkpoints"
         self.checkpoint_dir.mkdir(exist_ok=True)
-        self.global_step, self.epoch, self.start_task_idx, self.start_view_idx = 0, 0, 0, 0
+        self.global_step, self.epoch, self.start_task_idx = 0, 0, 0
         self.total_tasks_processed = 0
         self.curriculum_stage = 1
 
@@ -241,12 +80,14 @@ class Trainer:
     def _setup_model_and_optimizer(self):
         self.config.model.vocab_size = self.tokenizer.vocab_size
         self.model = ArcTransformer(self.config.model, device=self.device).to(self.device)
-        computation_params = [p for name, p in self.model.named_parameters() if "proto_weight" not in name and "gate_param" not in name]
-        routing_params_with_names = [(name, p) for name, p in self.model.named_parameters() if "proto_weight" in name or "gate_param" in name]
-
-        self.optimizer_comp = torch.optim.AdamW(computation_params, lr=self.config.lr)
-        self.optimizer_route = torch.optim.AdamW([p for _, p in routing_params_with_names], lr=self.config.lr)
-        self.dynamics = LearningDynamics(self.config, self.model, computation_params, routing_params_with_names, self.optimizer_comp, self.optimizer_route)
+        
+        self.optimizer = F3EO(
+            self.model.parameters(),
+            lr=self.config.lr,
+            betas=self.config.betas,
+            weight_decay=self.config.weight_decay,
+            orthogonalize=True
+        )
         self.evaluator = EvaluationStep(self.model, self.serializer, GridDeserializer(self.tokenizer), self.observer, self.device, self.train_loader.dataset, self.config)
 
     def _prepare_batch(self, task_data: dict, view_idx: int, max_len: int) -> dict[str, torch.Tensor] | None:
@@ -293,23 +134,24 @@ class Trainer:
             return None
 
         return {
-            "input_ids": torch.tensor([ids], dtype=torch.long),
-            "labels": torch.tensor([labels], dtype=torch.long),
-            "sample_entropy": torch.tensor([ArcCollator._calculate_sample_entropy(labels)], dtype=torch.float32),
+            "input_ids": torch.tensor(ids, dtype=torch.long),
+            "labels": torch.tensor(labels, dtype=torch.long),
+            "sample_entropy": torch.tensor(ArcCollator._calculate_sample_entropy(labels), dtype=torch.float32),
         }
 
     def _train_step(self, batch: dict, epoch: int, task_idx: int | str, view_idx: int) -> tuple | None:
         start_time = time.time()
         self.model.train()
 
-        with sdpa_kernel(SDPBackend.EFFICIENT_ATTENTION), torch.autocast(
-            device_type=self.config.device, dtype=torch.float32
+        with torch.autocast(
+            device_type=self.config.device, dtype=torch.bfloat16
         ):
             model_outputs = self.model(
                 batch["input_ids"],
                 coords=None,
                 return_dict=True,
             )
+        self.optimizer.zero_grad()
         main_loss = F.cross_entropy(
             model_outputs["logits"][:, :-1, :].contiguous().view(-1, self.config.model.vocab_size),
             batch["labels"][:, 1:].contiguous().view(-1),
@@ -320,14 +162,13 @@ class Trainer:
             self.console.print(f"[bold red]NaN detected in main_loss at step {self.global_step}. Aborting step.[/bold red]")
             return None
 
-        signals = self.dynamics.compute_and_apply_gradients(
-            main_loss, model_outputs, self.device
-        )
+        main_loss.backward(create_graph=True)
+        self.optimizer.step()
+
         model_outputs.update({"labels": batch["labels"], "sample_entropy": batch["sample_entropy"]})
+        signals = {"grad_norm": self.optimizer.grad_norm}
         metrics = self.observer.calculate_metrics(main_loss, model_outputs, signals, batch["input_ids"], self.model)
 
-        signals["masked_routing_logits"] = model_outputs.get("masked_routing_logits")
-        signals["routing_logits"] = model_outputs.get("routing_logits")
         self.observer.maybe_log_and_visualize(
             epoch,
             self.global_step,
@@ -345,7 +186,7 @@ class Trainer:
         )
 
         self.global_step += 1
-        return metrics, model_outputs.get("masked_routing_logits"), model_outputs.get("routing_logits"), signals
+        return metrics, signals
 
 
     def advance_curriculum(self):
@@ -353,46 +194,54 @@ class Trainer:
             self.curriculum_stage = 2
             self.train_loader.dataset.set_stage(2)
             self.console.print("[bold magenta]Curriculum stage advanced to 2. Using full dataset.[/bold magenta]")
-            self.start_task_idx, self.start_view_idx = 0, 0
+            self.start_task_idx = 0
             self.epoch = 0
 
     def _train_epoch(self, epoch: int):
         dataset = self.train_loader.dataset
         num_tasks_in_stage = len(dataset)
         
-        for task_idx, task_data in enumerate(dataset):
-            if task_idx < self.start_task_idx:
+        task_batch_size = self.config.task_batch_size
+        
+        for i in range(self.start_task_idx, num_tasks_in_stage, task_batch_size):
+            task_batch_indices = range(i, min(i + task_batch_size, num_tasks_in_stage))
+            
+            mega_batch_inputs = []
+            mega_batch_labels = []
+            mega_batch_entropies = []
+
+            for task_idx in task_batch_indices:
+                task_data = dataset[task_idx]
+                selected_views = random.sample(range(8), self.config.num_augmentation_views)
+
+                for view_idx in selected_views:
+                    batch_cpu = self._prepare_batch(task_data, view_idx, self.config.model.max_position_embeddings)
+                    if not batch_cpu:
+                        self.console.print(
+                            f"[yellow]Skipping Task {task_idx} View {view_idx} due to excessive length.[/yellow]"
+                        )
+                        continue
+                    
+                    mega_batch_inputs.append(batch_cpu["input_ids"])
+                    mega_batch_labels.append(batch_cpu["labels"])
+                    mega_batch_entropies.append(batch_cpu["sample_entropy"])
+
+            if not mega_batch_inputs:
                 continue
 
-            start_view = self.start_view_idx if task_idx == self.start_task_idx else 0
+            padded_inputs = nn.utils.rnn.pad_sequence(mega_batch_inputs, batch_first=True, padding_value=self.tokenizer.pad_token_id)
+            padded_labels = nn.utils.rnn.pad_sequence(mega_batch_labels, batch_first=True, padding_value=-100)
             
-            all_views = list(range(8))
-            if start_view > 0:
-                selected_views = all_views[start_view:]
-            else:
-                selected_views = random.sample(all_views, self.config.num_augmentation_views)
+            batch = {
+                "input_ids": padded_inputs.to(self.device),
+                "labels": padded_labels.to(self.device),
+                "sample_entropy": torch.stack(mega_batch_entropies).to(self.device),
+            }
 
-            for view_idx in selected_views:
-                self.start_view_idx = view_idx
-                batch_cpu = self._prepare_batch(task_data, view_idx, self.config.model.max_position_embeddings)
-                if not batch_cpu:
-                    self.console.print(
-                        f"[yellow]Skipping Task {task_idx} View {view_idx} due to excessive length.[/yellow]"
-                    )
-                    continue
-
-                batch = {k: v.to(self.device) for k, v in batch_cpu.items() if isinstance(v, torch.Tensor)}
-                for step in range(self.config.max_steps_per_view):
-                    result = self._train_step(batch, epoch, task_idx, view_idx)
-                    if not result:
-                        break
-                    metrics, _, _, _ = result
-                    if metrics["main_loss"] <= 0.05 and metrics["token_acc"] >= 0.999:
-                        self.console.print(f"Task {task_idx} view {view_idx} converged in {step + 1} steps.")
-                        break
-            self.start_view_idx = 0
+            self._train_step(batch, epoch, i, -1)
+            
             torch.cuda.empty_cache()
-            self.total_tasks_processed = task_idx + 1
+            self.total_tasks_processed = i + len(task_batch_indices)
         self.start_task_idx = 0
 
     def train(self):
@@ -411,10 +260,9 @@ class Trainer:
         save_file(self.model.state_dict(), model_path)
 
         trainer_state = {
-            "epoch": self.epoch, "step": self.global_step, "task_idx": task_idx, "view_idx": view_idx,
+            "epoch": self.epoch, "step": self.global_step, "task_idx": self.total_tasks_processed,
             "total_tasks_processed": self.total_tasks_processed,
-            "optimizer_comp_state_dict": self.optimizer_comp.state_dict(),
-            "optimizer_route_state_dict": self.optimizer_route.state_dict(),
+            "optimizer_state_dict": self.optimizer.state_dict(),
         }
         state_path = checkpoint_dir / "trainer_state.pt"
         torch.save(trainer_state, state_path)
@@ -444,18 +292,16 @@ class Trainer:
                     model_state_dict = load_file(model_path, device=str(self.device))
                     self.model.load_state_dict(model_state_dict)
                     state = torch.load(state_path, map_location=self.device)
-                    self.optimizer_comp.load_state_dict(state["optimizer_comp_state_dict"])
-                    self.optimizer_route.load_state_dict(state["optimizer_route_state_dict"])
-                    self.global_step, self.epoch, self.start_task_idx, self.start_view_idx = (state["step"], state["epoch"], state["task_idx"], state["view_idx"])
-                    self.total_tasks_processed = state["total_tasks_processed"]
+                    self.optimizer.load_state_dict(state["optimizer_state_dict"])
+                    self.global_step, self.epoch, self.start_task_idx = (state["step"], state["epoch"], state["task_idx"])
+                    self.total_tasks_processed = state.get("total_tasks_processed", self.start_task_idx)
 
                 elif path.is_file():
                     ckpt = torch.load(path, map_location=self.device)
-                    self.model.load_state_dict({k.replace(".sbl", ".spl"): v for k, v in ckpt["model_state_dict"].items()})
-                    self.optimizer_comp.load_state_dict(ckpt["optimizer_comp_state_dict"])
-                    self.optimizer_route.load_state_dict(ckpt["optimizer_route_state_dict"])
-                    self.global_step, self.epoch, self.start_task_idx, self.start_view_idx = (ckpt["step"], ckpt["epoch"], ckpt["task_idx"], ckpt["view_idx"])
-                    self.total_tasks_processed = ckpt["total_tasks_processed"]
+                    self.model.load_state_dict(ckpt["model_state_dict"])
+                    self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+                    self.global_step, self.epoch, self.start_task_idx = (ckpt["step"], ckpt["epoch"], ckpt["task_idx"])
+                    self.total_tasks_processed = ckpt.get("total_tasks_processed", self.start_task_idx)
 
                 self.console.print(f"[bold green]Loaded checkpoint from {path} at step {self.global_step}.[/bold green]")
                 return

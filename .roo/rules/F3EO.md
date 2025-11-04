@@ -99,7 +99,7 @@ optimizer.step()
 1. **性能梯度 (Accuracy Gradient)**: `g = -∇L`，它指向最快降低当前任务损失的方向。
 2. **结构梯度 (Complexity Gradient)**: `g_meta_ortho`，即 `H·g` 在与 `g` 正交的子空间上的投影。它代表了在**不干扰**当前性能提升的前提下，能够最大化模型结构优化的方向。
 
-`g_meta_ortho = (H·g) - proj_g(H·g)好的 = (H·g) - ( (H·g)·g / ‖g‖² ) · g`
+`g_meta_ortho = (H·g) - proj_g(H·g) = (H·g) - ( (H·g)·g / ‖g‖² ) · g`
 
 最终的更新规则是这两个正交向量的简单相加：
 `Δθ = g + g_meta_ortho`
