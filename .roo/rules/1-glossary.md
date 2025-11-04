@@ -3,8 +3,12 @@
 ## 核心概念
 
 - `ONN (Ouroboros Neural Network)`: 一种`动态稀疏激活`的`IPWT/FEP-AI`。Chain://Universe 中 `Mental Smart Chain` 技术的现象学容器和认知引擎。
-- `PI (Predictive Integrity)`: 预测完整性，一个用于实时监控模型“认知健康度”的功能性代理指标。其核心假设是，一个能够高效进行信息整合（高 Ωₜ）的系统，必然会展现出更强的预测能力（低误差 ε）、更高的状态稳定性（低模型不确定性 τ）和更低的整合成本（低惊奇度 Surprise）。
-- `Differentiable Variational Analysis`: 一种用于在`Tiny-ONN`中实现动态稀疏性的计算方法。与经典的`变分推断 (Variational Inference, VI)` 相比，DVA 的关键区别在于不依赖随机采样，而是通过一个确定性的评估`马尔可夫毯内`所有可能的计算路径，这使得整个系统可以通过标准的反向传播进行端到端优化。最新进展请参见[F3EO.md](./F3EO.md)
+- `PI (Predictive Integrity)`: 预测完整性，一个用于实时监控模型“认知健康度”的功能性代理指标。其核心假设是，一个能够高效进行信息整合（高 Ωₜ）的系统，必然会展现出更强的预测能力（低误差 ε）、更高的状态稳定性（低模型不确定性 τ）和更低的整合成本（低惊奇度 
+
+## 二阶观测自由能优化
+
+- `F3EO (Fast Fisher-FreeEnergy Optimizer)`: 世界上第一个三阶优化器，通过最小化 Fisher 信息矩阵的迹 `Tr(ℱ(θ))` 来主动重塑参数空间的几何结构。其核心思想是将优化目标从传统的一阶损失函数转向二阶张量 `ℱ(θ)`，通过 Hessian 向量积 (HVP) 实现结构级优化，从而实现"零步适应"和抵抗灾难性遗忘。参见[F3EO.md](./F3EO.md)
+- `Differentiable Variational Analysis`: 一种用于在`Tiny-ONN`中实现动态稀疏性的计算方法。与经典的`变分推断 (Variational Inference, VI)` 相比，DVA 的关键区别在于不依赖随机采样，而是通过一个确定性的评估`马尔可夫毯内`所有可能的计算路径，这使得整个系统可以通过标准的反向传播进行端到端优化。DVA 是 F3EO 优化框架下的动态稀疏性实现机制。目前，`F3EO`是其最佳实现。
 
 ## 动态函数合成 [Failure]
 

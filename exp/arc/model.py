@@ -1,8 +1,8 @@
-import math
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 from .config import ModelConfig
 
@@ -20,7 +20,7 @@ def apply_rope(q: torch.Tensor, k: torch.Tensor, position_ids: torch.Tensor, hid
     t = torch.arange(seq_len, device=q.device).type_as(inv_freq)
     freqs = torch.einsum("i,j->ij", t, inv_freq)
     emb = torch.cat((freqs, freqs), dim=-1)
-    
+
     cos = emb.cos()[position_ids, :].unsqueeze(2)
     sin = emb.sin()[position_ids, :].unsqueeze(2)
 
@@ -63,13 +63,15 @@ class Attention(nn.Module):
             past_k, past_v = past_kv
             k = torch.cat([past_k, k], dim=-2)
             v = torch.cat([past_v, v], dim=-2)
-        
+
         present_kv = (k, v)
-        
+
         is_causal = past_kv is None
-        attn_output = F.scaled_dot_product_attention(q, k, v, is_causal=is_causal)
+        import torch.nn.attention as attention
+        with attention.sdpa_kernel(attention.SDPBackend.MATH):
+            attn_output = F.scaled_dot_product_attention(q, k, v, is_causal=is_causal)
         attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, self.hidden_size)
-        
+
         return self.o_proj(attn_output), present_kv
 
 class MLP(nn.Module):
@@ -85,20 +87,23 @@ class MLP(nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, config: ModelConfig, dtype: torch.dtype = torch.float32):
+    def __init__(self, config: ModelConfig, dtype: torch.dtype = torch.float32, use_checkpoint: bool = False):
         super().__init__()
-        self.input_layernorm = nn.LayerNorm(config.hidden_size, eps=1e-5)
-        self.post_attention_layernorm = nn.LayerNorm(config.hidden_size, eps=1e-5)
+        self.input_layernorm = nn.LayerNorm(config.hidden_size, eps=1e-5, dtype=dtype)
+        self.post_attention_layernorm = nn.LayerNorm(config.hidden_size, eps=1e-5, dtype=dtype)
         self.attention = Attention(config, dtype=dtype)
         self.mlp = MLP(config, dtype=dtype)
+        self.use_checkpoint = use_checkpoint
 
-    def forward(
+    def _forward_impl(
         self,
         x: torch.Tensor,
         position_ids: torch.Tensor,
         past_kv: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
-        
+
+        position_ids = position_ids.long()
+
         residual = x
         x_norm = self.input_layernorm(x)
         attn_output, present_kv = self.attention(x_norm, position_ids, past_kv)
@@ -111,6 +116,23 @@ class TransformerBlock(nn.Module):
 
         return x, present_kv
 
+    def forward(
+        self,
+        x: torch.Tensor,
+        position_ids: torch.Tensor,
+        past_kv: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+
+        if self.use_checkpoint and self.training:
+            return checkpoint(
+                self._forward_impl,
+                x, position_ids, past_kv,
+                use_reentrant=False,
+                preserve_rng_state=False
+            )
+        else:
+            return self._forward_impl(x, position_ids, past_kv)
+
 
 class ArcEmbedding(nn.Module):
     def __init__(self, config: ModelConfig, dtype: torch.dtype = torch.float32):
@@ -119,6 +141,8 @@ class ArcEmbedding(nn.Module):
         self.color_embedding = nn.Embedding(config.vocab_size, self.hidden_size, dtype=dtype)
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        if input_ids.dtype not in [torch.long, torch.int32, torch.int64]:
+            input_ids = input_ids.long()
         return self.color_embedding(input_ids)
 
 class ArcTransformer(nn.Module):
@@ -127,9 +151,12 @@ class ArcTransformer(nn.Module):
         self.config, self.device = config, device
         dtype = torch.float32
         self.embedding = ArcEmbedding(config, dtype=dtype)
-        self.blocks = nn.ModuleList([TransformerBlock(config, dtype=dtype) for _ in range(config.num_layers)])
-        self.norm = nn.LayerNorm(config.hidden_size, eps=1e-5)
+        self.blocks = nn.ModuleList([TransformerBlock(config, dtype=dtype, use_checkpoint=config.use_checkpoint) for _ in range(config.num_layers)])
+        self.norm = nn.LayerNorm(config.hidden_size, eps=1e-5, dtype=dtype)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False, dtype=dtype)
+
+        self.to(device)
+        torch.cuda.empty_cache()
 
     def forward(
         self,
@@ -144,8 +171,10 @@ class ArcTransformer(nn.Module):
         if position_ids is None:
             past_seen_tokens = past_key_values[0][0].shape[2] if past_key_values is not None else 0
             position_ids = torch.arange(
-                past_seen_tokens, past_seen_tokens + x.shape[1], device=x.device
+                past_seen_tokens, past_seen_tokens + x.shape[1], device=x.device, dtype=torch.long
             ).unsqueeze(0)
+        else:
+            position_ids = position_ids.long()
 
         presents = []
         past_key_values = past_key_values if past_key_values is not None else [None] * len(self.blocks)

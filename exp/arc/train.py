@@ -3,7 +3,6 @@ import random
 import shutil
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
 
 import torch
 import torch.nn as nn
@@ -15,10 +14,10 @@ from torch.utils.data import DataLoader
 from .config import TrainConfig
 from .data import ArcCollator, GridDeserializer, GridSerializer, InMemoryArcDataset
 from .evaluation import EvaluationStep
+from .F3EO import F3EO
 from .model import ArcTransformer
 from .observer import Observer
 from .tokenizer import ArcColorTokenizer
-from .F3EO import F3EO
 
 
 @torch.jit.script
@@ -58,7 +57,26 @@ class Trainer:
         self.checkpoint_dir.mkdir(exist_ok=True)
         self.global_step, self.epoch, self.start_task_idx = 0, 0, 0
         self.total_tasks_processed = 0
-        self.curriculum_stage = 1
+
+        # 内存监控阈值（9GB）
+        self.memory_threshold_gb = 9.0
+        self.memory_threshold_bytes = self.memory_threshold_gb * 1024 * 1024 * 1024
+        
+        self.consecutive_high_pi_steps = 0
+        self.early_stop_triggered = False
+
+    def _check_memory_usage(self) -> bool:
+        if torch.cuda.is_available():
+            allocated = torch.cuda.memory_allocated()
+            reserved = torch.cuda.memory_reserved()
+
+            if allocated > self.memory_threshold_bytes:
+                self.console.print(
+                    f"[bold red]Memory usage exceeded threshold: {allocated / 1024**3:.2f}GB > {self.memory_threshold_gb}GB. "
+                    f"Reserved: {reserved / 1024**3:.2f}GB[/bold red]"
+                )
+                return False
+        return True
 
     def _setup_data(self):
         collator = ArcCollator(self.tokenizer, max_len=self.config.model.max_position_embeddings)
@@ -66,7 +84,6 @@ class Trainer:
             data_path=self.config.data.data_path,
             tokenizer=self.tokenizer,
             split="training",
-            warmup_ratio=self.config.data.warmup_dataset_ratio,
         )
         self.train_loader = DataLoader(
             train_dataset,
@@ -80,7 +97,7 @@ class Trainer:
     def _setup_model_and_optimizer(self):
         self.config.model.vocab_size = self.tokenizer.vocab_size
         self.model = ArcTransformer(self.config.model, device=self.device).to(self.device)
-        
+
         self.optimizer = F3EO(
             self.model.parameters(),
             lr=self.config.lr,
@@ -139,22 +156,23 @@ class Trainer:
             "sample_entropy": torch.tensor(ArcCollator._calculate_sample_entropy(labels), dtype=torch.float32),
         }
 
-    def _train_step(self, batch: dict, epoch: int, task_idx: int | str, view_idx: int) -> tuple | None:
+    def _train_step(self, batch: dict, epoch: int, task_idx: int | str) -> tuple | None:
         start_time = time.time()
         self.model.train()
 
-        with torch.autocast(
-            device_type=self.config.device, dtype=torch.bfloat16
-        ):
-            model_outputs = self.model(
-                batch["input_ids"],
-                coords=None,
-                return_dict=True,
-            )
+
+        model_outputs = self.model(
+            batch["input_ids"],
+            coords=None,
+            return_dict=True,
+        )
         self.optimizer.zero_grad()
+        logits_fp32 = model_outputs["logits"][:, :-1, :].contiguous().view(-1, self.config.model.vocab_size)
+        labels_long = batch["labels"][:, 1:].contiguous().view(-1)
+
         main_loss = F.cross_entropy(
-            model_outputs["logits"][:, :-1, :].contiguous().view(-1, self.config.model.vocab_size),
-            batch["labels"][:, 1:].contiguous().view(-1),
+            logits_fp32,
+            labels_long,
             ignore_index=-100,
         )
 
@@ -173,7 +191,6 @@ class Trainer:
             epoch,
             self.global_step,
             task_idx if isinstance(task_idx, int) else -1,
-            view_idx,
             metrics,
             time.time() - start_time,
             signals,
@@ -181,78 +198,118 @@ class Trainer:
             self.eval_loader,
             self.total_tasks_processed,
             self._save_checkpoint,
-            self.advance_curriculum,
-            self.curriculum_stage,
+            lambda: None,  # 空的课程推进函数
+            1,  # 固定的课程阶段
         )
 
         self.global_step += 1
+        
+        if metrics.get('pi', 0.0) >= self.config.pi_early_stop_threshold:
+            self.console.print(f"[bold green]Task PI={metrics['pi']:.3f} >= {self.config.pi_early_stop_threshold}, skipping remaining views[/bold green]")
+            return None, signals
+            
         return metrics, signals
 
 
-    def advance_curriculum(self):
-        if self.curriculum_stage == 1:
-            self.curriculum_stage = 2
-            self.train_loader.dataset.set_stage(2)
-            self.console.print("[bold magenta]Curriculum stage advanced to 2. Using full dataset.[/bold magenta]")
-            self.start_task_idx = 0
-            self.epoch = 0
 
     def _train_epoch(self, epoch: int):
         dataset = self.train_loader.dataset
         num_tasks_in_stage = len(dataset)
-        
-        task_batch_size = self.config.task_batch_size
-        
-        for i in range(self.start_task_idx, num_tasks_in_stage, task_batch_size):
-            task_batch_indices = range(i, min(i + task_batch_size, num_tasks_in_stage))
-            
-            mega_batch_inputs = []
-            mega_batch_labels = []
-            mega_batch_entropies = []
 
-            for task_idx in task_batch_indices:
-                task_data = dataset[task_idx]
-                selected_views = random.sample(range(8), self.config.num_augmentation_views)
+        for task_idx in range(self.start_task_idx, num_tasks_in_stage):
+            if self.early_stop_triggered:
+                self.console.print(f"[bold green]Task loop early stopped at task {task_idx} due to global PI threshold[/bold green]")
+                break
+            task_data = dataset[task_idx]
+            selected_views = random.sample(range(8), self.config.num_augmentation_views)
 
-                for view_idx in selected_views:
-                    batch_cpu = self._prepare_batch(task_data, view_idx, self.config.model.max_position_embeddings)
-                    if not batch_cpu:
-                        self.console.print(
-                            f"[yellow]Skipping Task {task_idx} View {view_idx} due to excessive length.[/yellow]"
-                        )
-                        continue
-                    
-                    mega_batch_inputs.append(batch_cpu["input_ids"])
-                    mega_batch_labels.append(batch_cpu["labels"])
-                    mega_batch_entropies.append(batch_cpu["sample_entropy"])
+            # 按view级别进行batch构建，不再累积整个任务的所有view
+            max_tokens_per_batch = self.config.data.max_tokens_per_batch
+            current_batch_tasks = []
+            current_batch_task_indices = []  # 只用于跟踪训练进度
+            current_total_tokens = 0
 
-            if not mega_batch_inputs:
-                continue
+            for view_idx in selected_views:
+                batch_cpu = self._prepare_batch(task_data, view_idx, self.config.model.max_position_embeddings)
+                if not batch_cpu:
+                    continue
 
-            padded_inputs = nn.utils.rnn.pad_sequence(mega_batch_inputs, batch_first=True, padding_value=self.tokenizer.pad_token_id)
-            padded_labels = nn.utils.rnn.pad_sequence(mega_batch_labels, batch_first=True, padding_value=-100)
-            
-            batch = {
-                "input_ids": padded_inputs.to(self.device),
-                "labels": padded_labels.to(self.device),
-                "sample_entropy": torch.stack(mega_batch_entropies).to(self.device),
-            }
+                task_tokens = len(batch_cpu["input_ids"])
 
-            self._train_step(batch, epoch, i, -1)
-            
-            torch.cuda.empty_cache()
-            self.total_tasks_processed = i + len(task_batch_indices)
+                # 检查当前view是否能加入当前batch
+                if current_total_tokens + task_tokens > max_tokens_per_batch and current_batch_tasks:
+                    # 处理当前batch，然后重新开始
+                    self._process_dynamic_batch(current_batch_tasks, current_batch_task_indices, epoch)
+                    current_batch_tasks = []
+                    current_batch_task_indices = []
+                    current_total_tokens = 0
+
+                current_batch_tasks.append(batch_cpu)
+                current_batch_task_indices.append(task_idx)
+                current_total_tokens += task_tokens
+
+            # 处理该任务剩余的view
+            if current_batch_tasks:
+                self._process_dynamic_batch(current_batch_tasks, current_batch_task_indices, epoch)
+
         self.start_task_idx = 0
+
+    def _process_dynamic_batch(self, batch_tasks: list, batch_task_indices: list, epoch: int):
+        """处理动态batch的训练"""
+        if not batch_tasks:
+            return
+
+        # 填充序列
+        mega_batch_inputs = [task["input_ids"] for task in batch_tasks]
+        mega_batch_labels = [task["labels"] for task in batch_tasks]
+        mega_batch_entropies = [task["sample_entropy"] for task in batch_tasks]
+
+        padded_inputs = nn.utils.rnn.pad_sequence(mega_batch_inputs, batch_first=True, padding_value=self.tokenizer.pad_token_id)
+        padded_labels = nn.utils.rnn.pad_sequence(mega_batch_labels, batch_first=True, padding_value=-100)
+
+        # 纯fp32模式
+        batch = {
+            "input_ids": padded_inputs.to(self.device, dtype=torch.long),
+            "labels": padded_labels.to(self.device, dtype=torch.long),
+            "sample_entropy": torch.stack(mega_batch_entropies).to(self.device, dtype=torch.float32),
+        }
+
+        # 使用第一个任务索引作为标识
+        first_task_idx = batch_task_indices[0] if batch_task_indices else 0
+
+        # 内存检查
+        if not self._check_memory_usage():
+            self.console.print("[bold red]Training aborted due to memory constraints.[/bold red]")
+            return
+
+        result = self._train_step(batch, epoch, first_task_idx)
+        torch.cuda.empty_cache()
+        
+        if result is not None:
+            metrics, _ = result
+            if metrics and metrics.get('pi', 0.0) >= self.config.pi_early_stop_threshold:
+                self.consecutive_high_pi_steps += 1
+                if self.consecutive_high_pi_steps >= self.config.global_early_stop_steps:
+                    self.console.print(f"[bold green]Global early stop triggered: {self.consecutive_high_pi_steps} consecutive steps with PI >= {self.config.pi_early_stop_threshold}[/bold green]")
+                    self.early_stop_triggered = True
+                    return
+            else:
+                self.consecutive_high_pi_steps = 0
+        
+        self.total_tasks_processed += len(set(batch_task_indices))  
 
     def train(self):
         self._load_checkpoint()
         self.console.print("[bold green]Starting Training...[/bold green]")
         for epoch in range(self.epoch, self.config.num_epochs):
+            if self.early_stop_triggered:
+                self.console.print(f"[bold green]Training early stopped at epoch {epoch} due to PI threshold[/bold green]")
+                break
             self.epoch = epoch
             self._train_epoch(epoch)
         self.console.print("[bold green]Training Finished.[/bold green]")
 
-    def _save_checkpoint(self, task_idx: int, view_idx: int):
+    def _save_checkpoint(self, task_idx: int):
         checkpoint_dir = self.checkpoint_dir / f"checkpoint_{self.global_step}"
         checkpoint_dir.mkdir(exist_ok=True)
 
@@ -260,7 +317,9 @@ class Trainer:
         save_file(self.model.state_dict(), model_path)
 
         trainer_state = {
-            "epoch": self.epoch, "step": self.global_step, "task_idx": self.total_tasks_processed,
+            "epoch": self.epoch,
+            "step": self.global_step,
+            "task_idx": self.total_tasks_processed,
             "total_tasks_processed": self.total_tasks_processed,
             "optimizer_state_dict": self.optimizer.state_dict(),
         }
@@ -274,6 +333,18 @@ class Trainer:
                 shutil.rmtree(oldest_ckpt)
             else:
                 os.remove(oldest_ckpt)
+
+    def _convert_state_dict_to_bf16(self, state_dict: dict) -> dict:
+        """将检查点中的fp32权重自动转换为bf16"""
+        converted_dict = {}
+        for key, tensor in state_dict.items():
+            if isinstance(tensor, torch.Tensor) and tensor.dtype == torch.float32:
+                # 将fp32权重转换为bf16
+                converted_dict[key] = tensor.to(torch.bfloat16)
+                self.console.print(f"[yellow]Converted {key} from fp32 to bf16[/yellow]")
+            else:
+                converted_dict[key] = tensor
+        return converted_dict
 
     def _load_checkpoint(self):
         ckpts = sorted(self.checkpoint_dir.glob("checkpoint_*"), key=os.path.getmtime, reverse=True)
@@ -290,18 +361,35 @@ class Trainer:
                         continue
 
                     model_state_dict = load_file(model_path, device=str(self.device))
+
                     self.model.load_state_dict(model_state_dict)
                     state = torch.load(state_path, map_location=self.device)
                     self.optimizer.load_state_dict(state["optimizer_state_dict"])
-                    self.global_step, self.epoch, self.start_task_idx = (state["step"], state["epoch"], state["task_idx"])
-                    self.total_tasks_processed = state.get("total_tasks_processed", self.start_task_idx)
+                    self.global_step, self.epoch, self.start_task_idx = (
+                        state["step"],
+                        state["epoch"],
+                        state["task_idx"],
+                    )
+                    self.total_tasks_processed = state.get(
+                        "total_tasks_processed", self.start_task_idx
+                    )
 
                 elif path.is_file():
                     ckpt = torch.load(path, map_location=self.device)
+                    # 自动类型转换：fp32 -> bf16
+                    model_state_dict = self._convert_state_dict_to_bf16(ckpt["model_state_dict"])
+                    ckpt["model_state_dict"] = model_state_dict
+
                     self.model.load_state_dict(ckpt["model_state_dict"])
                     self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-                    self.global_step, self.epoch, self.start_task_idx = (ckpt["step"], ckpt["epoch"], ckpt["task_idx"])
-                    self.total_tasks_processed = ckpt.get("total_tasks_processed", self.start_task_idx)
+                    self.global_step, self.epoch, self.start_task_idx = (
+                        ckpt["step"],
+                        ckpt["epoch"],
+                        ckpt["task_idx"],
+                    )
+                    self.total_tasks_processed = ckpt.get(
+                        "total_tasks_processed", self.start_task_idx
+                    )
 
                 self.console.print(f"[bold green]Loaded checkpoint from {path} at step {self.global_step}.[/bold green]")
                 return

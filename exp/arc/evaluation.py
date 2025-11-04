@@ -6,7 +6,6 @@ from typing import Any
 import numpy as np
 import torch
 from rich.progress import Progress
-from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch.utils.data import DataLoader, Subset
 
 from .config import GenerationConfig, TrainConfig
@@ -28,7 +27,12 @@ class ArcGenerator:
 
     @torch.no_grad()
     def generate(self, task_data: dict[str, Any]) -> tuple[torch.Tensor, list[int], list[float]]:
-        output_grid = task_data["test"][0].get("output", [])
+        test_data = task_data.get("test", [])
+        if test_data and len(test_data) > 0:
+            output_grid = test_data[0].get("output", [])
+        else:
+            output_grid = []
+        
         num_rows = len(output_grid)
         num_pixels = sum(len(row) for row in output_grid)
         max_new_tokens = num_pixels + num_rows + 2
@@ -51,10 +55,8 @@ class ArcGenerator:
         past_key_values = None
         position_ids = None
         probabilities = []
-        
-        current_r, current_c = 0, -1
 
-        with sdpa_kernel(SDPBackend.EFFICIENT_ATTENTION), torch.autocast(
+        with torch.autocast(
             device_type=self.device.type, dtype=torch.float16
         ):
             for i in range(max_new_tokens):
@@ -89,14 +91,14 @@ class ArcGenerator:
         pos = input_ids.shape[1]
         position_ids = torch.arange(pos, device=self.device).unsqueeze(0)
 
-        with sdpa_kernel(SDPBackend.EFFICIENT_ATTENTION), torch.autocast(
+        with torch.autocast(
             device_type=self.device.type, dtype=torch.float16
         ):
             outputs = self.model(input_ids, coords=None, position_ids=position_ids, return_dict=True)
             logits, cache = outputs["logits"], [outputs["past_key_values"]]
 
         logits_sliced = logits[0, pos - 1 :]
-        
+
         result = self._explore(
             logits_sliced, [], max_new_tokens, -np.log(self.config.min_prob), pos, cache, position_ids, 0, -1
         )
@@ -111,24 +113,13 @@ class ArcGenerator:
             softmax[0], softmax[path[0]], path = softmax[path[0]], softmax[0], path[1:]
 
         return_suffixes = []
-        
+
         for i, s in softmax:
             next_score = score + s.item()
             if next_score < max_score:
                 if i == self.eos_token_id:
                     suffixes = [([], next_score)]
                 elif max_new_tokens > 1:
-                    new_r, new_c = current_r, current_c
-                    if self.serializer.tokenizer.token_id_to_color(i) is not None:
-                        new_c += 1
-                        next_coord_tuple = (new_r, new_c)
-                    elif i == self.serializer.tokenizer.row_sep_token_id:
-                        new_r += 1
-                        new_c = -1
-                        next_coord_tuple = (-1, -1)
-                    else:
-                        next_coord_tuple = (-1, -1)
-                    
                     next_position_ids = torch.tensor([[position_ids[0, -1] + 1]], device=self.device)
 
                     if remaining_logits is None:
@@ -136,7 +127,7 @@ class ArcGenerator:
                             cache[0] = tuple(tuple(c[:, :, :pos] for c in l) for l in cache[0])
 
                         next_token_tensor = torch.tensor([[i]], device=self.device)
-                        
+
                         outputs = self.model(
                             next_token_tensor, coords=None, position_ids=next_position_ids, past_key_values=cache[0], return_dict=True
                         )
@@ -145,7 +136,7 @@ class ArcGenerator:
                     else:
                         new_logits = remaining_logits
 
-                    suffixes = self._explore(new_logits, path, max_new_tokens - 1, max_score, pos + 1, cache, next_position_ids, new_r, new_c, next_score)
+                    suffixes = self._explore(new_logits, path, max_new_tokens - 1, max_score, pos + 1, cache, next_position_ids, 0, -1, next_score)
                 else:
                     suffixes = []
 
@@ -177,20 +168,26 @@ class EvaluationStep:
             for item in itertools.islice(loader, num_samples):
                 task_data = item if isinstance(item, dict) else item[0]
 
-                if 'output' not in task_data["test"][0]:
+                if "test" not in task_data or not task_data["test"] or len(task_data["test"]) == 0:
+                    progress.update(task, advance=1)
+                    continue
+                
+                test_item = task_data["test"][0]
+                if not isinstance(test_item, dict) or "output" not in test_item:
                     progress.update(task, advance=1)
                     continue
 
-                target_grid_raw = torch.tensor(task_data['test'][0]['output'], device=self.device)
+                target_grid_raw = torch.tensor(test_item['output'], device=self.device)
                 pred_grid, generated_tokens, probabilities = self.generator.generate(task_data)
 
                 is_correct = 1 if torch.equal(pred_grid.to(self.device), target_grid_raw) else 0
 
                 if not visualized_this_loop:
-                    input_grid_raw = torch.tensor(task_data['test'][0]['input'])
-                    decoded_tokens = self.serializer.tokenizer.decode(generated_tokens)
-                    self.observer.visualize_evaluation_sample(input_grid_raw, target_grid_raw, pred_grid, decoded_tokens, probabilities, global_step)
-                    visualized_this_loop = True
+                    if "input" in test_item:
+                        input_grid_raw = torch.tensor(test_item['input'])
+                        decoded_tokens = self.serializer.tokenizer.decode(generated_tokens)
+                        self.observer.visualize_evaluation_sample(input_grid_raw, target_grid_raw, pred_grid, decoded_tokens, probabilities, global_step)
+                        visualized_this_loop = True
 
                 total_correct += is_correct
                 evaluated_count += 1
@@ -200,42 +197,30 @@ class EvaluationStep:
 
     def run(self, eval_loader: Any, total_tasks_processed: int, global_step: int, curriculum_stage: int, advance_curriculum_fn: callable, verbose: bool = False) -> dict[str, float]:
         self.model.eval()
-        self.observer.console.print(f"\n[bold cyan]--- Running 3-Phase Evaluation @ Step {global_step} (Stage {curriculum_stage}) ---[/bold cyan]")
+        self.observer.console.print(f"\n[bold cyan]--- Running Evaluation @ Step {global_step} ---[/bold cyan]")
 
-        num_historical = total_tasks_processed
-        if num_historical == 0:
-            self.observer.console.print("[yellow]Phase 1 skipped (no historical tasks to check for forgetting).[/yellow]")
-        else:
-            num_to_sample = min(5, num_historical)
-            indices = random.sample(range(num_historical), k=num_to_sample)
+        # 简化evaluation逻辑，直接从当前训练集随机抽样进行遗忘检查
+        num_training_tasks = len(self.train_dataset)
+        if num_training_tasks > 0:
+            num_to_sample = min(5, num_training_tasks)
+            indices = random.sample(range(num_training_tasks), k=num_to_sample)
             historical_subset = Subset(self.train_dataset, indices)
             historical_loader = DataLoader(historical_subset, batch_size=1, shuffle=False, collate_fn=lambda x: x)
-            correct, total = self._run_eval_loop(historical_loader, num_to_sample, "Phase 1: Forgetting Check", global_step)
+            correct, total = self._run_eval_loop(historical_loader, num_to_sample, "Forgetting Check", global_step)
             if correct < total:
-                self.observer.console.print(f"[bold red]Phase 1 FAILED: Forgetting detected! ({correct}/{total} passed). Aborting further evaluation.[/bold red]")
-                self.model.train()
-                return {"eval_grid_acc": correct / total if total > 0 else 0}
-            self.observer.console.print(f"[bold green]Phase 1 PASSED: No forgetting detected ({correct}/{total}).[/bold green]")
+                self.observer.console.print(f"[bold red]Forgetting detected! ({correct}/{total} passed).[/bold red]")
+            else:
+                self.observer.console.print(f"[bold green]No forgetting detected ({correct}/{total}).[/bold green]")
 
-            if curriculum_stage == 1:
-                advance_curriculum_fn()
-                self.model.train()
-                return {"eval_grid_acc": 1.0}
-
-        num_to_sample_quick = min(5, len(eval_loader.dataset))
-        correct_quick, total_quick = self._run_eval_loop(eval_loader, num_to_sample_quick, "Phase 2: Quick Generalization", global_step)
-        if correct_quick < total_quick:
-            self.observer.console.print(f"[bold red]Phase 2 FAILED: Quick generalization check failed! ({correct_quick}/{total_quick} passed). Aborting full evaluation.[/bold red]")
-            self.model.train()
-            return {"eval_grid_acc": correct_quick / total_quick if total_quick > 0 else 0}
-        self.observer.console.print(f"[bold green]Phase 2 PASSED: Quick generalization OK ({correct_quick}/{total_quick}). Proceeding to full evaluation.[/bold green]")
-
+        # 直接进行完整评估，不再分阶段
         num_full = len(eval_loader.dataset)
-        correct_full, total_full = self._run_eval_loop(eval_loader, num_full, "Phase 3: Full Evaluation", global_step)
-
-        final_acc = correct_full / total_full if total_full > 0 else 0
-        metrics = {"eval_grid_acc": final_acc, "total_count": float(total_full)}
-        self.observer.log_eval_summary(metrics, global_step)
+        if num_full > 0:
+            correct_full, total_full = self._run_eval_loop(eval_loader, num_full, "Full Evaluation", global_step)
+            final_acc = correct_full / total_full
+            metrics = {"eval_grid_acc": final_acc, "total_count": float(total_full)}
+            self.observer.log_eval_summary(metrics, global_step)
+        else:
+            metrics = {"eval_grid_acc": 0.0, "total_count": 0.0}
 
         self.model.train()
         return metrics

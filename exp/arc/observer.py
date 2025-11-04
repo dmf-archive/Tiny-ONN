@@ -1,10 +1,6 @@
-import os
-from pathlib import Path
 
-import matplotlib
+import math
 
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -17,17 +13,13 @@ from .config import TrainConfig
 
 
 class Observer:
-    ARC_COLORS: list[str] = [
-        "black", "blue", "red", "green", "yellow",
-        "grey", "magenta", "orange", "cyan", "brown",
-    ]
-
     def __init__(self, console: Console, config: TrainConfig):
         self.console = console
         self.config = config
-        self.vis_dir = Path(__file__).parent / "pic"
-        self.vis_dir.mkdir(exist_ok=True)
-        self.max_vis_files = 5
+        self.ARC_COLORS = [
+            "black", "blue", "red", "green", "yellow",
+            "grey", "magenta", "cyan", "white", "bright_white"
+        ]
 
     def calculate_metrics(
         self, main_loss: torch.Tensor, model_outputs: dict, signals: dict, input_ids: torch.Tensor, model: nn.Module
@@ -43,10 +35,14 @@ class Observer:
             else 0.0
         )
 
+        loss_value = main_loss.item()
+        grad_norm_value = signals.get("grad_norm", 0.0)
+        pi_value = math.exp(-(loss_value + grad_norm_value))
+
         metrics = {
-            "main_loss": main_loss.item(),
+            "main_loss": loss_value,
             "token_acc": acc,
-            "grad_norm": signals.get("grad_norm", 0.0),
+            "grad_norm": grad_norm_value,
             "sample_entropy": model_outputs.get("sample_entropy", torch.tensor(0.0)).mean().item(),
             "tau": (
                 -torch.sum(F.softmax(active_logits, dim=-1) * F.log_softmax(active_logits, dim=-1), dim=-1)
@@ -56,6 +52,7 @@ class Observer:
                 else 0.0
             ),
             "seq_len": float(labels.shape[1]),
+            "pi": pi_value,
         }
 
         return metrics
@@ -65,19 +62,19 @@ class Observer:
         epoch: int,
         step: int,
         task_idx: int | str,
-        view_idx: int,
         metrics: dict[str, float],
         elapsed_time: float,
     ):
         steps_per_sec = 1 / elapsed_time if elapsed_time > 0 else float("inf")
 
         log_str = (
-            f"E{epoch} S{step} T{task_idx} V{view_idx} | "
+            f"E{epoch} S{step} T{task_idx} | "
             f"Loss: {metrics.get('main_loss', 0.0):.3f} | "
             f"Acc: {metrics.get('token_acc', 0.0):.3f} | "
             f"GradNorm: {metrics.get('grad_norm', 0.0):.3e} | "
             f"τ: {metrics.get('tau', 0.0):.3f} | "
             f"H(x): {metrics.get('sample_entropy', 0.0):.3f} | "
+            f"PI: {metrics.get('pi', 0.0):.3f} | "
             f"Seq: {int(metrics.get('seq_len', 0))} | "
             f"Speed: {steps_per_sec:.2f} st/s"
         )
@@ -88,7 +85,6 @@ class Observer:
         epoch: int,
         step: int,
         task_idx: int,
-        view_idx: int,
         metrics: dict,
         elapsed_time: float,
         signals: dict,
@@ -100,8 +96,8 @@ class Observer:
         curriculum_stage: int,
     ):
         if step % self.config.log_interval == 0:
-            self.log_step(epoch, step, task_idx, view_idx, metrics, elapsed_time)
-            save_checkpoint_fn(task_idx, view_idx)
+            self.log_step(epoch, step, task_idx, metrics, elapsed_time)
+            save_checkpoint_fn(task_idx)
 
         if step > 0 and step % self.config.eval_interval == 0:
             evaluator.run(eval_loader, current_task_idx, step, curriculum_stage, advance_curriculum_fn)

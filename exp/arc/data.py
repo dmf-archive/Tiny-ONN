@@ -86,43 +86,40 @@ class GridSerializer:
             prompt_ids.extend([im_start_id] + output_ids + [im_end_id])
             prompt_coords.extend([(-1, -1)] + output_coords + [(-1, -1)])
 
-        test_input_ids, test_input_coords = self._serialize_grid(task_data["test"][0]["input"])
-        prompt_ids.extend([im_start_id] + test_input_ids + [im_end_id, im_start_id])
-        prompt_coords.extend([(-1, -1)] + test_input_coords + [(-1, -1), (-1, -1)])
+        test_data = task_data.get("test", [])
+        if test_data and len(test_data) > 0 and "input" in test_data[0]:
+            test_input_ids, test_input_coords = self._serialize_grid(test_data[0]["input"])
+            prompt_ids.extend([im_start_id] + test_input_ids + [im_end_id, im_start_id])
+            prompt_coords.extend([(-1, -1)] + test_input_coords + [(-1, -1), (-1, -1)])
+        else:
+            prompt_ids.extend([im_start_id, im_end_id, im_start_id])
+            prompt_coords.extend([(-1, -1), (-1, -1), (-1, -1)])
 
         return prompt_ids, prompt_coords
 
 
 class InMemoryArcDataset(Dataset):
-    def __init__(self, data_path: str, tokenizer: ArcColorTokenizer, split: str = "training", warmup_ratio: float = 1.0):
+    def __init__(self, data_path: str, tokenizer: ArcColorTokenizer, split: str = "training"):
         self.data_path = Path(data_path) / split
         self.split = split
-        self.warmup_ratio = warmup_ratio
-        
+
         all_tasks = []
         file_paths = sorted(list(self.data_path.glob("*.json")))
         for path in file_paths:
             with open(path) as f:
                 task_data = json.load(f)
-            if split == "training" and "test" in task_data and task_data["test"] and "output" in task_data["test"][0]:
-                all_tasks.append(task_data)
-            elif split == "evaluation" and "test" in task_data and task_data["test"]:
+            if split == "training" and "test" in task_data and task_data["test"] and len(task_data["test"]) > 0 and "output" in task_data["test"][0] or split == "evaluation" and "test" in task_data and task_data["test"] and len(task_data["test"]) > 0:
                 all_tasks.append(task_data)
 
         tasks_with_metrics = [
             (task, self._calculate_task_difficulty(task)) for task in all_tasks
         ]
-        
+
         sorted_tasks = sorted(
             tasks_with_metrics, key=lambda x: (x[1]["max_pixels"], x[1]["entropy"])
         )
-        
-        self.full_tasks = [task for task, metrics in sorted_tasks]
-        self.warmup_size = int(len(self.full_tasks) * self.warmup_ratio)
-        
-        self.tasks = self.full_tasks
-        if self.split == "training":
-            self.set_stage(1)
+
+        self.tasks = [task for task, metrics in sorted_tasks]
 
     @staticmethod
     def _normalize(values: list[float]) -> list[float]:
@@ -154,13 +151,6 @@ class InMemoryArcDataset(Dataset):
             "entropy": np.mean(entropies) if entropies else 0.0,
         }
 
-    def set_stage(self, stage: int):
-        if self.split != "training":
-            return
-        if stage == 1:
-            self.tasks = self.full_tasks[:self.warmup_size]
-        else:
-            self.tasks = self.full_tasks
 
     def __len__(self) -> int:
         return len(self.tasks)
