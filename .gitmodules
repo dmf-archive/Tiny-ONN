@@ -19,3 +19,6 @@
 [submodule "ref/adafisher"]
 	path = ref/adafisher
 	url = https://github.com/AtlasAnalyticsLab/AdaFisher.git
+[submodule "ref/F3EO"]
+	path = ref/F3EO
+	url = https://github.com/dmf-archive/F3EO.git
