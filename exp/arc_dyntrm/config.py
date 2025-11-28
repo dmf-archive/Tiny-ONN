@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 @dataclass
 class ModelConfig:
     vocab_size: int = 16
-    hidden_size: int = 512
+    hidden_size: int = 64
     max_refinement_steps: int = 7
     max_position_embeddings: int = 4096
 

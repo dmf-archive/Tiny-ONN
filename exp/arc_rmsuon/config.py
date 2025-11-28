@@ -4,14 +4,14 @@ from dataclasses import dataclass, field
 @dataclass
 class ModelConfig:
     vocab_size: int = 16
-    hidden_size: int = 512
+    hidden_size: int = 384
     num_heads: int = 8
     num_key_value_heads: int = 8
     num_layers: int = 6
     max_position_embeddings: int = 4096
     ffn_scale: int = 4
     use_checkpoint: bool = False
-    dropout: float = 0.05
+    dropout: float = 0.9
 
 @dataclass
 class GenerationConfig:
@@ -24,7 +24,7 @@ class DataConfig:
     data_path: str = "data/ARC-AGI-2/data"
     batch_size: int = 8
     num_workers: int = 4
-    max_tokens_per_batch: int = 6144
+    max_tokens_per_batch: int = 8192
 
 
 @dataclass
