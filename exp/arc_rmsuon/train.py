@@ -142,7 +142,7 @@ class Trainer:
         transformed_test = [{"input": augmented_grids_list[ptr], "output": augmented_grids_list[ptr + 1]}]
         augmented_task = {"train": transformed_train, "test": transformed_test}
 
-        ids, labels, _ = self.serializer.serialize_task(augmented_task)
+        ids, labels, _, diff_mask = self.serializer.serialize_task(augmented_task)
         if len(ids) > max_len:
             return None
 
@@ -159,6 +159,7 @@ class Trainer:
             "input_ids": torch.tensor(ids, dtype=torch.long),
             "labels": torch.tensor(labels, dtype=torch.long),
             "sample_entropy": torch.tensor(entropy, dtype=torch.float32),
+            "diff_mask": torch.tensor(diff_mask, dtype=torch.bool),
         }
 
     def _train_step(self, batch: dict, epoch: int, task_idx: int | str) -> tuple | None:
@@ -175,19 +176,54 @@ class Trainer:
         self.optimizer.zero_grad()
         main_loss = model_outputs.loss
 
-        if not torch.isfinite(main_loss):
-            self.console.print(f"[bold red]NaN detected in main_loss at step {self.global_step}. Aborting step.[/bold red]")
+        # --- START: Adaptive Auxiliary Loss Calculation ---
+        logits = model_outputs.logits
+        labels = batch["labels"]
+        diff_mask = batch["diff_mask"]
+
+        # Align logits and labels for loss calculation
+        shifted_logits = logits[..., :-1, :].contiguous()
+        shifted_labels = labels[..., 1:].contiguous()
+        shifted_diff_mask = diff_mask[..., 1:].contiguous()
+
+        # Calculate diff loss only on differing pixels
+        diff_labels = torch.where(shifted_diff_mask, shifted_labels, -100)
+        
+        loss_fct = nn.CrossEntropyLoss()
+        diff_loss = loss_fct(shifted_logits.view(-1, shifted_logits.size(-1)), diff_labels.view(-1))
+        
+        # If diff_loss is NaN (no differing pixels), set it to 0
+        if torch.isnan(diff_loss):
+            diff_loss = torch.tensor(0.0, device=main_loss.device)
+
+        # Calculate adaptive weight
+        num_diff_tokens = shifted_diff_mask.sum()
+        num_total_label_tokens = (shifted_labels != -100).sum()
+        
+        num_identity_tokens = num_total_label_tokens - num_diff_tokens
+
+        # Set a high penalty if there are no different tokens to encourage finding them
+        if num_diff_tokens == 0:
+            lambda_adaptive = torch.tensor(0.0, device=main_loss.device) # Set to 0 if no diff, no aux loss needed
+        else:
+            lambda_adaptive = (num_identity_tokens / num_diff_tokens).clamp(max=100.0)
+
+        total_loss = main_loss + lambda_adaptive * diff_loss
+        # --- END: Adaptive Auxiliary Loss Calculation ---
+
+        if not torch.isfinite(total_loss):
+            self.console.print(f"[bold red]NaN detected in total_loss at step {self.global_step}. Aborting step.[/bold red]")
             return None
 
-        main_loss.backward()
+        total_loss.backward()
         grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
         self.optimizer.step()
 
         model_outputs.labels = batch["labels"]
         model_outputs.sample_entropy = batch["sample_entropy"]
 
-        signals = {"grad_norm": grad_norm.item()}
-        metrics = self.observer.calculate_metrics(main_loss, model_outputs, signals, batch["input_ids"], self.model)
+        signals = {"grad_norm": grad_norm.item(), "lambda_adaptive": lambda_adaptive.item()}
+        metrics = self.observer.calculate_metrics(total_loss, model_outputs, signals, batch["input_ids"], self.model)
 
         self.observer.maybe_log_and_visualize(
             epoch,
@@ -279,6 +315,9 @@ class Trainer:
         raw_labels = [task["labels"] for task in batch_tasks]
         padded_labels = nn.utils.rnn.pad_sequence(raw_labels, batch_first=True, padding_value=-100)
 
+        raw_diff_masks = [task["diff_mask"] for task in batch_tasks]
+        padded_diff_masks = nn.utils.rnn.pad_sequence(raw_diff_masks, batch_first=True, padding_value=False)
+
         # 由于raw_input_ids已经是token IDs，不能直接使用tokenizer.__call__方法
         # 使用tokenizer.pad方法来处理预编码的token IDs
         batch = self.tokenizer.pad(
@@ -290,6 +329,7 @@ class Trainer:
         batch["attention_mask"] = (batch["input_ids"] != self.tokenizer.pad_token_id).long()
 
         batch["labels"] = padded_labels
+        batch["diff_mask"] = padded_diff_masks
         batch["sample_entropy"] = torch.stack([task["sample_entropy"] for task in batch_tasks])
 
         # 将所有张量移动到正确的设备

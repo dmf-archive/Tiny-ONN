@@ -26,3 +26,4 @@
 - `DynTRM (Dynamic Tiny Recursive Model)`: 基于 Universal Transformer 的动态递归模型。
 - `SDL (Sparse-Diversity Loss)`: **[Legacy]** 一种启发式门控损失，用于鼓励专家路由的稀疏性与多样性。
 - `DynMoE (Dynamic Mixture of Experts)`: **[Legacy]** Token 级别的动态 `MLP` 专家路由机制。
+- `CAPR (CrossAttentionPrototypeRouting)`: 原始DynMoE余弦相似度原型路由的改进版本，通过可学习的原型矩阵与输入token的交叉注意力计算实现语义感知的专家选择。参见 DynTRM。

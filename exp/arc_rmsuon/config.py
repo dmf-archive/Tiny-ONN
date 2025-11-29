@@ -4,10 +4,10 @@ from dataclasses import dataclass, field
 @dataclass
 class ModelConfig:
     vocab_size: int = 16
-    hidden_size: int = 384
+    hidden_size: int = 512
     num_heads: int = 8
     num_key_value_heads: int = 8
-    num_layers: int = 6
+    num_layers: int = 4
     max_position_embeddings: int = 4096
     ffn_scale: int = 4
     use_checkpoint: bool = False

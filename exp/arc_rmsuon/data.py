@@ -25,10 +25,11 @@ class GridSerializer:
                 coords.append((r, c))
         return tokens, coords
 
-    def serialize_task(self, task_data: dict[str, Any]) -> tuple[list[int], list[int], list[tuple[int, int]]]:
+    def serialize_task(self, task_data: dict[str, Any]) -> tuple[list[int], list[int], list[tuple[int, int]], list[bool]]:
         full_ids: list[int] = [self.tokenizer.bos_token_id]
         full_coords: list[tuple[int, int]] = [(-1, -1)]
         labels: list[int] = [-100]
+        diff_mask: list[bool] = [False]
 
         im_start_id = self.tokenizer.vocab["<im_start>"]
         im_end_id = self.tokenizer.vocab["<im_end>"]
@@ -37,20 +38,44 @@ class GridSerializer:
             ids: list[int],
             coords: list[tuple[int, int]],
             is_input: bool,
+            input_grid_for_diff: list[list[int]] | None = None,
         ):
             full_ids.extend([im_start_id] + ids + [im_end_id])
             full_coords.extend([(-1, -1)] + coords + [(-1, -1)])
+            
+            diff_mask.extend([False] * (len(ids) + 2))
+
             if is_input:
                 labels.extend([-100] * (len(ids) + 2))
             else:
                 labels.extend([-100] + ids + [im_end_id])
+                if input_grid_for_diff:
+                    output_grid = self.tokenizer.decode_grid(ids)
+                    
+                    token_idx = 0
+                    diff_mask_start_index = len(full_ids) - len(ids) - 1
+                    
+                    for r, row in enumerate(output_grid):
+                        if r > 0:
+                            token_idx += 1
+                        for c, color in enumerate(row):
+                            is_diff = False
+                            if r < len(input_grid_for_diff) and c < len(input_grid_for_diff[r]):
+                                if color != input_grid_for_diff[r][c]:
+                                    is_diff = True
+                            else: # Pixel exists in output but not input (size change)
+                                is_diff = True
+                            
+                            diff_mask[diff_mask_start_index + token_idx] = is_diff
+                            token_idx += 1
+
 
         for pair in task_data["train"]:
             input_ids, input_coords = self._serialize_grid(pair["input"])
             extend_and_mask(input_ids, input_coords, is_input=True)
 
             output_ids, output_coords = self._serialize_grid(pair["output"])
-            extend_and_mask(output_ids, output_coords, is_input=False)
+            extend_and_mask(output_ids, output_coords, is_input=False, input_grid_for_diff=pair["input"])
 
         test_input_ids, test_input_coords = self._serialize_grid(
             task_data["test"][0]["input"]
@@ -60,13 +85,14 @@ class GridSerializer:
         test_output_ids, test_output_coords = self._serialize_grid(
             task_data["test"][0]["output"]
         )
-        extend_and_mask(test_output_ids, test_output_coords, is_input=False)
+        extend_and_mask(test_output_ids, test_output_coords, is_input=False, input_grid_for_diff=task_data["test"][0]["input"])
 
         full_ids.append(self.tokenizer.eos_token_id)
         full_coords.append((-1, -1))
         labels.append(self.tokenizer.eos_token_id)
+        diff_mask.append(False)
 
-        return full_ids, labels, full_coords
+        return full_ids, labels, full_coords, diff_mask
 
     def serialize_for_inference(self, task_data: dict[str, Any]) -> tuple[list[int], list[tuple[int, int]]]:
         prompt_ids: list[int] = [self.tokenizer.bos_token_id]
@@ -117,7 +143,7 @@ class InMemoryArcDataset(Dataset):
             
             # 长度过滤检查 (Pre-filtering)
             # 使用无增强的原始数据进行序列化长度预估
-            ids, _, _ = self.serializer.serialize_task(task_data)
+            ids, _, _, _ = self.serializer.serialize_task(task_data)
             if len(ids) > self.max_len:
                 continue
 

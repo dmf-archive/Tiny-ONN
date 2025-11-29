@@ -43,7 +43,6 @@ class Observer:
         metrics = {
             "main_loss": loss_value,
             "token_acc": acc,
-            "grad_norm": grad_norm_value,
             "sample_entropy": model_outputs.sample_entropy.mean().item() if hasattr(model_outputs, 'sample_entropy') else 0.0,
             "tau": (
                 -torch.sum(F.softmax(active_logits, dim=-1) * F.log_softmax(active_logits, dim=-1), dim=-1)
@@ -55,6 +54,7 @@ class Observer:
             "seq_len": float(labels.shape[1]),
             "pi": pi_value,
         }
+        metrics.update(signals)
 
         return metrics
 
@@ -68,10 +68,12 @@ class Observer:
     ):
         steps_per_sec = 1 / elapsed_time if elapsed_time > 0 else float("inf")
 
+        lambda_val = metrics.get('lambda_adaptive', 0.0)
         log_str = (
             f"E{epoch} S{step} T{task_idx} | "
             f"Loss: {metrics.get('main_loss', 0.0):.3f} | "
             f"Acc: {metrics.get('token_acc', 0.0):.3f} | "
+            f"λ: {lambda_val:.2f} | "
             f"GradNorm: {metrics.get('grad_norm', 0.0):.3e} | "
             f"τ: {metrics.get('tau', 0.0):.3f} | "
             f"H(x): {metrics.get('sample_entropy', 0.0):.3f} | "

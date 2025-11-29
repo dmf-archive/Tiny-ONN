@@ -52,4 +52,20 @@ class ArcColorTokenizerFast(PreTrainedTokenizerFast):
     def row_sep_token_id(self) -> int:
         return self._vocab["\n"]
 
+    def decode_grid(self, token_ids: list[int]) -> list[list[int]]:
+        grid = []
+        current_row = []
+        for token_id in token_ids:
+            if token_id == self.row_sep_token_id:
+                if current_row:
+                    grid.append(current_row)
+                current_row = []
+            else:
+                color = self.token_id_to_color(token_id)
+                if color is not None:
+                    current_row.append(color)
+        if current_row:
+            grid.append(current_row)
+        return grid
+
     # The `vocab_size` and other properties are now inherited from PreTrainedTokenizerFast
