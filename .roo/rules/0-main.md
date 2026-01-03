@@ -48,10 +48,9 @@ owner: "Tiny-ONN 课题组"
 ## 6. 环境管理
 
 - **REQ-301**: 依赖项必须通过 `uv add/remove` 命令管理，`pyproject.toml` 是唯一真实来源。
-- **REQ-302**: 在执行 `uv add` 命令之前，必须通过设置环境变量 `$env:UV_PROJECT_ENVIRONMENT=".venv-win"` 来明确指定虚拟环境。启动训练和激活蓄虚拟环境无须设置环境变量。
 - **REQ-304**: 禁止 `cd` 到子文件夹内启动训练；代码须支持相对导入和 `python -m` 启动。
 - **GUD-301**: 若 `uv add` 失败，可使用 `uv pip install --no-deps --find-links ...` 作为临时方案。
-- **GUD-302**: 研究底层依赖时，应直接查阅 `.venv-win/Lib/site-packages` 中的源码。
+- **GUD-302**: 研究底层依赖时，应直接查阅 `.venv/Lib/site-packages` 中的源码。
 - **GUD-303**: 不确定上游库功能时，使用 `DeepWiki` 的 `ask_question` 功能查询。
 - **PAT-301**: 对于特定 CUDA/PyTorch 版本的依赖，应将 `.whl` 索引添加到 `pyproject.toml` 的 `[[tool.uv.index]]` 部分，然后运行 `uv add`。
 - **PAT-302**: 修改上游库时，必须优先采用“模型手术”模式（继承和替换最小组件），而不是覆写庞杂的 `forward` 方法。
@@ -84,3 +83,9 @@ owner: "Tiny-ONN 课题组"
 - **AC-002**: 所有依赖项必须已通过 `uv add` 正确添加到 `pyproject.toml`。
 - **AC-003**: 实验启动命令必须遵循 `python -m exp.<experiment_name>.train` 的格式。
 - **AC-004**: "原子重塑"操作必须保持外部接口完全透明。
+
+## 11. 空间级环境管理 (Chain:// Space)
+
+- **REQ-307**: 严禁使用系统默认的 `uv` 缓存。必须确保 `UV_CACHE_DIR` 指向 `../cache/uv`。
+- **CON-308**: 在执行 `uv sync/add` 前，Agent 必须验证环境变量。若未设置，应提示用户运行 `research-env.ps1` 或检查 `.vscode` 配置。
+- **GUD-309**: 所有的 Python 运行时应通过 `UV_PYTHON_INSTALL_DIR` 集中管理在 `cache/python` 中。
