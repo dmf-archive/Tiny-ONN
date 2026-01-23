@@ -1,58 +1,33 @@
-# Fisher-Aware Routing Shaping proposal
+# FARS: Fisher-Aware Routing Shaping
 
-`Date: 2026-01-03`
-`Status: Refined Theory / Design Specification`
-`Version: 2.0`
+`Latest update: 2026-01-23`
+`Status: Production Baseline`
 
-## 1. SARS 局限性分析
+> **TL;DR**: FARS 是一种“二阶矩范数加权负载均衡损失”。它利用优化器状态（Fisher 信息近似）来量化专家的认知代价，驱动路由器将数据分发给那些能以最小参数位移解释最大输出贡献的专家。
 
-[`SARS`](exp/arc_dyntrm/train.py:97) (Surprise-Aware Routing Shaping) 面临的核心挑战：
+## 1. 核心逻辑：从“惊奇”到“代价”
 
-1. **量纲冲突**: `logits` (无量纲) 与 `norm_mu_grad` (具有物理量纲的 Frobenius 范数) 直接相减导致超参数 `w_meta` 缺乏物理含义。
-2. **高频噪声**: 一阶瞬时梯度 `∇L` 包含大量随机噪声，导致路由决策在训练初期剧烈抖动。
+FARS 解决了旧版 SARS (Surprise-Aware) 的量纲冲突与高频噪声问题，也顺带解决了二次链式法则的性能问题。
 
-## 2. Fisher 信息近似
+- **认知代价 (Cost)**: 利用 [`ARS2-Neo`](src/optimizers/ars2_neo.py) 的二阶矩 $\sqrt{v_t}$ 作为 Fisher 信息的对角近似。它衡量了参数空间的局部曲率，即“参数变化对分布的影响程度”。
+- **重要性 (Importance)**: 专家输出的梯度范数 ‖ ∇_out ℒ ‖。
 
-利用 [`AdaRMSuon`](ref/F3EO/optimizer/ada_rmsuon.py) 的二阶矩估计 `v_t` 作为 Fisher 信息矩阵 (FIM) 的对角近似：
-`F(θ) ≈ E[∇L ⊗ ∇L] ≈ v_t`
+## 2. 统一路由塑造公式
 
-Fisher 信息定义了参数流形的度量，用于衡量专家的认知代价。
-
-## 3. 实施路径
-
-### 3.1 路径 A: SNR 视角 (无量纲化)
-
-定义 `Cost_SNR` 为 Adam 更新步长的范数，代表专家在流形上的有效位移：
-`Cost_SNR = ‖ m_t / (√(v_t) + ε) ‖`
-
-### 3.2 路径 B: 信息论视角 (KL 散度)
-
-定义 `Cost_IT` 为参数更新引起的局部 KL 散度（信息增益）：
-`Cost_IT ≈ 0.5 ⋅ η² ⋅ Σ m_t²`
-量纲为 **Nats**，与路由器的对数概率空间对齐，符合 MDL (最小描述长度) 原则。
-
-## 4. 统一路由塑造公式
-
-[`LearningDynamics`](exp/arc_dyntrm/train.py:103) 中的路由塑造逻辑重构为：
+路由器的目标是最小化以下塑造信号（Shaping Signal）：
 `𝒢 = Importance ⋅ (Belief - α ⋅ Cost_FARS)`
 
-- `Importance`: 专家输出梯度范数 `‖ ∇_out ℒ ‖`。
 - `Belief`: 路由器的原始 Logits。
-- `Cost_FARS`: 选定的成本度量 (`Cost_SNR` 或 `Cost_IT`)。
+- `Cost_FARS`: Norm(√v_t)，代表专家的认知复杂度。
 - `α`: 复杂度惩罚系数。
 
-## 5. 几何本质: 切空间对齐
+## 3. 几何本质：切空间对齐
 
-FARS 迫使路由器将数据分发至局部几何平坦的专家，实现非线性流形在当前数据点附近的切平面与数据分布重合。
+FARS 迫使路由器将数据分发至局部几何平坦的专家：
 
-- **高 Cost**: 参数更新剧烈，局部曲率大 (High Rank)，过拟合风险高。
-- **低 Cost**: 参数更新微小，局部几何平坦 (Low Rank)，泛化能力强。
+- **高 Cost**: 参数更新剧烈，局部曲率大，过拟合风险高（对应高 Kolmogorov 复杂度程序）。
+- **低 Cost**: 参数更新微小，局部几何平坦，泛化能力强（对应最小描述长度 MDL 程序）。
 
-## 6. ARC 离散域假设
+## 4. 实施参考
 
-在 [`ARC-AGI`](data/arc-agi_evaluation_challenges.json) 任务中，曲率对应程序的 **Kolmogorov 复杂度**：
-
-- **平坦区域**: 可通过低复杂度程序解释的样本。
-- **弯曲区域**: 需高复杂度特例解释的样本。
-
-FARS 作为 MDL 过滤器，优先保留符合最小描述长度原则的程序路径。
+具体实现详见 [`src/tasks/arc/shaper.py`](src/tasks/arc/shaper.py)。它通过直接读取优化器状态实现“零额外反向传播”的高效路由塑造。
