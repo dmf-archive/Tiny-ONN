@@ -132,6 +132,7 @@ class ARS2Neo(Optimizer):
         with torch.enable_grad():
             loss = closure()
             loss.backward()
+            self.state['grad_norm'] = self._calculate_global_grad_norm()
             
         # 3. SAM Logic (Global across groups)
         is_sync_step = False
@@ -301,6 +302,14 @@ class ARS2Neo(Optimizer):
         phi = num / ((den_g * den_v) ** 0.5 + 1e-12)
         return float(phi)
 
+    def _calculate_global_grad_norm(self) -> float:
+        grad_norm_sq = 0.0
+        for group in self.param_groups:
+            for p in group['params']:
+                if p.grad is not None:
+                    grad_norm_sq += p.grad.detach().pow(2).sum().item()
+        return grad_norm_sq ** 0.5
+
     @property
     def diagnostics(self) -> dict:
         total_steps = self.state.get('step', 1)
@@ -310,7 +319,8 @@ class ARS2Neo(Optimizer):
             'phi_std': self.state.get('phi_var', 0.0) ** 0.5,
             'threshold': self.state.get('threshold', 0.0),
             'alpha_t': self.state.get('alpha_t', 0.1),
-            'effective_k': total_steps / max(1, sync_steps)
+            'effective_k': total_steps / max(1, sync_steps),
+            'grad_norm': self.state.get('grad_norm', 0.0)
         }
 
     def _apply_ars2_kernel(self, p, beta1, beta2, lr, eps, weight_decay, ns_steps):

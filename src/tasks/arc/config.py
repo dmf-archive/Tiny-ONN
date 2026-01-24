@@ -15,7 +15,7 @@ class ModelConfig:
     hidden_size: int = 512
     num_layers: int = 8
     num_heads: int = 8
-    max_seq_len: int = 2048
+    max_seq_len: int = 8192
 
 @dataclass
 class TrainConfig:
@@ -26,3 +26,12 @@ class TrainConfig:
     num_epochs: int = 10
     device: str = "cuda"
     data_dir: str = "data/ARC-AGI-2/data"
+    # Optimizer settings
+    k: int = 1
+    adaptive_sync: bool = True
+    eval_steps: int = 100
+    save_steps: int = 500
+    resume_from_checkpoint: Optional[str] = None
+    # Routing Shaping
+    w_meta: float = 0.5
+    cost_alpha: float = 0.5

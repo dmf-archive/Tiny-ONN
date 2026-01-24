@@ -28,17 +28,21 @@ class ARCTrainer:
             observer=self.observer,
             device=config.device
         )
-        self.shaper = RoutingShaper(w_meta=0.1)
+        self.shaper = RoutingShaper(w_meta=config.w_meta, cost_alpha=config.cost_alpha)
         
         self.train_loader = get_arc_dataloader(config.data_dir, config.batch_size, split="training")
         self.eval_loader = get_arc_dataloader(config.data_dir, 1, split="evaluation")
         
         self.optimizer = self._setup_optimizer()
         self.global_step = 0
+        self.start_epoch = 0
         self.checkpoint_dir = Path("checkpoints/arc_v2")
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         self.last_routing_diagnostics = {}
         self.performance_stats = {}
+        
+        if config.resume_from_checkpoint:
+            self.load_checkpoint(config.resume_from_checkpoint)
 
     def _setup_optimizer(self) -> SingleDeviceARS2Neo:
         ars2_params = []
@@ -60,7 +64,8 @@ class ARCTrainer:
             lr=self.config.lr,
             weight_decay=0.01,
             rho=0.1,
-            k=1  # Synchronous SAM by default
+            k=self.config.k,
+            adaptive_sync=self.config.adaptive_sync
         )
 
     def train_step(self, batch: Dict[str, torch.Tensor]) -> float:
@@ -134,7 +139,9 @@ class ARCTrainer:
         dataset = self.eval_loader.dataset
         for i in range(num_tasks):
             task_data = dataset.tasks[i]
-            is_correct = self.evaluator.evaluate_task(task_data, self.config.generation)
+            # Only visualize the first task for brevity
+            visualize = (i == 0)
+            is_correct = self.evaluator.evaluate_task(task_data, self.config.generation, visualize=visualize)
             if is_correct:
                 total_correct += 1
         
@@ -142,37 +149,58 @@ class ARCTrainer:
         self.observer.log_metrics({"eval_accuracy": accuracy}, step=self.global_step)
         return accuracy
 
-    def save_checkpoint(self, epoch: int):
-        path = self.checkpoint_dir / f"checkpoint_epoch_{epoch}.pt"
+    def save_checkpoint(self, epoch: int, step: int):
+        path = self.checkpoint_dir / f"checkpoint_s{self.global_step}.pt"
         torch.save({
             "epoch": epoch,
+            "step": step,
             "model_state_dict": self.model.state_dict(),
             "optimizer_state_dict": self.optimizer.state_dict(),
             "global_step": self.global_step,
         }, path)
+        self.observer.console.print(f"[dim]Checkpoint saved: {path}[/dim]")
+
+    def load_checkpoint(self, path: str):
+        self.observer.console.print(f"[bold yellow]Resuming from checkpoint: {path}[/bold yellow]")
+        checkpoint = torch.load(path, map_location=self.device)
+        self.model.load_state_dict(checkpoint["model_state_dict"])
+        self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        self.global_step = checkpoint["global_step"]
+        self.start_epoch = checkpoint.get("epoch", 0)
 
     def train(self):
         self.observer.console.print(f"[bold green]Starting ARC-2 Training on {self.device}...[/bold green]")
-        for epoch in range(self.config.num_epochs):
+        for epoch in range(self.start_epoch, self.config.num_epochs):
             epoch_loss = 0.0
             for step, batch in enumerate(self.train_loader):
                 loss = self.train_step(batch)
                 epoch_loss += loss
                 
-                if step % 10 == 0:
+                # 1. Log metrics
+                if self.global_step % 10 == 0:
                     self.observer.log_metrics(
                         {
-                            "loss": loss, 
-                            **self.optimizer.diagnostics, 
+                            "loss": loss,
+                            **self.optimizer.diagnostics,
                             **self.last_routing_diagnostics,
                             **self.performance_stats
-                        }, 
-                        step=self.global_step, 
+                        },
+                        step=self.global_step,
                         epoch=epoch
                     )
+                
+                # 2. Step-based Evaluation
+                if self.global_step > 0 and self.global_step % self.config.eval_steps == 0:
+                    self.evaluate()
+                
+                # 3. Step-based Checkpointing
+                if self.global_step > 0 and self.global_step % self.config.save_steps == 0:
+                    self.save_checkpoint(epoch, step)
             
+            # End of epoch
             avg_loss = epoch_loss / len(self.train_loader)
             self.observer.log_metrics({"avg_epoch_loss": avg_loss}, step=self.global_step, epoch=epoch)
             
+            # Always evaluate and save at end of epoch
             self.evaluate()
-            self.save_checkpoint(epoch)
+            self.save_checkpoint(epoch, len(self.train_loader))

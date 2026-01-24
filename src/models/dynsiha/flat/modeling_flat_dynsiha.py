@@ -1,12 +1,23 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from dataclasses import dataclass
 from transformers import PreTrainedModel, GenerationMixin
 from transformers.modeling_outputs import CausalLMOutputWithPast
+from transformers.utils import ModelOutput
 from transformers.cache_utils import Cache, DynamicCache
 from typing import Optional, Union, Dict, Any, List, Tuple
 from .configuration_flat_dynsiha import FlatDynSIHAConfig
 from ..shared.layers import DynSIHABlock, DynSIHARotaryEmbedding, DynSIHARMSNorm
+
+@dataclass
+class FlatDynSIHAOutput(ModelOutput):
+    loss: Optional[torch.FloatTensor] = None
+    logits: torch.FloatTensor = None
+    past_key_values: Optional[Tuple[Tuple[torch.FloatTensor]]] = None
+    hidden_states: Optional[Tuple[torch.FloatTensor]] = None
+    attentions: Optional[Tuple[torch.FloatTensor]] = None
+    routing_info: Optional[List[Dict[str, torch.Tensor]]] = None
 
 class FlatDynSIHAPreTrainedModel(PreTrainedModel):
     config_class = FlatDynSIHAConfig
@@ -68,7 +79,7 @@ class FlatDynSIHAForCausalLM(FlatDynSIHAPreTrainedModel, GenerationMixin):
         return_dict: bool = True,
         cache_position: Optional[torch.LongTensor] = None,
         **kwargs
-    ) -> Union[CausalLMOutputWithPast, Tuple[torch.Tensor, List[Dict[str, torch.Tensor]]]]:
+    ) -> Union[FlatDynSIHAOutput, Tuple[torch.Tensor, List[Dict[str, torch.Tensor]]]]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -158,12 +169,13 @@ class FlatDynSIHAForCausalLM(FlatDynSIHAPreTrainedModel, GenerationMixin):
             output = (logits,) + (all_routing_info,)
             return ((loss,) + output) if loss is not None else output
 
-        return CausalLMOutputWithPast(
+        return FlatDynSIHAOutput(
             loss=loss,
             logits=logits,
             past_key_values=past_key_values if use_cache else None,
             hidden_states=all_hidden_states,
-            attentions=None, # Not implemented yet
+            attentions=None,
+            routing_info=all_routing_info,
         )
 
     def prepare_inputs_for_generation(
@@ -179,8 +191,8 @@ class FlatDynSIHAForCausalLM(FlatDynSIHAPreTrainedModel, GenerationMixin):
         if past_key_values is not None:
             if isinstance(past_key_values, Cache):
                 cache_length = past_key_values.get_seq_length()
-                past_length = past_key_values.seen_tokens
-                max_cache_length = past_key_values.get_max_length()
+                past_length = cache_length
+                max_cache_length = None # DynamicCache doesn't always have get_max_length
             else:
                 cache_length = past_length = past_key_values[0][0].shape[2]
                 max_cache_length = None

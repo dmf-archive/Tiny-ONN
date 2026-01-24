@@ -109,17 +109,23 @@ class ArcEvaluator:
             
             self._recursive_dfs(new_tokens, new_score, next_logits[:, -1, :], next_pkv, max_score, max_new_tokens, results)
 
-    def evaluate_task(self, task_data: Dict[str, Any], config: GenerationConfig):
+    def evaluate_task(self, task_data: Dict[str, Any], config: GenerationConfig, visualize: bool = False):
         input_ids = self.processor.serialize_for_inference(task_data).unsqueeze(0)
         
-        if config.use_dfs:
-            pred_tokens = self.dfs_search(input_ids, config)
-        else:
-            pred_tokens = self.greedy_decode(input_ids, config.max_new_tokens)
-        
-        pred_grid = self.processor.decode_grid(pred_tokens)
         target_grid = torch.tensor(task_data["test"][0]["output"], dtype=torch.long)
         input_grid = torch.tensor(task_data["test"][0]["input"], dtype=torch.long)
         
-        self.observer.visualize_prediction(input_grid, target_grid, pred_grid)
+        # Optimization: Limit generation length to target length + small buffer if target is known
+        target_tokens = self.processor.encode_grid(target_grid)
+        max_new_tokens = min(config.max_new_tokens, len(target_tokens) + 2)
+
+        if config.use_dfs:
+            pred_tokens = self.dfs_search(input_ids, config)
+        else:
+            pred_tokens = self.greedy_decode(input_ids, max_new_tokens)
+        
+        pred_grid = self.processor.decode_grid(pred_tokens)
+        
+        if visualize:
+            self.observer.visualize_prediction(input_grid, target_grid, pred_grid)
         return torch.equal(pred_grid, target_grid)

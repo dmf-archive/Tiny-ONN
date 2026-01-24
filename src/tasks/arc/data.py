@@ -174,17 +174,18 @@ class ARCDataset(Dataset):
                     all_labels.append(torch.tensor([-100] * (len(out_tokens) + 2)))
 
                 # H2: Diff Mask logic (Adaptive Differential Loss)
-                # We want to focus on tokens that are DIFFERENT from the input grid
-                # to suppress the "copying" bias.
-                d_mask = torch.ones(len(out_tokens) + 2)
+                # Binary mask: 1.0 for innovation (diff), 0.0 for noise (identity/copy)
+                d_mask = torch.zeros(len(out_tokens) + 2)
                 if in_grid.shape == out_grid.shape:
-                    # Encode in_grid to tokens to compare at token level
                     in_tokens_for_diff = self.processor.encode_grid(in_grid)
                     if len(in_tokens_for_diff) == len(out_tokens):
-                        # Mask out tokens that are identical (copying)
-                        # We keep 1.0 for different tokens, and a small epsilon for identical ones
-                        is_same = (in_tokens_for_diff == out_tokens).float()
-                        d_mask[1:-1] = 1.0 - 0.9 * is_same
+                        # Only mark tokens that actually CHANGED
+                        is_diff = (in_tokens_for_diff != out_tokens).float()
+                        d_mask[1:-1] = is_diff
+                    else:
+                        d_mask[1:-1] = 1.0 # Length change implies total innovation
+                else:
+                    d_mask[1:-1] = 1.0 # Shape change implies total innovation
                 
                 all_diff_masks.append(d_mask)
 

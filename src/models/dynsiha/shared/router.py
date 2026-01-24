@@ -65,17 +65,28 @@ class VectorizedExpertMLP(nn.Module):
         rw_flat = routing_weights.view(-1, K)
         se_flat = selected_experts.view(-1, K)
         
-        S = x_flat.shape[0]
-        expert_inputs = x_flat.unsqueeze(1).expand(S, K, D)
+        combined_output = torch.zeros(x_flat.shape[0], D, device=x.device, dtype=x.dtype)
         
-        selected_w1 = self.w1[se_flat]
-        selected_w2 = self.w2[se_flat]
-        
-        hidden = torch.matmul(expert_inputs.unsqueeze(-2), selected_w1)
-        hidden = F.silu(hidden)
-        
-        output = torch.matmul(hidden, selected_w2)
-        output = output.squeeze(-2)
-        
-        weighted_output = output * rw_flat.unsqueeze(-1)
-        return weighted_output.sum(dim=1).view(shape)
+        # Memory efficient MoE: Loop over experts instead of materializing all weights
+        for i in range(self.num_experts):
+            # Find tokens that selected this expert
+            mask = (se_flat == i)
+            if not mask.any():
+                continue
+            
+            # Get token indices and which 'k' slot they used
+            token_indices, k_slots = torch.where(mask)
+            
+            # Extract inputs and weights
+            expert_inputs = x_flat[token_indices] # [num_matched, D]
+            weights = rw_flat[token_indices, k_slots].unsqueeze(-1) # [num_matched, 1]
+            
+            # Compute expert output
+            # hidden = silu(x @ w1) @ w2
+            hidden = F.silu(torch.matmul(expert_inputs, self.w1[i]))
+            out = torch.matmul(hidden, self.w2[i])
+            
+            # Accumulate weighted output
+            combined_output.index_add_(0, token_indices, out * weights)
+            
+        return combined_output.view(shape)

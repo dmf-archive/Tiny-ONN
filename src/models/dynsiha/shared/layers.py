@@ -1,9 +1,15 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional, Dict, Tuple, Union
+from typing import Optional, Dict, Tuple, Union, List
 from .router import MLPRouter, VectorizedExpertMLP
 from transformers.cache_utils import Cache
+from transformers.modeling_outputs import CausalLMOutputWithPast
+from dataclasses import dataclass
+
+@dataclass
+class DynSIHACausalLMOutput(CausalLMOutputWithPast):
+    routing_info: Optional[List[Dict[str, torch.Tensor]]] = None
 
 class DynSIHARMSNorm(nn.Module):
     def __init__(self, hidden_size: int, eps: float = 1e-6):
@@ -116,7 +122,7 @@ class DynSIHAAttention(nn.Module):
 
         attn_output = F.scaled_dot_product_attention(
             q, k, v,
-            attn_mask=attention_mask,
+            attn_mask=attention_mask.bool() if attention_mask is not None else None,
             is_causal=True if attention_mask is None and q.shape[2] > 1 else False
         )
         

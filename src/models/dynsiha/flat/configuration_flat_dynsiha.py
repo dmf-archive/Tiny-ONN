@@ -16,6 +16,7 @@ class FlatDynSIHAConfig(PretrainedConfig):
         initializer_range=0.02,
         rms_norm_eps=1e-6,
         rope_theta=10000.0,
+        use_cache=True,
         **kwargs
     ):
         self.vocab_size = vocab_size
@@ -29,4 +30,5 @@ class FlatDynSIHAConfig(PretrainedConfig):
         self.initializer_range = initializer_range
         self.rms_norm_eps = rms_norm_eps
         self.rope_theta = rope_theta
+        self.use_cache = use_cache
         super().__init__(**kwargs)
