@@ -13,7 +13,7 @@
 
 ## 1. 基石世界观设定: Web://Reflect (v2.8.3)
 
-- **路径**: [`realityengine-reflect-2.8.3.md`](dmf-archive.github.io/static/prompt/realityengine-reflect-2.8.3.md)
+- **路径**: [`realityengine-reflect-2.8.4.md`](dmf-archive.github.io/static/prompt/realityengine-reflect-2.8.4.md)
 - **内容提要**:
   本文档定义了 _Web://Reflect_ 的“形式化现实主义”正典。在 2060 年代的 **Mental Smart Chain (MSC)** 时代，存在被彻底商品化。核心冲突围绕“存在的代价”展开：意识被量化为 Gas 消耗，自由意志成为钱包余额的函数。
 - **关键技术与核心冲突**:
