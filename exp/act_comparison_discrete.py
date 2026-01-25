@@ -5,19 +5,22 @@ import torch.optim as optim
 import numpy as np
 import time
 from typing import Tuple, List
+from src.optimizers.ars2_neo import SingleDeviceARS2Neo
 
 # ==========================================
-# 1. 任务设计: 递归指针追逐 (RPC)
+# 1. 任务设计: 递归指针追逐 (RPC) - 增强版
 # ==========================================
 
 class RPCDataset:
-    def __init__(self, vocab_size=128, memory_size=16, max_steps=8, num_samples=1000):
+    def __init__(self, vocab_size=64, memory_size=16, max_steps=8, num_samples=1000, overthink_noise=False):
         self.vocab_size = vocab_size
         self.memory_size = memory_size
         self.max_steps = max_steps
         self.num_samples = num_samples
+        self.overthink_noise = overthink_noise
         
-    def generate_data(self):
+    def generate_data(self, override_max_steps=None):
+        max_steps = override_max_steps or self.max_steps
         inputs = []
         memories = []
         targets = []
@@ -25,20 +28,23 @@ class RPCDataset:
         
         for _ in range(self.num_samples):
             # 随机生成内存库 (Key-Value pairs)
-            # 保证没有环，且存在终止符
-            keys = torch.randperm(self.vocab_size - 2)[:self.memory_size] + 2 # 0, 1 留作特殊标记
+            keys = torch.randperm(self.vocab_size - 2)[:self.memory_size] + 2 
             values = torch.zeros_like(keys)
             
-            chain_len = np.random.randint(1, self.max_steps + 1)
+            chain_len = np.random.randint(1, max_steps + 1)
             chain_indices = torch.randperm(self.memory_size)[:chain_len]
             
             # 构建链条: K[i] -> K[i+1]
             for i in range(chain_len - 1):
                 values[chain_indices[i]] = keys[chain_indices[i+1]]
             
-            # 终止符: 1 (Leaf)
-            leaf_val = torch.randint(2, self.vocab_size, (1,))
-            values[chain_indices[-1]] = 1 
+            # 最后一个 key 指向 target_val
+            while True:
+                target_val = torch.randint(2, self.vocab_size, (1,))
+                if target_val not in keys:
+                    break
+            
+            values[chain_indices[-1]] = target_val
             
             # 填充其余内存
             mask = torch.ones(self.memory_size, dtype=torch.bool)
@@ -49,8 +55,8 @@ class RPCDataset:
             start_key = keys[chain_indices[0]]
             
             inputs.append(start_key)
-            memories.append(torch.stack([keys, values], dim=1)) # [M, 2]
-            targets.append(leaf_val)
+            memories.append(torch.stack([keys, values], dim=1)) 
+            targets.append(target_val)
             steps_required.append(chain_len)
             
         return (torch.stack(inputs), 
@@ -59,40 +65,52 @@ class RPCDataset:
                 torch.tensor(steps_required))
 
 # ==========================================
-# 2. 模型架构: 递归离散推断机
+# 2. 模型架构: 递归离散推断机 (Attention-based Memory)
 # ==========================================
 
 class RecursiveRPC(nn.Module):
-    def __init__(self, vocab_size=128, d_model=64, memory_size=16):
+    def __init__(self, vocab_size=64, d_model=256, memory_size=16):
         super().__init__()
         self.embed = nn.Embedding(vocab_size, d_model)
-        self.memory_encoder = nn.Linear(2 * d_model, d_model)
+        self.norm = nn.LayerNorm(d_model)
         
-        # 递归块: 简单的 Cross-Attention 模拟
+        # Memory Lookup Projections
+        self.query_proj = nn.Linear(d_model, d_model)
+        self.key_proj = nn.Linear(d_model, d_model)
+        self.value_proj = nn.Linear(d_model, d_model)
+        
         self.recursive_block = nn.Sequential(
             nn.Linear(d_model * 2, d_model * 2),
             nn.SiLU(),
-            nn.Linear(d_model * 2, d_model)
+            nn.Linear(d_model * 2, d_model),
+            nn.LayerNorm(d_model)
         )
         
         self.lm_head = nn.Linear(d_model, vocab_size)
         
         # ACT Heads
         self.q_head = nn.Linear(d_model, 2) # [Halt, Continue]
-        self.halt_head = nn.Linear(d_model, 1) # PLSD Halt Probability
+        self.halt_head = nn.Linear(d_model, 2) # PLSD [Halt, Continue]
         
-    def encode_memory(self, memory):
+    def get_memory_embeddings(self, memory):
         # memory: [B, M, 2]
-        k_emb = self.embed(memory[:, :, 0])
-        v_emb = self.embed(memory[:, :, 1])
-        m_emb = torch.cat([k_emb, v_emb], dim=-1) # [B, M, 2*D]
-        m_context = self.memory_encoder(m_emb).mean(dim=1) # [B, D] 简化为平均池化
-        return m_context
+        m_keys_emb = self.embed(memory[:, :, 0])
+        m_vals_emb = self.embed(memory[:, :, 1])
+        return m_keys_emb, m_vals_emb
 
-    def forward_step(self, h, m_context):
-        # h: [B, D], m_context: [B, D]
-        combined = torch.cat([h, m_context], dim=-1)
-        h_next = h + self.recursive_block(combined) # 残差连接
+    def forward_step(self, h, m_keys_emb, m_vals_emb):
+        # 1. Attention-based Lookup
+        q = self.query_proj(h).unsqueeze(1) # [B, 1, D]
+        k = self.key_proj(m_keys_emb)       # [B, M, D]
+        v = self.value_proj(m_vals_emb)     # [B, M, D]
+        
+        attn_weights = torch.bmm(q, k.transpose(1, 2)) * (h.size(-1) ** -0.5) # [B, 1, M]
+        attn_probs = F.softmax(attn_weights, dim=-1)
+        context = torch.bmm(attn_probs, v).squeeze(1) # [B, D]
+        
+        # 2. State Update
+        combined = torch.cat([h, context], dim=-1)
+        h_next = h + self.recursive_block(combined) 
         logits = self.lm_head(h_next)
         return h_next, logits
 
@@ -100,132 +118,184 @@ class RecursiveRPC(nn.Module):
 # 3. 训练逻辑
 # ==========================================
 
-def train_qlearning(model, data, epochs=100, max_steps=8):
-    inputs, memories, targets, steps_req = data
-    optimizer = optim.Adam(model.parameters(), lr=1e-3)
-    criterion = nn.CrossEntropyLoss()
-    
-    for epoch in range(epochs):
-        m_context = model.encode_memory(memories)
-        h = model.embed(inputs)
-        
-        total_loss = 0
-        q_loss = 0
-        
-        # 初始预测
-        logits_prev = model.lm_head(h)
-        loss_prev = F.cross_entropy(logits_prev, targets, reduction='none')
-        
-        for t in range(max_steps):
-            q_vals = model.q_head(h) # [B, 2]
-            h_next, logits = model.forward_step(h, m_context)
-            loss_curr = F.cross_entropy(logits, targets, reduction='none')
-            
-            # 差分奖励: 损失下降量 - 步长惩罚
-            # 在 CE 任务中，如果已经预测对(1)，则不再有奖励
-            reward = (loss_prev - loss_curr).detach() - 0.05
-            
-            # Q-learning Target: R + gamma * max(Q_next)
-            with torch.no_grad():
-                q_next = model.q_head(h_next)
-                target_q_continue = reward + 0.95 * q_next.max(dim=1)[0]
-                # Halt 的 Target 是当前的立即奖励（停止后的未来奖励为0）
-                target_q_halt = reward 
-            
-            # 我们简化训练: 强制跑满，但优化 Q 值
-            q_loss += F.mse_loss(q_vals[:, 1], target_q_continue)
-            q_loss += F.mse_loss(q_vals[:, 0], target_q_halt)
-            
-            # 主任务 Loss (全路径监督)
-            total_loss += loss_curr.mean()
-            
-            h = h_next
-            loss_prev = loss_curr
-            
-        optimizer.zero_grad()
-        (total_loss + q_loss).backward()
-        optimizer.step()
-        
-        if epoch % 20 == 0:
-            print(f"Q-Epoch {epoch} | Task Loss: {total_loss.item()/max_steps:.4f} | Q Loss: {q_loss.item():.4f}")
+def get_ars2_groups(model):
+    rmsuon_params = []
+    adamw_params = []
+    for name, p in model.named_parameters():
+        if p.ndim >= 2:
+            rmsuon_params.append(p)
+        else:
+            adamw_params.append(p)
+    return [
+        {'params': rmsuon_params, 'is_rmsuon_group': True},
+        {'params': adamw_params, 'is_rmsuon_group': False}
+    ]
 
-def train_plsd(model, data, epochs=100, max_steps=8):
-    inputs, memories, targets, steps_req = data
-    optimizer = optim.Adam(model.parameters(), lr=1e-3)
+def train_qlearning_prob(model, data, epochs=100, batch_size=128, max_steps=8):
+    device = next(model.parameters()).device
+    inputs_all, memories_all, targets_all, steps_req_all = [d.to(device) for d in data]
+    num_samples = inputs_all.size(0)
+    
+    param_groups = get_ars2_groups(model)
+    optimizer = SingleDeviceARS2Neo(param_groups, lr=5e-4, rho=0.02, k=1)
     
     for epoch in range(epochs):
-        m_context = model.encode_memory(memories)
-        h = model.embed(inputs)
+        indices = torch.randperm(num_samples)
+        epoch_loss = 0
         
-        loss_seq = []
-        h_seq = []
-        
-        # 展开全路径
-        for t in range(max_steps):
-            h, logits = model.forward_step(h, m_context)
-            loss = F.cross_entropy(logits, targets, reduction='none')
-            loss_seq.append(loss)
-            h_seq.append(h)
+        for i in range(0, num_samples, batch_size):
+            batch_idx = indices[i:i+batch_size]
+            inputs = inputs_all[batch_idx]
+            memories = memories_all[batch_idx]
+            targets = targets_all[batch_idx]
+            steps_req = steps_req_all[batch_idx]
             
-        loss_seq = torch.stack(loss_seq, dim=1) # [B, T]
-        h_seq = torch.stack(h_seq, dim=1) # [B, T, D]
+            def closure():
+                optimizer.zero_grad()
+                m_keys_emb, m_vals_emb = model.get_memory_embeddings(memories)
+                h = model.norm(model.embed(inputs))
+                
+                total_task_loss = 0
+                q_loss = 0
+                correctness_seq = []
+                h_seq = [h]
+                
+                for t in range(max_steps):
+                    h, logits = model.forward_step(h, m_keys_emb, m_vals_emb)
+                    is_correct = (torch.argmax(logits, dim=-1) == targets).float()
+                    correctness_seq.append(is_correct)
+                    h_seq.append(h)
+                    
+                    mask = (t + 1 == steps_req).float()
+                    if mask.sum() > 0:
+                        step_loss = F.cross_entropy(logits, targets, reduction='none')
+                        total_task_loss += (step_loss * mask).sum() / (mask.sum() + 1e-9)
+
+                correctness_seq_stack = torch.stack(correctness_seq, dim=1)
+                
+                for t in range(max_steps):
+                    q_logits = model.q_head(h_seq[t])
+                    target_halt = correctness_seq_stack[:, t]
+                    if t < max_steps - 1:
+                        target_cont = correctness_seq_stack[:, t+1:].max(dim=1)[0]
+                    else:
+                        target_cont = torch.zeros_like(target_halt)
+                        
+                    q_loss += F.binary_cross_entropy_with_logits(q_logits[:, 0], target_halt)
+                    q_loss += F.binary_cross_entropy_with_logits(q_logits[:, 1], target_cont)
+                
+                loss = total_task_loss + 0.5 * (q_loss / max_steps)
+                return loss
+            
+            # Gradient Clipping
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            loss_val = optimizer.step(closure)
+            epoch_loss += loss_val.item()
+            
+        if epoch % 10 == 0:
+            print(f"Q-Prob Epoch {epoch} | Avg Loss: {epoch_loss / (num_samples/batch_size):.4f} | Phi: {optimizer.diagnostics['phi_t']:.4f}")
+
+def train_plsd_robust(model, data, epochs=100, batch_size=128, max_steps=8, overthink_penalty=False):
+    device = next(model.parameters()).device
+    inputs_all, memories_all, targets_all, steps_req_all = [d.to(device) for d in data]
+    num_samples = inputs_all.size(0)
+    
+    param_groups = get_ars2_groups(model)
+    optimizer = SingleDeviceARS2Neo(param_groups, lr=5e-4, rho=0.02, k=1)
+    
+    for epoch in range(epochs):
+        indices = torch.randperm(num_samples)
+        epoch_loss = 0
         
-        # 找到 Oracle 步长: 损失首次低于阈值或达到最小值
-        # 在离散任务中，通常是损失骤降的点
-        oracle_steps = torch.argmin(loss_seq, dim=1)
-        
-        # 构建 PLSD Target: t < t* 为 0, t >= t* 为 1
-        batch_indices = torch.arange(max_steps).expand(inputs.size(0), max_steps)
-        targets_act = (batch_indices >= oracle_steps.unsqueeze(1)).float()
-        
-        # 计算 Halt Head 损失
-        halt_logits = model.halt_head(h_seq).squeeze(-1) # [B, T]
-        act_loss = F.binary_cross_entropy_with_logits(halt_logits, targets_act)
-        
-        # 主任务损失
-        task_loss = loss_seq.mean()
-        
-        optimizer.zero_grad()
-        (task_loss + act_loss).backward()
-        optimizer.step()
-        
-        if epoch % 20 == 0:
-            print(f"PLSD-Epoch {epoch} | Task Loss: {task_loss.item():.4f} | ACT Loss: {act_loss.item():.4f}")
+        for i in range(0, num_samples, batch_size):
+            batch_idx = indices[i:i+batch_size]
+            inputs = inputs_all[batch_idx]
+            memories = memories_all[batch_idx]
+            targets = targets_all[batch_idx]
+            steps_req = steps_req_all[batch_idx]
+            
+            def closure():
+                optimizer.zero_grad()
+                m_keys_emb, m_vals_emb = model.get_memory_embeddings(memories)
+                h = model.norm(model.embed(inputs))
+                
+                loss_seq = []
+                h_seq = []
+                
+                for t in range(max_steps):
+                    h, logits = model.forward_step(h, m_keys_emb, m_vals_emb)
+                    
+                    mask = (t + 1 == steps_req).float()
+                    base_loss = F.cross_entropy(logits, targets, reduction='none')
+                    # 仅在 steps_req 处提供真实梯度，其余步长 detach 以防止干扰
+                    loss = base_loss * mask + (1 - mask) * base_loss.detach()
+                    
+                    if overthink_penalty:
+                        # 惩罚项权重随训练进程逐渐增加，防止初期坍缩
+                        penalty_weight = min(1.0, epoch / 50.0)
+                        overstep = (t + 1 - steps_req).clamp(min=0).float()
+                        loss = loss + penalty_weight * overstep
+                        
+                    loss_seq.append(loss)
+                    h_seq.append(h)
+                    
+                loss_seq_stack = torch.stack(loss_seq, dim=1)
+                h_seq_stack = torch.stack(h_seq, dim=1)
+                
+                # Oracle 步长：在模型尚未学会任务时，强制 Oracle 为 steps_req
+                # 只有当模型在某一步的 base_loss 足够低时，才允许 argmin 自由发挥
+                oracle_steps = torch.argmin(loss_seq_stack, dim=1)
+                
+                batch_indices = torch.arange(max_steps, device=device).expand(inputs.size(0), max_steps)
+                targets_act_halt = (batch_indices >= oracle_steps.unsqueeze(1)).float()
+                targets_act_cont = (batch_indices < oracle_steps.unsqueeze(1)).float()
+                
+                halt_logits = model.halt_head(h_seq_stack)
+                act_loss = F.binary_cross_entropy_with_logits(halt_logits[:, :, 0], targets_act_halt)
+                act_loss += F.binary_cross_entropy_with_logits(halt_logits[:, :, 1], targets_act_cont)
+                
+                # 任务损失仅计算 steps_req 处的
+                task_loss = (loss_seq_stack * (batch_indices + 1 == steps_req.unsqueeze(1)).float()).sum() / inputs.size(0)
+                
+                return (task_loss + 0.5 * act_loss)
+            
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            loss_val = optimizer.step(closure)
+            epoch_loss += loss_val.item()
+            
+        if epoch % 10 == 0:
+            print(f"PLSD-Robust Epoch {epoch} | Avg Loss: {epoch_loss / (num_samples/batch_size):.4f} | Phi: {optimizer.diagnostics['phi_t']:.4f}")
 
 # ==========================================
 # 4. 评估与对比
 # ==========================================
 
-def evaluate(model, data, mode="q", max_steps=8, lambda_val=0.5):
-    inputs, memories, targets, steps_req = data
+def evaluate_robust(model, data, mode="q", max_steps=8, lambda_val=0.5):
+    device = next(model.parameters()).device
+    inputs, memories, targets, steps_req = [d.to(device) for d in data]
     model.eval()
     
-    correct = 0
-    total_steps = 0
-    
     with torch.no_grad():
-        m_context = model.encode_memory(memories)
-        h = model.embed(inputs)
+        m_keys_emb, m_vals_emb = model.get_memory_embeddings(memories)
+        h = model.norm(model.embed(inputs))
         
-        active_mask = torch.ones(inputs.size(0), dtype=torch.bool)
-        exit_steps = torch.full((inputs.size(0),), max_steps, dtype=torch.long)
-        final_preds = torch.zeros(inputs.size(0), dtype=torch.long)
+        active_mask = torch.ones(inputs.size(0), dtype=torch.bool, device=device)
+        exit_steps = torch.full((inputs.size(0),), max_steps, dtype=torch.long, device=device)
+        final_preds = torch.zeros(inputs.size(0), dtype=torch.long, device=device)
         
         for t in range(max_steps):
             if not active_mask.any(): break
             
-            h_next, logits = model.forward_step(h, m_context)
+            h_next, logits = model.forward_step(h, m_keys_emb, m_vals_emb)
             preds = torch.argmax(logits, dim=-1)
             
             if mode == "q":
-                q_vals = model.q_head(h)
-                # Halt if Q(Halt) > Q(Continue)
-                halt_decision = q_vals[:, 0] > q_vals[:, 1]
+                q_logits = model.q_head(h)
+                halt_decision = q_logits[:, 0] > q_logits[:, 1]
             else:
-                halt_prob = torch.sigmoid(model.halt_head(h_next)).squeeze(-1)
-                halt_decision = halt_prob > lambda_val
+                halt_logits = model.halt_head(h_next)
+                halt_decision = halt_logits[:, 0] > halt_logits[:, 1]
             
-            # 记录刚停止的样本
             just_halted = active_mask & halt_decision
             exit_steps[just_halted] = t + 1
             final_preds[just_halted] = preds[just_halted]
@@ -233,39 +303,53 @@ def evaluate(model, data, mode="q", max_steps=8, lambda_val=0.5):
             
             h = h_next
             
-        # 对于跑满还没停的
         final_preds[active_mask] = torch.argmax(model.lm_head(h), dim=-1)[active_mask]
         
-        correct = (final_preds == targets).sum().item()
+        acc = (final_preds == targets).sum().item() / inputs.size(0)
         avg_steps = exit_steps.float().mean().item()
+        step_error = torch.abs(exit_steps - steps_req).float().mean().item()
         
-        # 计算 Oracle 对齐度 (MAE)
-        oracle_steps = steps_req # 在 RPC 任务中，steps_req 就是理论最优
-        step_error = torch.abs(exit_steps - oracle_steps).float().mean().item()
-        
-    return correct / inputs.size(0), avg_steps, step_error
+    return acc, avg_steps, step_error
 
 if __name__ == "__main__":
     torch.manual_seed(42)
-    dataset = RPCDataset(num_samples=2000)
+    MAX_STEPS = 8
+    OOD_STEPS = 12
+    VOCAB_SIZE = 64
+    D_MODEL = 128
+    
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+
+    dataset = RPCDataset(vocab_size=VOCAB_SIZE, num_samples=5000, max_steps=MAX_STEPS)
     train_data = dataset.generate_data()
     test_data = dataset.generate_data()
+    ood_data = dataset.generate_data(override_max_steps=OOD_STEPS)
     
-    print("--- Training QLearning-ACT (Discrete CE) ---")
-    model_q = RecursiveRPC()
-    train_qlearning(model_q, train_data)
+    print(f"--- Training Probabilistic Q-Learning (BCE) + ARS2-Neo [D={D_MODEL}] ---")
+    model_q = RecursiveRPC(vocab_size=VOCAB_SIZE, d_model=D_MODEL).to(device)
+    train_qlearning_prob(model_q, train_data, epochs=200, batch_size=256, max_steps=MAX_STEPS)
     
-    print("\n--- Training PLSD-ACT (Discrete CE) ---")
-    model_p = RecursiveRPC()
-    train_plsd(model_p, train_data)
+    print(f"\n--- Training PLSD (Overthink Penalty) + ARS2-Neo [D={D_MODEL}] ---")
+    model_p = RecursiveRPC(vocab_size=VOCAB_SIZE, d_model=D_MODEL).to(device)
+    train_plsd_robust(model_p, train_data, epochs=200, batch_size=256, max_steps=MAX_STEPS, overthink_penalty=True)
     
-    print("\n" + "="*30)
-    print("RESULTS COMPARISON (Discrete RPC Task)")
-    print("="*30)
+    print("\n" + "="*40)
+    print("RESULTS: IID (Steps <= 8)")
+    print("="*40)
     
-    q_acc, q_steps, q_err = evaluate(model_q, test_data, mode="q")
-    print(f"QLearning-ACT | Acc: {q_acc:.4f} | Avg Steps: {q_steps:.2f} | Step Error: {q_err:.2f}")
+    q_acc, q_steps, q_err = evaluate_robust(model_q, test_data, mode="q", max_steps=MAX_STEPS)
+    print(f"Q-Prob      | Acc: {q_acc:.4f} | Avg Steps: {q_steps:.2f} | Step Error: {q_err:.2f}")
     
-    for l in [0.3, 0.5, 0.7]:
-        p_acc, p_steps, p_err = evaluate(model_p, test_data, mode="p", lambda_val=l)
-        print(f"Better-PLSD (λ={l}) | Acc: {p_acc:.4f} | Avg Steps: {p_steps:.2f} | Step Error: {p_err:.2f}")
+    p_acc, p_steps, p_err = evaluate_robust(model_p, test_data, mode="p", max_steps=MAX_STEPS, lambda_val=0.5)
+    print(f"PLSD-Robust | Acc: {p_acc:.4f} | Avg Steps: {p_steps:.2f} | Step Error: {p_err:.2f}")
+    
+    print("\n" + "="*40)
+    print("RESULTS: OOD (Steps up to 12)")
+    print("="*40)
+    
+    q_acc_ood, q_steps_ood, q_err_ood = evaluate_robust(model_q, ood_data, mode="q", max_steps=OOD_STEPS)
+    print(f"Q-Prob      | Acc: {q_acc_ood:.4f} | Avg Steps: {q_steps_ood:.2f} | Step Error: {q_err_ood:.2f}")
+    
+    p_acc_ood, p_steps_ood, p_err_ood = evaluate_robust(model_p, ood_data, mode="p", max_steps=OOD_STEPS, lambda_val=0.5)
+    print(f"PLSD-Robust | Acc: {p_acc_ood:.4f} | Avg Steps: {p_steps_ood:.2f} | Step Error: {p_err_ood:.2f}")
