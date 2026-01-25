@@ -1,8 +1,10 @@
+import time
+from typing import Any
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import time
-from typing import Dict, List, Any, Optional
+
 
 class RoutingShaper:
     def __init__(self, w_meta: float = 0.5, cost_alpha: float = 0.5):
@@ -12,7 +14,7 @@ class RoutingShaper:
 
     def calculate_meta_loss(
         self,
-        routing_info: List[Dict[str, torch.Tensor]],
+        routing_info: list[dict[str, torch.Tensor]],
         model: nn.Module,
         optimizer: Any
     ) -> torch.Tensor:
@@ -22,7 +24,7 @@ class RoutingShaper:
         """
         start_time = time.perf_counter()
         meta_losses = []
-        
+
         # Pre-calculate expert-level Fisher costs
         module_costs = {}
         for name, module in model.named_modules():
@@ -38,15 +40,15 @@ class RoutingShaper:
                         # Average over all dims except the first (expert dim)
                         reduce_dims = list(range(1, v_t_sqrt.ndim))
                         p_expert_costs = v_t_sqrt.mean(dim=reduce_dims)
-                        
+
                         if expert_costs is None:
                             expert_costs = p_expert_costs
                         else:
                             expert_costs = expert_costs + p_expert_costs
-                
+
                 if expert_costs is not None:
                     module_costs[name] = expert_costs
-        
+
         # Debug: Verify mapping once
         if not hasattr(self, "_mapping_verified"):
             if module_costs:
@@ -59,7 +61,7 @@ class RoutingShaper:
                     # 1. SARS: Surprise-Aware (Entropy of the prior)
                     probs = F.softmax(logits, dim=-1)
                     entropy = -torch.sum(probs * torch.log(probs + 1e-9), dim=-1).mean()
-                    
+
                     # 2. FARS: Fisher-Aware (Expert-level cost)
                     prefix = f"layers.{i}."
                     if "q_logits" in key: module_name = prefix + "attn.q_experts"
@@ -67,13 +69,13 @@ class RoutingShaper:
                     elif "v_logits" in key: module_name = prefix + "attn.v_experts"
                     elif "mlp_logits" in key: module_name = prefix + "mlp.experts"
                     else: module_name = None
-                    
+
                     if module_name and module_name not in module_costs:
                         for m_name in module_costs:
                             if m_name.endswith(module_name.split('.')[-1]) and prefix in m_name:
                                 module_name = m_name
                                 break
-                    
+
                     expert_costs = module_costs.get(module_name)
                     if expert_costs is not None:
                         # expert_costs shape: [num_experts]
@@ -82,18 +84,18 @@ class RoutingShaper:
                         cost_fars = (probs * expert_costs).sum(dim=-1).mean()
                     else:
                         cost_fars = 0.0
-                    
+
                     meta_losses.append(entropy + self.cost_alpha * cost_fars)
-        
+
         if not meta_losses:
             res = torch.tensor(0.0, device=next(model.parameters()).device)
         else:
             res = torch.stack(meta_losses).mean() * self.w_meta
-            
+
         self.performance_stats['shaper_calc_time_ms'] = (time.perf_counter() - start_time) * 1000
         return res
 
-    def get_routing_diagnostics(self, routing_info: List[Dict[str, torch.Tensor]]) -> Dict[str, float]:
+    def get_routing_diagnostics(self, routing_info: list[dict[str, torch.Tensor]]) -> dict[str, float]:
         diagnostics = {}
         for i, layer_info in enumerate(routing_info):
             for key, logits in layer_info.items():

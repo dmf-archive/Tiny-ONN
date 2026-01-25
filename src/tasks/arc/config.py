@@ -1,5 +1,6 @@
 from dataclasses import dataclass, field
 
+
 @dataclass
 class GenerationConfig:
     use_dfs: bool = False

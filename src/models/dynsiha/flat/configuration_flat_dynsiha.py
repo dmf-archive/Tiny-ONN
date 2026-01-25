@@ -1,8 +1,9 @@
 from transformers import PretrainedConfig
 
+
 class FlatDynSIHAConfig(PretrainedConfig):
     model_type = "flat_dynsiha"
-    
+
     def __init__(
         self,
         vocab_size=16,

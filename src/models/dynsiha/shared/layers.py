@@ -1,15 +1,17 @@
+from dataclasses import dataclass
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional, Dict, Tuple, Union, List
-from .router import MLPRouter, VectorizedExpertMLP
 from transformers.cache_utils import Cache
 from transformers.modeling_outputs import CausalLMOutputWithPast
-from dataclasses import dataclass
+
+from .router import MLPRouter, VectorizedExpertMLP
+
 
 @dataclass
 class DynSIHACausalLMOutput(CausalLMOutputWithPast):
-    routing_info: Optional[List[Dict[str, torch.Tensor]]] = None
+    routing_info: list[dict[str, torch.Tensor]] | None = None
 
 class DynSIHARMSNorm(nn.Module):
     def __init__(self, hidden_size: int, eps: float = 1e-6):
@@ -69,7 +71,7 @@ class DynSIHAAttention(nn.Module):
         num_heads: int,
         num_experts: int,
         top_k: int,
-        layer_idx: Optional[int] = None,
+        layer_idx: int | None = None,
         dtype: torch.dtype = torch.float32
     ):
         super().__init__()
@@ -77,40 +79,40 @@ class DynSIHAAttention(nn.Module):
         self.num_heads = num_heads
         self.head_dim = hidden_size // num_heads
         self.layer_idx = layer_idx
-        
+
         self.q_router = MLPRouter(self.head_dim, num_experts, top_k, dtype=dtype)
         self.k_router = MLPRouter(self.head_dim, num_experts, top_k, dtype=dtype)
         self.v_router = MLPRouter(self.head_dim, num_experts, top_k, dtype=dtype)
-        
+
         self.q_experts = VectorizedExpertMLP(num_experts, self.head_dim, self.head_dim, dtype=dtype)
         self.k_experts = VectorizedExpertMLP(num_experts, self.head_dim, self.head_dim, dtype=dtype)
         self.v_experts = VectorizedExpertMLP(num_experts, self.head_dim, self.head_dim, dtype=dtype)
-        
+
         self.o_proj = nn.Linear(hidden_size, hidden_size, bias=False, dtype=dtype)
 
     def forward(
         self,
         x: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_value: Optional[Cache] = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_value: Cache | None = None,
         output_attentions: bool = False,
         use_cache: bool = False,
-        cache_position: Optional[torch.LongTensor] = None,
-        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-        layer_idx: Optional[int] = None,
-    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor], Optional[Cache]]:
+        cache_position: torch.LongTensor | None = None,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
+        layer_idx: int | None = None,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor], Cache | None]:
         B, T, C = x.shape
         x_heads = x.view(B, T, self.num_heads, self.head_dim)
-        
+
         qw, qe, ql = self.q_router(x_heads)
         kw, ke, kl = self.k_router(x_heads)
         vw, ve, vl = self.v_router(x_heads)
-        
+
         q = self.q_experts(x_heads, qw, qe).transpose(1, 2) # [B, num_heads, T, head_dim]
         k = self.k_experts(x_heads, kw, ke).transpose(1, 2)
         v = self.v_experts(x_heads, vw, ve).transpose(1, 2)
-        
+
         if position_embeddings is not None:
             cos, sin = position_embeddings
             q, k = apply_rotary_pos_emb(q, k, cos, sin, position_ids)
@@ -125,10 +127,10 @@ class DynSIHAAttention(nn.Module):
             attn_mask=attention_mask.bool() if attention_mask is not None else None,
             is_causal=True if attention_mask is None and q.shape[2] > 1 else False
         )
-        
+
         attn_output = attn_output.transpose(1, 2).contiguous().view(B, T, C)
         output = self.o_proj(attn_output)
-        
+
         routing_info = {"q_logits": ql, "k_logits": kl, "v_logits": vl}
         return output, routing_info, past_key_value
 
@@ -150,7 +152,7 @@ class DynSIHAMLP(nn.Module):
             dtype=dtype
         )
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         w, e, l = self.router(x)
         return self.experts(x, w, e), l
 
@@ -161,7 +163,7 @@ class DynSIHABlock(nn.Module):
         num_heads: int,
         num_experts: int,
         top_k: int,
-        layer_idx: Optional[int] = None,
+        layer_idx: int | None = None,
         ffn_scale: int = 4,
         rms_norm_eps: float = 1e-6,
         dtype: torch.dtype = torch.float32
@@ -175,15 +177,15 @@ class DynSIHABlock(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_value: Optional[Cache] = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_value: Cache | None = None,
         output_attentions: bool = False,
         use_cache: bool = False,
-        cache_position: Optional[torch.LongTensor] = None,
-        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-        layer_idx: Optional[int] = None,
-    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor], Optional[Cache]]:
+        cache_position: torch.LongTensor | None = None,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
+        layer_idx: int | None = None,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor], Cache | None]:
         attn_in = self.ln1(x)
         attn_out, attn_routing, past_key_value = self.attn(
             attn_in,
@@ -197,9 +199,9 @@ class DynSIHABlock(nn.Module):
             layer_idx=layer_idx
         )
         x = x + attn_out
-        
+
         mlp_in = self.ln2(x)
         mlp_out, mlp_routing = self.mlp(mlp_in)
         x = x + mlp_out
-        
+
         return x, {**attn_routing, "mlp_logits": mlp_routing}, past_key_value

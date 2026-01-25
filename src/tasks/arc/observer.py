@@ -1,11 +1,13 @@
-import torch
 import math
+from typing import Any
+
+import torch
 import torch.nn.functional as F
 from rich.console import Console
+from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
-from rich.panel import Panel
-from typing import Dict, Optional, Any
+
 
 class ARCObserver:
     ARC_COLORS = ["black", "blue", "red", "green", "yellow", "grey", "magenta", "orange", "cyan", "brown"]
@@ -35,13 +37,13 @@ class ARCObserver:
         loss: float,
         logits: torch.Tensor,
         labels: torch.Tensor,
-        optimizer_diagnostics: Dict[str, Any]
-    ) -> Dict[str, float]:
+        optimizer_diagnostics: dict[str, Any]
+    ) -> dict[str, float]:
         # Token Accuracy
         logits_acc = logits[:, :-1, :].contiguous()
         labels_acc = labels[:, 1:].contiguous()
         mask = labels_acc != -100
-        
+
         if mask.any():
             active_logits = logits_acc[mask]
             acc = (torch.argmax(active_logits, dim=-1) == labels_acc[mask]).float().mean().item()
@@ -50,11 +52,11 @@ class ARCObserver:
         else:
             acc = 0.0
             tau = 0.0
-            
+
         grad_norm = optimizer_diagnostics.get("grad_norm", 0.0)
         # PI: Predictive Integrity proxy
         pi = math.exp(-(loss + grad_norm))
-        
+
         return {
             "loss": loss,
             "token_acc": acc,
@@ -63,17 +65,17 @@ class ARCObserver:
             "grad_norm": grad_norm
         }
 
-    def log_metrics(self, metrics: Dict[str, Any], step: int, epoch: Optional[int] = None):
+    def log_metrics(self, metrics: dict[str, Any], step: int, epoch: int | None = None):
         prefix = f"[bold magenta]E{epoch} [/]" if epoch is not None else ""
         parts = [f"[bold cyan]S{step}[/]"]
-        
+
         # Priority metrics
         priority = ["loss", "token_acc", "pi", "grad_norm"]
         for k in priority:
             if k in metrics:
                 v = metrics[k]
                 parts.append(f"{k}: [green]{v:.4f}[/]")
-        
+
         # Other metrics
         for k, v in metrics.items():
             if k in priority or k == "epoch" or k == "step": continue
@@ -81,5 +83,5 @@ class ARCObserver:
                 parts.append(f"{k}: [blue]{v:.4f}[/]")
             elif isinstance(v, torch.Tensor) and v.numel() == 1:
                 parts.append(f"{k}: [blue]{v.item():.4f}[/]")
-                
+
         self.console.print(prefix + " | ".join(parts))

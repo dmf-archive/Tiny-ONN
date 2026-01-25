@@ -25,36 +25,9 @@ Tiny-ONN/
         └── ars2_neo.py        # SOTA 优化器：能量-几何解耦与 AGA 机制
 ```
 
-## 2. 系统架构与数据流
+## 2. 核心协议规范
 
-```mermaid
-graph TD
-    subgraph "实验入口 (exp/)"
-        Config[加载配置] --> Launch[启动脚本]
-    end
-
-    subgraph "任务逻辑层 (src/tasks/arc/)"
-        Launch --> Trainer[Trainer: 驱动训练循环]
-        Trainer --> Data[Data: 加载并增强数据]
-        Trainer --> Shaper[Shaper: 注入路由塑造逻辑]
-        Trainer --> Observer[Observer: 实时监控与可视化]
-    end
-
-    subgraph "纯粹模型层 (src/models/)"
-        Trainer -- "前向传播 (input_ids)" --> Model[Model: 纯净 nn.Module]
-        Model -- "返回 (logits, loss, routing_info)" --> Trainer
-    end
-
-    subgraph "优化算子层 (src/optimizers/)"
-        Trainer -- "闭包调用 (closure)" --> Optimizer[ARS2-Neo: 能量-几何解耦优化]
-        Optimizer -- "更新参数" --> Model
-        Shaper -- "获取 Fisher 信息 (v_t)" --> Optimizer
-    end
-```
-
-## 3. 核心协议规范
-
-### 3.1 模型协议 (Model Protocol)
+### 2.1 模型协议 (Model Protocol)
 
 - [x] **纯粹性**: 模型必须是标准的 `nn.Module`，严禁依赖特定的训练器状态或全局变量。
 - [x] **元数据暴露**: 动态路由模型必须通过 `return_dict` 模式暴露 `routing_logits` 或 `routing_info`。
@@ -62,13 +35,13 @@ graph TD
 - [ ] **内生 ASI**: 模型应集成基于 Surrogate Gap 的自适应调度 (Active Sharpening Inference) 作为默认特性。
 - [ ] **FARS 支持**: 模型应可选地暴露 `active_features` 以支持精确的梯度计算。
 
-### 3.2 路由塑造器 (RoutingShaper)
+### 2.2 路由塑造器 (RoutingShaper)
 
 - [x] **职责分离**: 负责计算 `meta_loss` (FARS/SARS) 和路由相关的诊断指标（如专家利用率、熵）。
 - [ ] **非侵入式注入**: 通过 `shaper.wrap_model(model)` 注入必要的 hooks，严禁修改模型主干代码。
 - [x] **优化器协同**: 允许访问优化器的 `state_dict`（特别是 Adam 的二阶矩 `v_t`）以实现无量纲的 FARS 成本计算。
 
-### 3.3 训练与优化规范
+### 2.3 训练与优化规范
 
 - [x] **优化器锁定**: 默认锁定使用 **ARS2-Neo**，充分利用其测地线滑行与平坦度约束能力。
 - [x] **原子重塑**: 训练脚本必须支持 `optimizer.step(closure)` 模式，确保 SAM 扰动逻辑的正确执行。

@@ -1,8 +1,10 @@
 import torch
+
 from src.models.dynsiha.flat.configuration_flat_dynsiha import FlatDynSIHAConfig
 from src.models.dynsiha.flat.modeling_flat_dynsiha import FlatDynSIHAForCausalLM
-from src.tasks.arc.config import TrainConfig, ModelConfig
+from src.tasks.arc.config import ModelConfig, TrainConfig
 from src.tasks.arc.trainer import ARCTrainer
+
 
 def main():
     # 1. Setup Config

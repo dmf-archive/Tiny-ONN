@@ -1,15 +1,16 @@
+import time
+from pathlib import Path
+
 import torch
 import torch.nn as nn
-import time
-import os
-from typing import Dict, Any, Optional, List
-from pathlib import Path
-from .config import TrainConfig
-from .data import get_arc_dataloader, ARCTokenizer, ARCProcessor
-from .observer import ARCObserver
-from .evaluator import ArcEvaluator
-from .shaper import RoutingShaper
+
 from ...optimizers.ars2_neo import SingleDeviceARS2Neo
+from .config import TrainConfig
+from .data import ARCProcessor, ARCTokenizer, get_arc_dataloader
+from .evaluator import ArcEvaluator
+from .observer import ARCObserver
+from .shaper import RoutingShaper
+
 
 class ARCTrainer:
     def __init__(self, model: nn.Module, config: TrainConfig):
@@ -17,7 +18,7 @@ class ARCTrainer:
         self.config = config
         self.device = torch.device(config.device)
         self.model.to(self.device)
-        
+
         self.tokenizer = ARCTokenizer()
         self.processor = ARCProcessor(self.tokenizer)
         self.observer = ARCObserver()
@@ -29,10 +30,10 @@ class ARCTrainer:
             device=config.device
         )
         self.shaper = RoutingShaper(w_meta=config.w_meta, cost_alpha=config.cost_alpha)
-        
+
         self.train_loader = get_arc_dataloader(config.data_dir, config.batch_size, split="training")
         self.eval_loader = get_arc_dataloader(config.data_dir, 1, split="evaluation")
-        
+
         self.optimizer = self._setup_optimizer()
         self.global_step = 0
         self.start_epoch = 0
@@ -40,7 +41,7 @@ class ARCTrainer:
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         self.last_routing_diagnostics = {}
         self.performance_stats = {}
-        
+
         if config.resume_from_checkpoint:
             self.load_checkpoint(config.resume_from_checkpoint)
 
@@ -53,12 +54,12 @@ class ARCTrainer:
                     ars2_params.append(p)
                 else:
                     adamw_params.append(p)
-        
+
         param_groups = [
             {"params": ars2_params, "is_rmsuon_group": True},
             {"params": adamw_params, "is_rmsuon_group": False}
         ]
-        
+
         return SingleDeviceARS2Neo(
             param_groups,
             lr=self.config.lr,
@@ -68,7 +69,7 @@ class ARCTrainer:
             adaptive_sync=self.config.adaptive_sync
         )
 
-    def train_step(self, batch: Dict[str, torch.Tensor]) -> float:
+    def train_step(self, batch: dict[str, torch.Tensor]) -> float:
         start_time = time.perf_counter()
         self.model.train()
         input_ids = batch["input_ids"].to(self.device)
@@ -76,13 +77,13 @@ class ARCTrainer:
         diff_mask = batch.get("diff_mask")
         if diff_mask is not None:
             diff_mask = diff_mask.to(self.device)
-        
+
         last_outputs = {}
 
         def closure():
             self.optimizer.zero_grad()
             outputs = self.model(input_ids, labels=labels, diff_mask=diff_mask)
-            
+
             if isinstance(outputs, dict):
                 main_loss = outputs["loss"]
                 routing_info = outputs.get("routing_info")
@@ -93,7 +94,7 @@ class ARCTrainer:
                 logits = getattr(outputs, "logits", None)
             else:
                 raise ValueError(f"Unsupported model output type: {type(outputs)}")
-            
+
             last_outputs['logits'] = logits.detach() if logits is not None else None
 
             if routing_info:
@@ -108,12 +109,12 @@ class ARCTrainer:
             else:
                 total_loss = main_loss
                 self.last_routing_diagnostics = {}
-                
+
             return total_loss
 
         loss = self.optimizer.step(closure)
         self.global_step += 1
-        
+
         # Calculate metrics using observer
         if last_outputs.get('logits') is not None:
             step_metrics = self.observer.calculate_metrics(
@@ -127,7 +128,7 @@ class ARCTrainer:
         self.performance_stats['step_ms'] = (time.perf_counter() - start_time) * 1000
         if self.device.type == 'cuda':
             self.performance_stats['gpu_mem_mb'] = torch.cuda.memory_allocated(self.device) / 1024**2
-            
+
         return loss.item()
 
     @torch.no_grad()
@@ -135,7 +136,7 @@ class ARCTrainer:
         self.model.eval()
         total_correct = 0
         num_tasks = min(len(self.eval_loader), 10)
-        
+
         dataset = self.eval_loader.dataset
         for i in range(num_tasks):
             task_data = dataset.tasks[i]
@@ -144,7 +145,7 @@ class ARCTrainer:
             is_correct = self.evaluator.evaluate_task(task_data, self.config.generation, visualize=visualize)
             if is_correct:
                 total_correct += 1
-        
+
         accuracy = total_correct / num_tasks
         self.observer.log_metrics({"eval_accuracy": accuracy}, step=self.global_step)
         return accuracy
@@ -175,7 +176,7 @@ class ARCTrainer:
             for step, batch in enumerate(self.train_loader):
                 loss = self.train_step(batch)
                 epoch_loss += loss
-                
+
                 # 1. Log metrics
                 if self.global_step % 10 == 0:
                     self.observer.log_metrics(
@@ -188,19 +189,19 @@ class ARCTrainer:
                         step=self.global_step,
                         epoch=epoch
                     )
-                
+
                 # 2. Step-based Evaluation
                 if self.global_step > 0 and self.global_step % self.config.eval_steps == 0:
                     self.evaluate()
-                
+
                 # 3. Step-based Checkpointing
                 if self.global_step > 0 and self.global_step % self.config.save_steps == 0:
                     self.save_checkpoint(epoch, step)
-            
+
             # End of epoch
             avg_loss = epoch_loss / len(self.train_loader)
             self.observer.log_metrics({"avg_epoch_loss": avg_loss}, step=self.global_step, epoch=epoch)
-            
+
             # Always evaluate and save at end of epoch
             self.evaluate()
             self.save_checkpoint(epoch, len(self.train_loader))

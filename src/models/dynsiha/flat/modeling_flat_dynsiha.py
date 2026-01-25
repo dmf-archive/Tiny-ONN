@@ -1,23 +1,24 @@
+from dataclasses import dataclass
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from dataclasses import dataclass
-from transformers import PreTrainedModel, GenerationMixin
-from transformers.modeling_outputs import CausalLMOutputWithPast
-from transformers.utils import ModelOutput
+from transformers import GenerationMixin, PreTrainedModel
 from transformers.cache_utils import Cache, DynamicCache
-from typing import Optional, Union, Dict, Any, List, Tuple
+from transformers.utils import ModelOutput
+
+from ..shared.layers import DynSIHABlock, DynSIHARMSNorm, DynSIHARotaryEmbedding
 from .configuration_flat_dynsiha import FlatDynSIHAConfig
-from ..shared.layers import DynSIHABlock, DynSIHARotaryEmbedding, DynSIHARMSNorm
+
 
 @dataclass
 class FlatDynSIHAOutput(ModelOutput):
-    loss: Optional[torch.FloatTensor] = None
+    loss: torch.FloatTensor | None = None
     logits: torch.FloatTensor = None
-    past_key_values: Optional[Tuple[Tuple[torch.FloatTensor]]] = None
-    hidden_states: Optional[Tuple[torch.FloatTensor]] = None
-    attentions: Optional[Tuple[torch.FloatTensor]] = None
-    routing_info: Optional[List[Dict[str, torch.Tensor]]] = None
+    past_key_values: tuple[tuple[torch.FloatTensor]] | None = None
+    hidden_states: tuple[torch.FloatTensor] | None = None
+    attentions: tuple[torch.FloatTensor] | None = None
+    routing_info: list[dict[str, torch.Tensor]] | None = None
 
 class FlatDynSIHAPreTrainedModel(PreTrainedModel):
     config_class = FlatDynSIHAConfig
@@ -68,18 +69,18 @@ class FlatDynSIHAForCausalLM(FlatDynSIHAPreTrainedModel, GenerationMixin):
     def forward(
         self,
         input_ids: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.Tensor] = None,
-        past_key_values: Optional[Union[Cache, List[torch.FloatTensor]]] = None,
-        labels: Optional[torch.Tensor] = None,
-        diff_mask: Optional[torch.Tensor] = None,
-        use_cache: Optional[bool] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
+        past_key_values: Cache | list[torch.FloatTensor] | None = None,
+        labels: torch.Tensor | None = None,
+        diff_mask: torch.Tensor | None = None,
+        use_cache: bool | None = None,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
         return_dict: bool = True,
-        cache_position: Optional[torch.LongTensor] = None,
+        cache_position: torch.LongTensor | None = None,
         **kwargs
-    ) -> Union[FlatDynSIHAOutput, Tuple[torch.Tensor, List[Dict[str, torch.Tensor]]]]:
+    ) -> FlatDynSIHAOutput | tuple[torch.Tensor, list[dict[str, torch.Tensor]]]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -117,13 +118,13 @@ class FlatDynSIHAForCausalLM(FlatDynSIHAPreTrainedModel, GenerationMixin):
 
         all_routing_info = []
         all_hidden_states = () if output_hidden_states else None
-        
+
         for layer in self.layers:
             if output_hidden_states:
                 all_hidden_states += (x,)
-                
+
             x, routing_info, past_key_values = layer(
-                x, 
+                x,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
                 past_key_value=past_key_values,
@@ -133,38 +134,40 @@ class FlatDynSIHAForCausalLM(FlatDynSIHAPreTrainedModel, GenerationMixin):
                 position_embeddings=position_embeddings
             )
             all_routing_info.append(routing_info)
-            
+
         x = self.ln_f(x)
-        
+
         if output_hidden_states:
             all_hidden_states += (x,)
-            
+
         logits = self.lm_head(x)
-        
+
         loss = None
         if labels is not None:
-            main_loss = F.cross_entropy(logits.view(-1, self.config.vocab_size), labels.view(-1))
-            
+            # Standard Causal LM shift
+            shifted_logits = logits[..., :-1, :].contiguous()
+            shifted_labels = labels[..., 1:].contiguous()
+
+            main_loss = F.cross_entropy(shifted_logits.view(-1, self.config.vocab_size), shifted_labels.view(-1))
+
             if diff_mask is not None:
-                shifted_logits = logits[..., :-1, :].contiguous()
-                shifted_labels = labels[..., 1:].contiguous()
                 shifted_diff_mask = diff_mask[..., 1:].contiguous()
-                
+
                 diff_labels = torch.where(shifted_diff_mask.bool(), shifted_labels, -100)
                 diff_loss = F.cross_entropy(shifted_logits.view(-1, self.config.vocab_size), diff_labels.view(-1))
-                
+
                 if torch.isnan(diff_loss):
                     diff_loss = torch.tensor(0.0, device=main_loss.device)
-                
+
                 num_diff = shifted_diff_mask.sum()
                 num_total = (shifted_labels != -100).sum()
                 num_identity = num_total - num_diff
-                
+
                 lambda_adaptive = (num_identity / (num_diff + 1e-6)).clamp(max=100.0)
                 loss = main_loss + lambda_adaptive * diff_loss
             else:
                 loss = main_loss
-            
+
         if not return_dict:
             output = (logits,) + (all_routing_info,)
             return ((loss,) + output) if loss is not None else output
@@ -179,12 +182,12 @@ class FlatDynSIHAForCausalLM(FlatDynSIHAPreTrainedModel, GenerationMixin):
         )
 
     def prepare_inputs_for_generation(
-        self, 
-        input_ids, 
-        past_key_values=None, 
-        attention_mask=None, 
-        inputs_embeds=None, 
-        cache_position=None, 
+        self,
+        input_ids,
+        past_key_values=None,
+        attention_mask=None,
+        inputs_embeds=None,
+        cache_position=None,
         **kwargs
     ):
         # If we have past_key_values, we only need the last token
@@ -209,7 +212,7 @@ class FlatDynSIHAForCausalLM(FlatDynSIHAPreTrainedModel, GenerationMixin):
                 past_seen_tokens, past_seen_tokens + input_ids.shape[1], device=input_ids.device
             )
 
-        position_ids = kwargs.get("position_ids", None)
+        position_ids = kwargs.get("position_ids")
         if attention_mask is not None and position_ids is None:
             position_ids = cache_position.unsqueeze(0)
 

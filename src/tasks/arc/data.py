@@ -1,11 +1,11 @@
 import json
 import random
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Any
 
 import torch
-import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset
+
 
 class ARCTokenizer:
     def __init__(self):
@@ -53,26 +53,26 @@ class ARCProcessor:
                 break
         if current_row:
             rows.append(current_row)
-        
+
         if not rows:
             return torch.zeros((0, 0), dtype=torch.long)
-        
+
         # Handle potential ragged rows by padding or truncating to first row width
         width = len(rows[0])
         valid_rows = [r[:width] + [0]*(width-len(r)) for r in rows]
         return torch.tensor(valid_rows, dtype=torch.long)
 
-    def serialize_for_inference(self, task: Dict[str, Any]) -> torch.Tensor:
+    def serialize_for_inference(self, task: dict[str, Any]) -> torch.Tensor:
         all_ids = [torch.tensor([self.tokenizer.bos_id])]
-        
+
         for pair in task["train"]:
             in_grid = torch.tensor(pair["input"], dtype=torch.long)
             out_grid = torch.tensor(pair["output"], dtype=torch.long)
-            
+
             all_ids.append(torch.tensor([self.tokenizer.im_start_id]))
             all_ids.append(self.encode_grid(in_grid))
             all_ids.append(torch.tensor([self.tokenizer.im_end_id]))
-            
+
             all_ids.append(torch.tensor([self.tokenizer.im_start_id]))
             all_ids.append(self.encode_grid(out_grid))
             all_ids.append(torch.tensor([self.tokenizer.im_end_id]))
@@ -83,7 +83,7 @@ class ARCProcessor:
         all_ids.append(self.encode_grid(test_in))
         all_ids.append(torch.tensor([self.tokenizer.im_end_id]))
         all_ids.append(torch.tensor([self.tokenizer.im_start_id])) # Prompt for output
-        
+
         return torch.cat(all_ids)
 
 class ARCDataset(Dataset):
@@ -101,7 +101,7 @@ class ARCDataset(Dataset):
         self.max_seq_len = max_seq_len
         self.augment = augment
         self.h1_all_predict = h1_all_predict
-        
+
         self.tasks = []
         for p in sorted(self.data_path.glob("*.json")):
             with open(p) as f:
@@ -110,30 +110,30 @@ class ARCDataset(Dataset):
     def __len__(self) -> int:
         return len(self.tasks)
 
-    def _apply_augment(self, grid: torch.Tensor, flip_dim: Optional[int], rot_k: int, color_perm: torch.Tensor) -> torch.Tensor:
+    def _apply_augment(self, grid: torch.Tensor, flip_dim: int | None, rot_k: int, color_perm: torch.Tensor) -> torch.Tensor:
         if flip_dim is not None:
             grid = torch.flip(grid, dims=[flip_dim])
         if rot_k > 0:
             grid = torch.rot90(grid, k=rot_k, dims=[0, 1])
-        
+
         # Vectorized color mapping
         mask = (grid >= 0) & (grid <= 9)
         grid[mask] = color_perm[grid[mask]]
         return grid
 
-    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+    def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
         task = self.tasks[idx]
-        
+
         # Generate augmentation params
         color_perm = torch.arange(10)
         flip_dim = None
         rot_k = 0
-        
+
         if self.augment:
             # 1. Color Permutation (excluding background 0 often helps, but ARC allows all)
             if random.random() > 0.5:
                 color_perm = torch.randperm(10)
-            
+
             # 2. Geometric Symmetry (D4 Group: 8 symmetries)
             flip_dim = random.choice([None, 0, 1])
             rot_k = random.randint(0, 3)
@@ -142,29 +142,29 @@ class ARCDataset(Dataset):
         all_labels = [torch.tensor([-100])]
         all_diff_masks = [torch.tensor([0.0])]
 
-        def process_pair(pair: Dict[str, Any], is_test: bool):
+        def process_pair(pair: dict[str, Any], is_test: bool):
             in_grid = torch.tensor(pair["input"], dtype=torch.long)
             out_grid = torch.tensor(pair["output"], dtype=torch.long) if "output" in pair else None
-            
+
             in_grid = self._apply_augment(in_grid, flip_dim, rot_k, color_perm)
             in_tokens = self.processor.encode_grid(in_grid)
-            
+
             # Input block
             all_ids.append(torch.tensor([self.tokenizer.im_start_id]))
             all_ids.append(in_tokens)
             all_ids.append(torch.tensor([self.tokenizer.im_end_id]))
-            
+
             all_labels.append(torch.tensor([-100] * (len(in_tokens) + 2)))
             all_diff_masks.append(torch.tensor([0.0] * (len(in_tokens) + 2)))
 
             if out_grid is not None:
                 out_grid = self._apply_augment(out_grid, flip_dim, rot_k, color_perm)
                 out_tokens = self.processor.encode_grid(out_grid)
-                
+
                 all_ids.append(torch.tensor([self.tokenizer.im_start_id]))
                 all_ids.append(out_tokens)
                 all_ids.append(torch.tensor([self.tokenizer.im_end_id]))
-                
+
                 # H1: All Predict logic
                 if is_test or self.h1_all_predict:
                     all_labels.append(torch.tensor([-100]))
@@ -186,7 +186,7 @@ class ARCDataset(Dataset):
                         d_mask[1:-1] = 1.0 # Length change implies total innovation
                 else:
                     d_mask[1:-1] = 1.0 # Shape change implies total innovation
-                
+
                 all_diff_masks.append(d_mask)
 
         for pair in task["train"]:
@@ -232,57 +232,57 @@ class PackedARCDataLoader:
                 "data": sample,
                 "len": len(sample["input_ids"])
             })
-        
+
         if self.shuffle:
             random.shuffle(samples)
-            
+
         # FFD: First Fit Decreasing
         samples.sort(key=lambda x: x["len"], reverse=True)
-        
+
         batches = []
         current_batch = []
         current_tokens = 0
-        
+
         for s in samples:
             if current_tokens + s["len"] > self.max_tokens and current_batch:
                 batches.append(self._collate(current_batch))
                 current_batch = []
                 current_tokens = 0
-            
+
             current_batch.append(s["data"])
             current_tokens += s["len"]
-            
+
         if current_batch:
             batches.append(self._collate(current_batch))
-            
+
         if self.shuffle:
             random.shuffle(batches)
-            
+
         for b in batches:
             yield b
 
     def __len__(self):
         return len(self.dataset) // 4 # Rough estimate for progress bars
 
-    def _collate(self, batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
+    def _collate(self, batch: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
         input_ids = [s["input_ids"] for s in batch]
         labels = [s["labels"] for s in batch]
         diff_masks = [s["diff_mask"] for s in batch]
-        
+
         max_len = max(len(x) for x in input_ids)
-        
+
         padded_input_ids = []
         padded_labels = []
         padded_diff_masks = []
         attention_masks = []
-        
+
         for ids, lbls, dms in zip(input_ids, labels, diff_masks):
             pad_len = max_len - len(ids)
             padded_input_ids.append(torch.cat([ids, torch.full((pad_len,), self.tokenizer.pad_id)]))
             padded_labels.append(torch.cat([lbls, torch.full((pad_len,), -100)]))
             padded_diff_masks.append(torch.cat([dms, torch.zeros(pad_len)]))
             attention_masks.append(torch.cat([torch.ones(len(ids)), torch.zeros(pad_len)]))
-            
+
         return {
             "input_ids": torch.stack(padded_input_ids),
             "labels": torch.stack(padded_labels),

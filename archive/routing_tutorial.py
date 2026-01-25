@@ -1,9 +1,8 @@
-import math
 import time
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Tuple, List, Dict
 
 """
 Tiny-ONN Routing Expressiveness & Evolution Tutorial
@@ -119,18 +118,18 @@ class TrLocalRouter(nn.Module):
 def generate_benchmark_data(b, d, n):
     torch.manual_seed(42)
     x = torch.randn(b, d)
-    
+
     # Task 1: Linear Rule
     w_true = torch.randn(d, n)
     y_linear = (x @ w_true).argmax(-1)
-    
+
     # Task 2: XOR Rule (Tests non-linear logic)
     y_xor = (torch.sum(x[:, :4] > 0, dim=-1) % n).long()
-    
+
     # Task 3: Proto Rule (Tests clustering)
     centroids = torch.randn(n, d)
     y_proto = torch.cdist(x, centroids).argmin(-1)
-    
+
     # Task 4: V5 Complex Rule (XOR + Conditional + Manifold)
     y_complex = torch.zeros(b, dtype=torch.long)
     for i in range(b):
@@ -142,7 +141,7 @@ def generate_benchmark_data(b, d, n):
             y_complex[i] = 2
         else:
             y_complex[i] = 3
-            
+
     return x, {
         "Linear": y_linear,
         "XOR": y_xor,
@@ -155,25 +154,25 @@ def generate_benchmark_data(b, d, n):
 def run_eval(name, model, x, y, epochs=1000):
     optimizer = torch.optim.AdamW(model.parameters(), lr=2e-3)
     start_cpu = time.process_time()
-    
+
     for e in range(epochs):
         optimizer.zero_grad()
         logits = model(x)
         loss = F.cross_entropy(logits, y)
-        
+
         # 引入熵正则化以保证路由决策的确定性
         probs = F.softmax(logits, dim=-1)
         entropy = -torch.sum(probs * torch.log(probs + 1e-9), dim=-1).mean()
-        
+
         (loss + 0.05 * entropy).backward()
         optimizer.step()
-        
+
         if (e + 1) % 100 == 0:
             acc = (logits.argmax(-1) == y).float().mean().item()
             if acc > 0.99: break
-            
+
     duration = (time.process_time() - start_cpu) * 1000
-    
+
     # 归因分析 (Interpretability Analysis)
     model.eval()
     x_test = x[:512].detach().clone()
@@ -181,19 +180,19 @@ def run_eval(name, model, x, y, epochs=1000):
     logits_test = model(x_test)
     loss_test = F.cross_entropy(logits_test, y[:512])
     loss_test.backward()
-    
+
     # 计算显著性 (Saliency)
     saliency = x_test.grad.abs().mean(dim=0)
     # 在 Complex 任务中，前 7 维是语义相关的
     snr = saliency[:7].mean() / (saliency[7:].mean() + 1e-9)
-    
+
     final_acc = (logits_test.argmax(-1) == y[:512]).float().mean().item()
     return final_acc, duration, snr.item()
 
 def benchmark():
     B, D, N = 2048, 16, 4
     x, tasks = generate_benchmark_data(B, D, N)
-    
+
     configs = [
         ("Linear", lambda: LinearRouter(D, N)),
         ("CPR", lambda: CPRRouter(D, N)),
@@ -202,10 +201,10 @@ def benchmark():
         ("Gated-MLP", lambda: GatedMLPRouter(D, N)),
         ("Tr-Local", lambda: TrLocalRouter(D, N))
     ]
-    
+
     print(f"{'Router':<10} | {'Task':<10} | {'Acc':<6} | {'SNR':<6} | {'Time (ms)':<10}")
     print("-" * 55)
-    
+
     for r_name, r_factory in configs:
         for t_name, y in tasks.items():
             acc, dur, snr = run_eval(r_name, r_factory(), x, y)
