@@ -9,6 +9,7 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from ..shared.layers import DynSIHABlock, DynSIHARMSNorm, DynSIHARotaryEmbedding
 from .configuration_recursive_dynsiha import RecursiveDynSIHAConfig
+import torch.utils.checkpoint as cp
 
 
 @dataclass
@@ -16,6 +17,7 @@ class RecursiveDynSIHAOutput(CausalLMOutputWithPast):
     routing_info: list[dict[str, torch.Tensor]] | None = None
     exit_steps: torch.LongTensor | None = None
     all_step_losses: torch.Tensor | None = None
+    best_step_mask: torch.Tensor | None = None  # [B, T] 仅神谕步为 True
 
 class RecursiveDynSIHAPreTrainedModel(PreTrainedModel):
     config_class = RecursiveDynSIHAConfig
@@ -54,6 +56,7 @@ class RecursiveDynSIHAForCausalLM(RecursiveDynSIHAPreTrainedModel, GenerationMix
         self.halt_head = nn.Linear(config.hidden_size, 1)
         self.ln_f = DynSIHARMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.gradient_checkpointing = False
         self.post_init()
 
     def get_input_embeddings(self): return self.embedding
@@ -75,7 +78,11 @@ class RecursiveDynSIHAForCausalLM(RecursiveDynSIHAPreTrainedModel, GenerationMix
         cache_position: torch.LongTensor | None = None,
         **kwargs
     ) -> CausalLMOutputWithPast | tuple[torch.Tensor, list[dict[str, torch.Tensor]]]:
-        use_cache = use_cache if use_cache is not None else self.config.use_cache
+        # 训练期间强制禁用 KV Cache 以节省显存并简化 Checkpointing 逻辑
+        if self.training:
+            use_cache = False
+        else:
+            use_cache = use_cache if use_cache is not None else self.config.use_cache
 
         if input_ids is not None:
             batch_size, seq_length = input_ids.shape
@@ -110,23 +117,37 @@ class RecursiveDynSIHAForCausalLM(RecursiveDynSIHAPreTrainedModel, GenerationMix
         # We share the same block but treat each step as a virtual layer for KV Cache
         max_steps = self.config.max_refinement_steps if self.training else self.config.max_inference_steps
 
-        for step in range(max_steps):
-            actual_steps = step + 1
-            x, routing_info, past_key_values = self.block(
-                x,
+        def step_fn(step_input, step_idx, pkv):
+            h, r_info, new_pkv = self.block(
+                step_input,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
-                past_key_value=past_key_values,
+                past_key_value=pkv,
                 output_attentions=output_attentions,
                 use_cache=use_cache,
                 cache_position=cache_position,
                 position_embeddings=position_embeddings,
-                layer_idx=step # Override layer_idx for recursive cache
+                layer_idx=step_idx
             )
+            # Checkpoint 必须返回 Tensor 元组。我们将 dict 展开。
+            return h, r_info["q_logits"], r_info["k_logits"], r_info["v_logits"], r_info["mlp_logits"]
+
+        for step in range(max_steps):
+            actual_steps = step + 1
+            if self.training and self.gradient_checkpointing:
+                x, ql, kl, vl, mlpl = cp.checkpoint(
+                    step_fn, x, step, None, use_reentrant=False
+                )
+                routing_info = {"q_logits": ql, "k_logits": kl, "v_logits": vl, "mlp_logits": mlpl}
+                past_key_values = None # 训练期禁用 KV Cache
+            else:
+                x, ql, kl, vl, mlpl = step_fn(x, step, past_key_values)
+                routing_info = {"q_logits": ql, "k_logits": kl, "v_logits": vl, "mlp_logits": mlpl}
+            
             all_routing_info.append(routing_info)
 
             # ACT: Halt prediction
-            halt_step_logits = self.halt_head(x) # [B, T, 1]
+            halt_step_logits = self.halt_head(x)  # [B, T, 1]
             all_halt_logits.append(halt_step_logits)
 
             if labels is not None:
@@ -134,20 +155,19 @@ class RecursiveDynSIHAForCausalLM(RecursiveDynSIHAPreTrainedModel, GenerationMix
                 inter_x = self.ln_f(x)
                 inter_logits = self.lm_head(inter_x)
 
-                # Standard Causal LM shift for each step
                 shifted_logits = inter_logits[..., :-1, :].contiguous()
                 shifted_labels = labels[..., 1:].contiguous()
-
-                # Use reduction='none' to get per-token loss for more precise ACT
-                step_loss = F.cross_entropy(shifted_logits.view(-1, self.config.vocab_size), shifted_labels.view(-1), reduction='none')
-                # Reconstruct batch/seq dimensions to mean over sequence
-                step_losses.append(step_loss.view(batch_size, seq_length - 1).mean(dim=-1)) # [B]
+                step_loss = F.cross_entropy(
+                    shifted_logits.view(-1, self.config.vocab_size),
+                    shifted_labels.view(-1),
+                    reduction='none'
+                )
+                step_losses.append(step_loss.view(batch_size, seq_length - 1).mean(dim=-1))  # [B]
 
             # Inference early exit logic
             if not self.training and step > 0:
-                # Use a threshold for early exit
                 halt_prob = torch.sigmoid(halt_step_logits).mean()
-                if halt_prob > 0.8: # Adaptive threshold
+                if halt_prob > 0.8:
                     break
 
         x = self.ln_f(x)
@@ -155,10 +175,18 @@ class RecursiveDynSIHAForCausalLM(RecursiveDynSIHAPreTrainedModel, GenerationMix
 
         loss = None
         all_step_losses_tensor = None
+        best_step_mask = None
+        best_steps = torch.full((batch_size,), actual_steps - 1, device=self.device, dtype=torch.long)
+
         if labels is not None:
             all_step_losses_tensor = torch.stack(step_losses) # [steps, B]
             best_losses, best_steps = all_step_losses_tensor.min(dim=0)
             main_loss = best_losses.mean()
+            
+            # 生成路径掩码 [steps, B]，用于 FARS 路径对齐
+            # 只有 t <= t_best 的步才会被计入 FARS 损失
+            steps_range = torch.arange(all_step_losses_tensor.shape[0], device=self.device).unsqueeze(1)
+            best_step_mask = (steps_range <= best_steps.unsqueeze(0)) # [steps, B]
             
             halt_logits_tensor = torch.stack(all_halt_logits).squeeze(-1) # [steps, B, T]
             halt_probs = torch.sigmoid(halt_logits_tensor.mean(dim=-1)) # [steps, B]
@@ -168,9 +196,7 @@ class RecursiveDynSIHAForCausalLM(RecursiveDynSIHAPreTrainedModel, GenerationMix
                 target_halt[best_steps[b]:, b] = 1.0
             
             act_loss = F.binary_cross_entropy(halt_probs, target_halt)
-            ponder_penalty = (best_steps.float() / self.config.max_refinement_steps).mean()
-            
-            loss = main_loss + 0.1 * act_loss + 0.01 * ponder_penalty
+            loss = main_loss + 0.1 * act_loss
 
         if not return_dict:
             return (loss, logits, all_routing_info) if loss is not None else (logits, all_routing_info)
@@ -182,8 +208,10 @@ class RecursiveDynSIHAForCausalLM(RecursiveDynSIHAPreTrainedModel, GenerationMix
             hidden_states=None,
             attentions=None,
             routing_info=all_routing_info,
-            exit_steps=best_steps if labels is not None else torch.full((batch_size,), actual_steps, device=self.device),
-            all_step_losses=all_step_losses_tensor
+            # 返回 1-based 的步数，方便观察
+            exit_steps=best_steps + 1,
+            all_step_losses=all_step_losses_tensor,
+            best_step_mask=best_step_mask
         )
 
     def prepare_inputs_for_generation(

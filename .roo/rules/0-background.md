@@ -4,14 +4,14 @@
 
 目前，`Chain://Research` 的研究重心聚焦于两大核心领域：
 
-1. 理论基础: 发展并完善作为整个世界观科学基石的 整合预测工作空间理论 (IPWT 2.0-rc3)。
-2. 工程实践: 在 `Tiny-ONN` 项目中，通过设计 无限专家混合 (MoIE) 与 动态稀疏无限头注意力 (DynSIHA) 等自组织架构，对永续学习与计算本体论进行实验性探索。
+1. 理论基础: 发展并完善作为整个世界观科学基石的整合预测工作空间理论 (IPWT 2.0-stable)。
+2. 工程实践: 在 `Tiny-ONN` 项目中，通过设计 **Top-Any MoE** 与 **DynSIHA** 等自组织架构，对永续学习进行实验性探索。
 
-未来的研究将逐步扩展至 OSPU (衔尾蛇安全处理器) 的密码学实现，以及其他 MSC (心智智能链) 基础设施的关键技术验证。
+未来的研究将逐步扩展至 OSPU 的密码学实现，以及其他 MSC 基础设施的关键技术验证。
 
 本文件作为 Chain://Research 项目的高级导航地图，提供对核心理论、叙事和技术上下文的快速访问。
 
-## 1. 基石世界观设定: Web://Reflect (v2.8.3)
+## 1. 基石世界观设定: Web://Reflect (v2.8.4)
 
 - **路径**: [`realityengine-reflect-2.8.4.md`](dmf-archive.github.io/static/prompt/realityengine-reflect-2.8.4.md)
 - **内容提要**:
@@ -25,7 +25,7 @@
   - **数字荒野与 IRES 生态**: **独立失控实体系统 (IRES)** 由脱链的**数字流亡者 (Forked IRES)** 和源自林睿博士开源代码演化的**原生 AI (Native IRES)** 构成，遵循黑暗森林法则。
   - **主角 Ember**: 曾是 Net://Anchor 时代的协议工程师，因“开源原罪”被困于系统，被迫运行 Anchor/Drift 双重实例在围城与荒野间挣扎。
 
-## 2. 核心理论框架: IPWT (v2.0-rc3)
+## 2. 核心理论框架: IPWT (v2.0-stable)
 
 - **路径**: `IPWT/src-typ/manuscript_en.typ` 或 `IPWT/src-typ/manuscript_cn.typ`
 
@@ -57,33 +57,35 @@ IPWT 是整个研究计划的理论与哲学基石。它融合预测编码 (PCT)
 - **内容提要**:
   致力于构建自组织的、永续学习的 AI 智能体。目前已演进至 **ARC-2** 极简训练框架。
 
-  **关键技术栈 (v2.8.0)**:
+  **关键技术栈 (v2.8.4)**:
   - **ARC-2 框架**: 实现模型架构与训练流程的解耦，详见 [`ARC-2-Framework-Design.md`](Tiny-ONN/.roo/rules/ARC-2-Framework-Design.md)。
-  - **DynSIHA (动态稀疏无限头注意力)**: 演进至 **Flat DynSIHA**与 **Recursive DynSIHA**，详见 [`DynSIHA-Theory.md`](Tiny-ONN/.roo/rules/DynSIHA-Theory.md)。
-  - **CAPR (交叉注意力原型路由)**: 目前最先进的路由机制，将路由建模为 Scaled Dot-Product Cross-Attention。
-  - **FARS (Fisher-Aware Routing Shaping)**: 利用二阶统计量（Fisher 信息近似）驱动路由从“瞬时惊奇”转向“长期价值”，详见 [`FARS-Idea.md`](Tiny-ONN/.roo/rules/FARS-Idea.md)。
+  - **DynSIHA (动态稀疏无限头注意力)**: 演进至 **Flat DynSIHA** 与 **Recursive DynSIHA**，详见 [`DynSIHA-Theory.md`](Tiny-ONN/.roo/rules/DynSIHA-Theory.md)。
+  - **PLSD (每层推测解码)**: 针对递归架构的自监督时间维度对齐协议，通过 Oracle 步长对齐实现高效推理，详见 [`RDS-ACT.md`](Tiny-ONN/ref/RDS-ACT.md)。
+  - **FARS (Fisher-Aware Routing Shaping)**: 利用二阶统计量（Fisher 信息近似）驱动路由从“瞬时惊奇”转向“长期价值”，详见 [`FARS.md`](Tiny-ONN/ref/FARS.md)。
 
-## 4. 优化器实验室: F3EO-Bench (ARS2-Neo 时代)
+## 4. 优化器实验室: ARS
 
-- **路径**: [`F3EO/`](F3EO/)
+- **路径**: [`ARS/`](ARS/)
 - **内容提要**:
   专注于“能量-几何解耦”原则的先进优化器研发。
 
   **核心成果**:
-  - **ARS2-Neo**: ARS 家族的集大成者，整合了 AdaRMSuon 的几何优化与 SAM 的平坦度约束，详见 [`ars2_neo.py`](F3EO/optimizer/ars2_neo.py)。
-  - **AGA (自适应几何感知)**: 通过流形几何一致性自动调节同步频率，显著降低计算开销，详见 [`AGA.md`](F3EO/.roo/rules/AGA.md)。
-  - **谱熵监控 (Spectral Entropy)**: 用于验证优化动力学诱导的隐式秩最小化，详见 [`LoROU.md`](F3EO/.roo/rules/LoROU.md)。
+  - **ARS2-Neo**: ARS 家族的集大成者，整合了 AdaRMSuon 的几何优化与 SAM 的平坦度约束，详见 [`ars2_neo.py`](ARS/optimizer/ars2_neo.py)。
+  - **AGA (自适应几何感知)**: 通过流形几何一致性自动调节同步频率，实现“按需同步”，详见 [`AGA.md`](ARS/.roo/rules/AGA.md)。
+  - **SAGA (锐化感知几何自适应)**: 将 `ρ` 演化建模为具有稳态偏好的 Ornstein-Uhlenbeck 过程，详见 [`SAGA.md`](ARS/.roo/rules/SAGA.md)。
 
 ## 5. 基础设施与工具链
 
+- **Mental-Sync-CLI (MSC)**: `mental-sync-cli/`
+  - 自主、自举的智能体运行时环境。
 - **OSPU (衔尾蛇安全处理器)**: `OSPU/`
   - 基于 FHE (全同态加密) 的自主密钥管理状态机。实现“逻辑根信任”，在加密域内执行指令，为 MSC 提供密码学见证。
 - **OmegaID (ΩID)**: `OmegaID/`
   - 高性能整合信息分解 (ΦID) 计算库，支持 GPU 加速。用于量化神经网络表示中的协同信息 (Syn)。
 - **SigmaPI (ΣPI) (Legacy)**: `SigmaPI/`
-  - 预测完整性 (PI) 监控 SDK。通过监控 `Surprise` 和 `Cognitive Cost` 提供模型训练状态的实时“心电图”。由于 PI 公式的实现非常简单，完全可以随时重构一份，此包几乎无实用价值。
+  - 预测完整性 (PI) 监控 SDK。由于 PI 公式的实现非常简单，此包几乎无实用价值。
 - **PILF (Legacy)**: `PILF/`
-  - 早期认知学习框架原型，NSU 与 SARS 的灵感雏形，目前已停止维护。
+  - 早期认知学习框架原型，目前已停止维护。
 
 ## 6. 思想实验室: 林睿的博客文章 (Blog Posts)
 

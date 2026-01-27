@@ -26,10 +26,11 @@ class GridSerializer:
                 coords.append((r, c))
         return tokens, coords
 
-    def serialize_task(self, task_data: dict[str, Any]) -> tuple[list[int], list[int], list[tuple[int, int]]]:
+    def serialize_task(self, task_data: dict[str, Any]) -> tuple[list[int], list[int], list[tuple[int, int]], list[int]]:
         full_ids: list[int] = [self.tokenizer.bos_token_id]
         full_coords: list[tuple[int, int]] = [(-1, -1)]
         labels: list[int] = [-100]
+        diff_mask: list[int] = [0]
 
         im_start_id = self.tokenizer.vocab["<im_start>"]
         im_end_id = self.tokenizer.vocab["<im_end>"]
@@ -38,36 +39,67 @@ class GridSerializer:
             ids: list[int],
             coords: list[tuple[int, int]],
             is_input: bool,
+            diff_ids: list[int] = None,
         ):
             full_ids.extend([im_start_id] + ids + [im_end_id])
             full_coords.extend([(-1, -1)] + coords + [(-1, -1)])
             if is_input:
                 labels.extend([-100] * (len(ids) + 2))
+                diff_mask.extend([0] * (len(ids) + 2))
             else:
                 labels.extend([-100] + ids + [im_end_id])
+                if diff_ids:
+                    # diff_ids is a list of bools/ints indicating if the token at that position is a "diff" token
+                    diff_mask.extend([0] + diff_ids + [0])
+                else:
+                    diff_mask.extend([0] * (len(ids) + 2))
+
+        def get_diff_ids(input_grid, output_grid, output_ids):
+            # output_ids contains color tokens and row separators
+            # We need to map them back to grid coordinates to check for diff
+            diff_ids = []
+            h1, w1 = len(input_grid), len(input_grid[0])
+            h2, w2 = len(output_grid), len(output_grid[0])
+            
+            r, c = 0, 0
+            for token_id in output_ids:
+                if token_id == self.tokenizer.row_sep_token_id:
+                    diff_ids.append(0)
+                    r += 1
+                    c = 0
+                else:
+                    # Color token
+                    is_diff = 1
+                    if r < h1 and c < w1 and h1 == h2 and w1 == w2:
+                        if input_grid[r][c] == output_grid[r][c]:
+                            is_diff = 0
+                    diff_ids.append(is_diff)
+                    c += 1
+            return diff_ids
 
         for pair in task_data["train"]:
             input_ids, input_coords = self._serialize_grid(pair["input"])
             extend_and_mask(input_ids, input_coords, is_input=True)
 
             output_ids, output_coords = self._serialize_grid(pair["output"])
-            extend_and_mask(output_ids, output_coords, is_input=False)
+            diff_ids = get_diff_ids(pair["input"], pair["output"], output_ids)
+            extend_and_mask(output_ids, output_coords, is_input=False, diff_ids=diff_ids)
 
-        test_input_ids, test_input_coords = self._serialize_grid(
-            task_data["test"][0]["input"]
-        )
+        test_input_grid = task_data["test"][0]["input"]
+        test_input_ids, test_input_coords = self._serialize_grid(test_input_grid)
         extend_and_mask(test_input_ids, test_input_coords, is_input=True)
 
-        test_output_ids, test_output_coords = self._serialize_grid(
-            task_data["test"][0]["output"]
-        )
-        extend_and_mask(test_output_ids, test_output_coords, is_input=False)
+        test_output_grid = task_data["test"][0]["output"]
+        test_output_ids, test_output_coords = self._serialize_grid(test_output_grid)
+        diff_ids = get_diff_ids(test_input_grid, test_output_grid, test_output_ids)
+        extend_and_mask(test_output_ids, test_output_coords, is_input=False, diff_ids=diff_ids)
 
         full_ids.append(self.tokenizer.eos_token_id)
         full_coords.append((-1, -1))
         labels.append(self.tokenizer.eos_token_id)
+        diff_mask.append(0)
 
-        return full_ids, labels, full_coords
+        return full_ids, labels, full_coords, diff_mask
 
     def serialize_for_inference(self, task_data: dict[str, Any]) -> tuple[list[int], list[tuple[int, int]]]:
         prompt_ids: list[int] = [self.tokenizer.bos_token_id]
@@ -177,10 +209,10 @@ class ArcCollator:
         return -torch.sum(probs * torch.log2(probs)).item()
 
     def __call__(self, batch: list[dict[str, Any]]) -> dict[str, Any]:
-        all_input_ids, all_labels, all_entropies = [], [], []
+        all_input_ids, all_labels, all_diff_masks, all_entropies = [], [], [], []
 
         for task_data in batch:
-            input_ids, labels, _ = self.serializer.serialize_task(task_data)
+            input_ids, labels, _, diff_mask = self.serializer.serialize_task(task_data)
 
             if len(input_ids) > self.max_len:
                 continue
@@ -189,16 +221,19 @@ class ArcCollator:
             all_entropies.append(entropy)
             all_input_ids.append(torch.tensor(input_ids, dtype=torch.long))
             all_labels.append(torch.tensor(labels, dtype=torch.long))
+            all_diff_masks.append(torch.tensor(diff_mask, dtype=torch.long))
 
         if not all_input_ids:
             return {}
 
         padded_input_ids = pad_sequence(all_input_ids, batch_first=True, padding_value=self.tokenizer.pad_token_id)
         padded_labels = pad_sequence(all_labels, batch_first=True, padding_value=-100)
+        padded_diff_masks = pad_sequence(all_diff_masks, batch_first=True, padding_value=0)
 
         return {
             "input_ids": padded_input_ids,
             "labels": padded_labels,
+            "diff_mask": padded_diff_masks,
             "task_data": batch,
             "sample_entropy": torch.tensor(all_entropies, dtype=torch.float32),
         }

@@ -21,16 +21,20 @@ class MLPRouter(nn.Module):
             nn.SiLU(),
             nn.Linear(hidden_size, num_experts, bias=False, dtype=dtype)
         )
-
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         routing_logits = self.net(x)
+        
+        # 贝叶斯竞争：全局 Softmax 归一化
+        probs = F.softmax(routing_logits, dim=-1)
+        routing_weights = probs
 
         if self.top_k < self.num_experts:
-            routing_weights, selected_experts = torch.topk(routing_logits, self.top_k, dim=-1)
-            routing_weights = F.softmax(routing_weights, dim=-1)
+            routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
         else:
-            routing_weights = F.softmax(routing_logits, dim=-1)
-            selected_experts = torch.arange(self.num_experts, device=x.device).expand_as(routing_logits)
+            selected_experts = torch.arange(self.num_experts, device=x.device).expand_as(routing_weights)
+            
+            # 物理截断：优化 Kernel 调度，真正为 0 的部分不参与计算
+            routing_weights = torch.where(routing_weights > 1e-5, routing_weights, torch.zeros_like(routing_weights))
 
         return routing_weights, selected_experts, routing_logits
 
@@ -69,13 +73,14 @@ class VectorizedExpertMLP(nn.Module):
 
         # Memory efficient MoE: Loop over experts instead of materializing all weights
         for i in range(self.num_experts):
-            # Find tokens that selected this expert
-            mask = (se_flat == i)
-            if not mask.any():
+            # 优化调度：只有当该专家在当前 Batch 中有非零贡献时才启动 Kernel
+            # 在 Top-Any 模式下，这能显著减少无效计算
+            expert_mask = (se_flat == i) & (rw_flat > 0)
+            if not expert_mask.any():
                 continue
 
             # Get token indices and which 'k' slot they used
-            token_indices, k_slots = torch.where(mask)
+            token_indices, k_slots = torch.where(expert_mask)
 
             # Extract inputs and weights
             expert_inputs = x_flat[token_indices] # [num_matched, D]

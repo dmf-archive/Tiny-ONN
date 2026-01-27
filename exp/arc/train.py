@@ -14,7 +14,7 @@ from torch.utils.data import DataLoader
 from .config import TrainConfig
 from .data import ArcCollator, GridDeserializer, GridSerializer, InMemoryArcDataset
 from .evaluation import EvaluationStep
-from .F3EO import F3EO
+from .ARS import ARS
 from .model import ArcTransformer
 from .observer import Observer
 from .tokenizer import ArcColorTokenizer
@@ -98,7 +98,7 @@ class Trainer:
         self.config.model.vocab_size = self.tokenizer.vocab_size
         self.model = ArcTransformer(self.config.model, device=self.device).to(self.device)
 
-        self.optimizer = F3EO(
+        self.optimizer = ARS(
             self.model.parameters(),
             lr=self.config.lr,
             betas=self.config.betas,

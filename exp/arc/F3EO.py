@@ -2,7 +2,7 @@ import torch
 from torch.optim.optimizer import Optimizer
 
 
-class F3EO(Optimizer):
+class ARS(Optimizer):
     def __init__(self,
                  params,
                  lr=1e-3,
@@ -43,7 +43,7 @@ class F3EO(Optimizer):
             for p in group['params']:
                 if p.grad is not None:
                     if p.grad.is_sparse:
-                        raise RuntimeError('F3EO does not support sparse gradients.')
+                        raise RuntimeError('ARS does not support sparse gradients.')
                     if p.grad.grad_fn is None:
                         raise RuntimeError('Gradient tensor does not have grad_fn. When calling loss.backward(), make sure the option create_graph is set to True.')
                     params_with_grad.append(p)
