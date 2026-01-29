@@ -17,5 +17,5 @@
 	path = ref/trm
 	url = https://github.com/SamsungSAILMontreal/TinyRecursiveModels.git
 [submodule "ref/ARS"]
-	path = ref/F3EO
+	path = ref/ARS
 	url = https://github.com/dmf-archive/ARS.git
