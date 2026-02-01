@@ -140,6 +140,8 @@ class InMemoryArcDataset(Dataset):
         for path in file_paths:
             with open(path) as f:
                 task_data = json.load(f)
+            # 注入 task_id 以便后续分析
+            task_data["task_id"] = path.stem
             if split == "training" and "test" in task_data and task_data["test"] and len(task_data["test"]) > 0 and "output" in task_data["test"][0] or split == "evaluation" and "test" in task_data and task_data["test"] and len(task_data["test"]) > 0:
                 all_tasks.append(task_data)
 
@@ -209,16 +211,18 @@ class ArcCollator:
         return -torch.sum(probs * torch.log2(probs)).item()
 
     def __call__(self, batch: list[dict[str, Any]]) -> dict[str, Any]:
-        all_input_ids, all_labels, all_diff_masks, all_entropies = [], [], [], []
+        all_input_ids, all_labels, all_diff_masks, all_entropies, all_task_ids = [], [], [], [], []
 
         for task_data in batch:
             input_ids, labels, _, diff_mask = self.serializer.serialize_task(task_data)
+            task_id = task_data.get("task_id", "unknown")
 
             if len(input_ids) > self.max_len:
                 continue
 
             entropy = self._calculate_sample_entropy(labels)
             all_entropies.append(entropy)
+            all_task_ids.append(task_id)
             all_input_ids.append(torch.tensor(input_ids, dtype=torch.long))
             all_labels.append(torch.tensor(labels, dtype=torch.long))
             all_diff_masks.append(torch.tensor(diff_mask, dtype=torch.long))
@@ -233,6 +237,7 @@ class ArcCollator:
         return {
             "input_ids": padded_input_ids,
             "labels": padded_labels,
+            "task_id": all_task_ids,
             "diff_mask": padded_diff_masks,
             "task_data": batch,
             "sample_entropy": torch.tensor(all_entropies, dtype=torch.float32),

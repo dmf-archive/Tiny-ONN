@@ -19,6 +19,7 @@ class FlatDynSIHAOutput(ModelOutput):
     hidden_states: tuple[torch.FloatTensor] | None = None
     attentions: tuple[torch.FloatTensor] | None = None
     routing_info: list[dict[str, torch.Tensor]] | None = None
+    routing_weights: list[dict[str, torch.Tensor]] | None = None
 
 class FlatDynSIHAPreTrainedModel(PreTrainedModel):
     config_class = FlatDynSIHAConfig
@@ -117,6 +118,7 @@ class FlatDynSIHAForCausalLM(FlatDynSIHAPreTrainedModel, GenerationMixin):
         position_embeddings = self.rotary_emb(x, seq_len=cache_position.max().item() + 1)
 
         all_routing_info = []
+        all_routing_weights = [] # 用于 FARS 计算
         all_hidden_states = () if output_hidden_states else None
 
         for layer in self.layers:
@@ -134,6 +136,13 @@ class FlatDynSIHAForCausalLM(FlatDynSIHAPreTrainedModel, GenerationMixin):
                 position_embeddings=position_embeddings
             )
             all_routing_info.append(routing_info)
+            # 提取 weights 用于 FARS 塑造
+            all_routing_weights.append({
+                "q": routing_info["q_weights"],
+                "k": routing_info["k_weights"],
+                "v": routing_info["v_weights"],
+                "mlp": routing_info["mlp_weights"]
+            })
 
         x = self.ln_f(x)
 
@@ -179,6 +188,7 @@ class FlatDynSIHAForCausalLM(FlatDynSIHAPreTrainedModel, GenerationMixin):
             hidden_states=all_hidden_states,
             attentions=None,
             routing_info=all_routing_info,
+            routing_weights=all_routing_weights,
         )
 
     def prepare_inputs_for_generation(

@@ -15,6 +15,7 @@ import torch.utils.checkpoint as cp
 @dataclass
 class RecursiveDynSIHAOutput(CausalLMOutputWithPast):
     routing_info: list[dict[str, torch.Tensor]] | None = None
+    routing_weights: list[dict[str, torch.Tensor]] | None = None
     exit_steps: torch.LongTensor | None = None
     all_step_losses: torch.Tensor | None = None
     best_step_mask: torch.Tensor | None = None  # [B, T] 仅神谕步为 True
@@ -109,6 +110,7 @@ class RecursiveDynSIHAForCausalLM(RecursiveDynSIHAPreTrainedModel, GenerationMix
         position_embeddings = self.rotary_emb(x, seq_len=cache_position.max().item() + 1)
 
         all_routing_info = []
+        all_routing_weights = []
         step_losses = []
         all_halt_logits = []
         actual_steps = 0
@@ -130,21 +132,31 @@ class RecursiveDynSIHAForCausalLM(RecursiveDynSIHAPreTrainedModel, GenerationMix
                 layer_idx=step_idx
             )
             # Checkpoint 必须返回 Tensor 元组。我们将 dict 展开。
-            return h, r_info["q_logits"], r_info["k_logits"], r_info["v_logits"], r_info["mlp_logits"]
+            return h, r_info["q_logits"], r_info["k_logits"], r_info["v_logits"], r_info["mlp_logits"], \
+                   r_info["q_weights"], r_info["k_weights"], r_info["v_weights"], r_info["mlp_weights"]
 
         for step in range(max_steps):
             actual_steps = step + 1
             if self.training and self.gradient_checkpointing:
-                x, ql, kl, vl, mlpl = cp.checkpoint(
+                x, ql, kl, vl, mlpl, qw, kw, vw, mw = cp.checkpoint(
                     step_fn, x, step, None, use_reentrant=False
                 )
-                routing_info = {"q_logits": ql, "k_logits": kl, "v_logits": vl, "mlp_logits": mlpl}
+                routing_info = {
+                    "q_logits": ql, "k_logits": kl, "v_logits": vl, "mlp_logits": mlpl,
+                    "q_weights": qw, "k_weights": kw, "v_weights": vw, "mlp_weights": mw
+                }
                 past_key_values = None # 训练期禁用 KV Cache
             else:
-                x, ql, kl, vl, mlpl = step_fn(x, step, past_key_values)
-                routing_info = {"q_logits": ql, "k_logits": kl, "v_logits": vl, "mlp_logits": mlpl}
+                x, ql, kl, vl, mlpl, qw, kw, vw, mw = step_fn(x, step, past_key_values)
+                routing_info = {
+                    "q_logits": ql, "k_logits": kl, "v_logits": vl, "mlp_logits": mlpl,
+                    "q_weights": qw, "k_weights": kw, "v_weights": vw, "mlp_weights": mw
+                }
             
             all_routing_info.append(routing_info)
+            all_routing_weights.append({
+                "q": qw, "k": kw, "v": vw, "mlp": mw
+            })
 
             # ACT: Halt prediction
             halt_step_logits = self.halt_head(x)  # [B, T, 1]
@@ -208,6 +220,7 @@ class RecursiveDynSIHAForCausalLM(RecursiveDynSIHAPreTrainedModel, GenerationMix
             hidden_states=None,
             attentions=None,
             routing_info=all_routing_info,
+            routing_weights=all_routing_weights,
             # 返回 1-based 的步数，方便观察
             exit_steps=best_steps + 1,
             all_step_losses=all_step_losses_tensor,

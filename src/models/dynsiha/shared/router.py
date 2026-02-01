@@ -9,32 +9,40 @@ class MLPRouter(nn.Module):
         hidden_size: int,
         num_experts: int,
         top_k: int,
+        temperature: float = 0.1,
         dtype: torch.dtype = torch.float32
     ):
         super().__init__()
         self.hidden_size = hidden_size
         self.num_experts = num_experts
         self.top_k = top_k
+        self.temperature = temperature
 
         self.net = nn.Sequential(
             nn.Linear(hidden_size, hidden_size, bias=False, dtype=dtype),
+            nn.LayerNorm(hidden_size, dtype=dtype),
             nn.SiLU(),
-            nn.Linear(hidden_size, num_experts, bias=False, dtype=dtype)
+            nn.Linear(hidden_size, num_experts, bias=True, dtype=dtype)
         )
+        # 初始化偏置以确保初期有足够的激活，防止 FARS 直接压死
+        nn.init.constant_(self.net[-1].bias, 1.0)
+
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         routing_logits = self.net(x)
         
-        # 贝叶斯竞争：全局 Softmax 归一化
-        probs = F.softmax(routing_logits, dim=-1)
-        routing_weights = probs
+        # 恢复 Softmax 竞争机制，但保留温度控制
+        # Sigmoid 在没有强监督信号时极易导致全关或全开的平凡解
+        routing_weights = F.softmax(routing_logits / self.temperature, dim=-1)
 
         if self.top_k < self.num_experts:
+            # 虽然 Sigmoid 是独立的，但为了兼容 Top-K 调度，我们仍保留截断逻辑
             routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
         else:
             selected_experts = torch.arange(self.num_experts, device=x.device).expand_as(routing_weights)
             
-            # 物理截断：优化 Kernel 调度，真正为 0 的部分不参与计算
-            routing_weights = torch.where(routing_weights > 1e-5, routing_weights, torch.zeros_like(routing_weights))
+            # 物理截断：优化 Kernel 调度，低于阈值的部分不参与计算
+            # 配合 FARS，这能实现真正的按需计算
+            routing_weights = torch.where(routing_weights > 1e-3, routing_weights, torch.zeros_like(routing_weights))
 
         return routing_weights, selected_experts, routing_logits
 

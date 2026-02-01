@@ -131,7 +131,10 @@ class DynSIHAAttention(nn.Module):
         attn_output = attn_output.transpose(1, 2).contiguous().view(B, T, C)
         output = self.o_proj(attn_output)
 
-        routing_info = {"q_logits": ql, "k_logits": kl, "v_logits": vl}
+        routing_info = {
+            "q_logits": ql, "k_logits": kl, "v_logits": vl,
+            "q_weights": qw, "k_weights": kw, "v_weights": vw
+        }
         return output, routing_info, past_key_value
 
 class DynSIHAMLP(nn.Module):
@@ -152,9 +155,9 @@ class DynSIHAMLP(nn.Module):
             dtype=dtype
         )
 
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         w, e, l = self.router(x)
-        return self.experts(x, w, e), l
+        return self.experts(x, w, e), l, w
 
 class DynSIHABlock(nn.Module):
     def __init__(
@@ -201,7 +204,7 @@ class DynSIHABlock(nn.Module):
         x = x + attn_out
 
         mlp_in = self.ln2(x)
-        mlp_out, mlp_routing = self.mlp(mlp_in)
+        mlp_out, mlp_routing, mlp_weights = self.mlp(mlp_in)
         x = x + mlp_out
 
-        return x, {**attn_routing, "mlp_logits": mlp_routing}, past_key_value
+        return x, {**attn_routing, "mlp_logits": mlp_routing, "mlp_weights": mlp_weights}, past_key_value
