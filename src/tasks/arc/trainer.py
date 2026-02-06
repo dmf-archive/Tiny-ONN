@@ -1,4 +1,6 @@
 import time
+import os
+import shutil
 from pathlib import Path
 
 import torch
@@ -31,7 +33,7 @@ class ARCTrainer:
         )
         self.shaper = RoutingShaper(w_meta=config.w_meta, cost_alpha=config.cost_alpha)
 
-        self.train_loader = get_arc_dataloader(config.data_dir, config.batch_size, split="training")
+        self.train_loader = get_arc_dataloader(config.data_dir, config.batch_size, split="training", max_tokens=config.max_tokens)
         self.eval_loader = get_arc_dataloader(config.data_dir, 1, split="evaluation")
 
         self.optimizer = self._setup_optimizer()
@@ -41,6 +43,7 @@ class ARCTrainer:
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         self.last_routing_diagnostics = {}
         self.performance_stats = {}
+        self.memory_threshold_bytes = config.memory_threshold_gb * 1024 * 1024 * 1024
 
         if config.resume_from_checkpoint:
             self.load_checkpoint(config.resume_from_checkpoint)
@@ -69,7 +72,20 @@ class ARCTrainer:
             adaptive_sync=self.config.adaptive_sync
         )
 
+    def _check_memory_usage(self) -> bool:
+        if torch.cuda.is_available():
+            allocated = torch.cuda.memory_allocated(self.device)
+            if allocated > self.memory_threshold_bytes:
+                self.observer.console.print(
+                    f"[bold red]Memory usage exceeded threshold: {allocated / 1024**3:.2f}GB > {self.config.memory_threshold_gb}GB.[/bold red]"
+                )
+                return False
+        return True
+
     def train_step(self, batch: dict[str, torch.Tensor]) -> float:
+        if not self._check_memory_usage():
+            return 0.0
+
         start_time = time.perf_counter()
         self.model.train()
         input_ids = batch["input_ids"].to(self.device)
@@ -88,10 +104,12 @@ class ARCTrainer:
                 main_loss = outputs["loss"]
                 routing_info = outputs.get("routing_info")
                 logits = outputs.get("logits")
+                best_step_mask = outputs.get("best_step_mask")
             elif hasattr(outputs, "loss"):
                 main_loss = outputs.loss
                 routing_info = getattr(outputs, "routing_info", None)
                 logits = getattr(outputs, "logits", None)
+                best_step_mask = getattr(outputs, "best_step_mask", None)
             else:
                 raise ValueError(f"Unsupported model output type: {type(outputs)}")
 
@@ -99,13 +117,22 @@ class ARCTrainer:
 
             if routing_info:
                 # FARS: Fisher-Aware Routing Shaping (Module-level)
-                meta_loss = self.shaper.calculate_meta_loss(routing_info, model=self.model, optimizer=self.optimizer)
+                meta_loss = self.shaper.calculate_meta_loss(
+                    routing_info,
+                    model=self.model,
+                    optimizer=self.optimizer,
+                    best_step_mask=best_step_mask
+                )
                 total_loss = main_loss + meta_loss
                 self.last_routing_diagnostics = {
                     **self.shaper.get_routing_diagnostics(routing_info),
                     "meta_loss": meta_loss.item(),
                     "shaper_ms": self.shaper.performance_stats.get('shaper_calc_time_ms', 0)
                 }
+                # Update RMI/ITJD history
+                if self.config.compute_rmi_itjd:
+                    task_ids = batch.get("task_id", ["unknown"] * input_ids.shape[0])
+                    self.observer.update_routing_history(task_ids, routing_info)
             else:
                 total_loss = main_loss
                 self.last_routing_diagnostics = {}
@@ -161,6 +188,12 @@ class ARCTrainer:
         }, path)
         self.observer.console.print(f"[dim]Checkpoint saved: {path}[/dim]")
 
+        # Rolling deletion
+        ckpts = sorted(self.checkpoint_dir.glob("checkpoint_s*.pt"), key=os.path.getmtime)
+        if len(ckpts) > self.config.max_checkpoints:
+            for old_ckpt in ckpts[:-self.config.max_checkpoints]:
+                os.remove(old_ckpt)
+
     def load_checkpoint(self, path: str):
         self.observer.console.print(f"[bold yellow]Resuming from checkpoint: {path}[/bold yellow]")
         checkpoint = torch.load(path, map_location=self.device)
@@ -184,7 +217,9 @@ class ARCTrainer:
                             "loss": loss,
                             **self.optimizer.diagnostics,
                             **self.last_routing_diagnostics,
-                            **self.performance_stats
+                            **self.performance_stats,
+                            "rmi": self.observer.compute_rmi() if self.config.compute_rmi_itjd else 0.0,
+                            "itjd": self.observer.compute_itjd() if self.config.compute_rmi_itjd else 0.0,
                         },
                         step=self.global_step,
                         epoch=epoch

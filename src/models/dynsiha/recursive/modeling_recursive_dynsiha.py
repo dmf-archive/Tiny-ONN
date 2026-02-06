@@ -14,11 +14,13 @@ import torch.utils.checkpoint as cp
 
 @dataclass
 class RecursiveDynSIHAOutput(CausalLMOutputWithPast):
-    routing_info: list[dict[str, torch.Tensor]] | None = None
-    routing_weights: list[dict[str, torch.Tensor]] | None = None
     exit_steps: torch.LongTensor | None = None
     all_step_losses: torch.Tensor | None = None
-    best_step_mask: torch.Tensor | None = None  # [B, T] 仅神谕步为 True
+    best_step_mask: torch.Tensor | None = None
+    halt_logits: torch.Tensor | None = None
+    all_step_logits: torch.Tensor | None = None
+    eff_k: torch.Tensor | None = None
+    routing_weights: torch.Tensor | None = None
 
 class RecursiveDynSIHAPreTrainedModel(PreTrainedModel):
     config_class = RecursiveDynSIHAConfig
@@ -50,7 +52,7 @@ class RecursiveDynSIHAForCausalLM(RecursiveDynSIHAPreTrainedModel, GenerationMix
             config.num_heads,
             config.num_experts,
             config.top_k,
-            layer_idx=0, # Base index, will be overridden in loop
+            layer_idx=0,
             ffn_scale=config.ffn_scale,
             rms_norm_eps=config.rms_norm_eps
         )
@@ -79,9 +81,8 @@ class RecursiveDynSIHAForCausalLM(RecursiveDynSIHAPreTrainedModel, GenerationMix
         cache_position: torch.LongTensor | None = None,
         **kwargs
     ) -> CausalLMOutputWithPast | tuple[torch.Tensor, list[dict[str, torch.Tensor]]]:
-        # 训练期间强制禁用 KV Cache 以节省显存并简化 Checkpointing 逻辑
         if self.training:
-            use_cache = False
+            use_cache = self.config.use_cache_in_train
         else:
             use_cache = use_cache if use_cache is not None else self.config.use_cache
 
@@ -89,6 +90,9 @@ class RecursiveDynSIHAForCausalLM(RecursiveDynSIHAPreTrainedModel, GenerationMix
             batch_size, seq_length = input_ids.shape
         else:
             batch_size, seq_length = kwargs.get("inputs_embeds").shape[:2]
+
+        if self.training and self.config.max_refinement_steps > 1:
+            use_cache = False
 
         if cache_position is None:
             past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
@@ -109,18 +113,17 @@ class RecursiveDynSIHAForCausalLM(RecursiveDynSIHAPreTrainedModel, GenerationMix
 
         position_embeddings = self.rotary_emb(x, seq_len=cache_position.max().item() + 1)
 
-        all_routing_info = []
-        all_routing_weights = []
         step_losses = []
+        step_logits_list = []
         all_halt_logits = []
         actual_steps = 0
+        active_counts = []
+        routing_weights = []
 
-        # PLSD: Per-Layer Speculative Decode
-        # We share the same block but treat each step as a virtual layer for KV Cache
         max_steps = self.config.max_refinement_steps if self.training else self.config.max_inference_steps
 
-        def step_fn(step_input, step_idx, pkv):
-            h, r_info, new_pkv = self.block(
+        def step_fn(step_input, step_idx, pkv, route_input):
+            h, routing_info, new_pkv = self.block(
                 step_input,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
@@ -129,55 +132,67 @@ class RecursiveDynSIHAForCausalLM(RecursiveDynSIHAPreTrainedModel, GenerationMix
                 use_cache=use_cache,
                 cache_position=cache_position,
                 position_embeddings=position_embeddings,
-                layer_idx=step_idx
+                layer_idx=step_idx,
+                route_x=route_input
             )
-            # Checkpoint 必须返回 Tensor 元组。我们将 dict 展开。
-            return h, r_info["q_logits"], r_info["k_logits"], r_info["v_logits"], r_info["mlp_logits"], \
-                   r_info["q_weights"], r_info["k_weights"], r_info["v_weights"], r_info["mlp_weights"]
+            return h, new_pkv, routing_info
 
+        prev_x = None
         for step in range(max_steps):
             actual_steps = step + 1
-            if self.training and self.gradient_checkpointing:
-                x, ql, kl, vl, mlpl, qw, kw, vw, mw = cp.checkpoint(
-                    step_fn, x, step, None, use_reentrant=False
-                )
-                routing_info = {
-                    "q_logits": ql, "k_logits": kl, "v_logits": vl, "mlp_logits": mlpl,
-                    "q_weights": qw, "k_weights": kw, "v_weights": vw, "mlp_weights": mw
-                }
-                past_key_values = None # 训练期禁用 KV Cache
-            else:
-                x, ql, kl, vl, mlpl, qw, kw, vw, mw = step_fn(x, step, past_key_values)
-                routing_info = {
-                    "q_logits": ql, "k_logits": kl, "v_logits": vl, "mlp_logits": mlpl,
-                    "q_weights": qw, "k_weights": kw, "v_weights": vw, "mlp_weights": mw
-                }
-            
-            all_routing_info.append(routing_info)
-            all_routing_weights.append({
-                "q": qw, "k": kw, "v": vw, "mlp": mw
-            })
 
-            # ACT: Halt prediction
-            halt_step_logits = self.halt_head(x)  # [B, T, 1]
+            if self.config.use_sia and self.training and step > 0:
+                x = x.detach()
+
+            if self.training and self.gradient_checkpointing:
+                x, past_key_values, routing_info = cp.checkpoint(
+                    step_fn, x, step, past_key_values, prev_x, use_reentrant=False
+                )
+            else:
+                x, past_key_values, routing_info = step_fn(x, step, past_key_values, prev_x)
+
+            q_active = routing_info.get("q_active")
+            k_active = routing_info.get("k_active")
+            v_active = routing_info.get("v_active")
+            mlp_active = routing_info.get("mlp_active")
+            if q_active is not None and k_active is not None and v_active is not None and mlp_active is not None:
+                q_mean = q_active.float().mean(dim=-1)
+                k_mean = k_active.float().mean(dim=-1)
+                v_mean = v_active.float().mean(dim=-1)
+                active_counts.append((q_mean + k_mean + v_mean + mlp_active.float()).mean())
+            q_weights = routing_info.get("q_weights")
+            if q_weights is not None:
+                routing_weights.append(q_weights.mean(dim=(1, 2)).detach())
+
+            prev_x = x
+
+            halt_step_logits = self.halt_head(x)
             all_halt_logits.append(halt_step_logits)
 
             if labels is not None:
-                # Calculate intermediate loss for PLSD
                 inter_x = self.ln_f(x)
                 inter_logits = self.lm_head(inter_x)
+                step_logits_list.append(inter_logits)
 
                 shifted_logits = inter_logits[..., :-1, :].contiguous()
                 shifted_labels = labels[..., 1:].contiguous()
                 step_loss = F.cross_entropy(
                     shifted_logits.view(-1, self.config.vocab_size),
                     shifted_labels.view(-1),
-                    reduction='none'
+                    reduction='none',
+                    ignore_index=-100
                 )
-                step_losses.append(step_loss.view(batch_size, seq_length - 1).mean(dim=-1))  # [B]
+                step_loss = step_loss.view(batch_size, seq_length - 1)
+                step_mask = shifted_labels.ne(-100).float()
+                step_losses.append(
+                    (step_loss * step_mask).sum(dim=-1) / (step_mask.sum(dim=-1) + 1e-9)
+                )
+            else:
+                inter_x = self.ln_f(x)
+                inter_logits = self.lm_head(inter_x)
+                step_logits_list.append(inter_logits)
 
-            # Inference early exit logic
-            if not self.training and step > 0:
+            if not self.training and self.config.use_act_inference and step > 0:
                 halt_prob = torch.sigmoid(halt_step_logits).mean()
                 if halt_prob > 0.8:
                     break
@@ -191,27 +206,32 @@ class RecursiveDynSIHAForCausalLM(RecursiveDynSIHAPreTrainedModel, GenerationMix
         best_steps = torch.full((batch_size,), actual_steps - 1, device=self.device, dtype=torch.long)
 
         if labels is not None:
-            all_step_losses_tensor = torch.stack(step_losses) # [steps, B]
+            all_step_losses_tensor = torch.stack(step_losses)
             best_losses, best_steps = all_step_losses_tensor.min(dim=0)
             main_loss = best_losses.mean()
-            
-            # 生成路径掩码 [steps, B]，用于 FARS 路径对齐
-            # 只有 t <= t_best 的步才会被计入 FARS 损失
+
             steps_range = torch.arange(all_step_losses_tensor.shape[0], device=self.device).unsqueeze(1)
-            best_step_mask = (steps_range <= best_steps.unsqueeze(0)) # [steps, B]
-            
-            halt_logits_tensor = torch.stack(all_halt_logits).squeeze(-1) # [steps, B, T]
-            halt_probs = torch.sigmoid(halt_logits_tensor.mean(dim=-1)) # [steps, B]
-            
+            best_step_mask = (steps_range <= best_steps.unsqueeze(0))
+
+            main_loss = (all_step_losses_tensor * best_step_mask.float()).sum() / (best_step_mask.float().sum() + 1e-9)
+
+            halt_logits_tensor = torch.stack(all_halt_logits).squeeze(-1)
+            halt_probs = torch.sigmoid(halt_logits_tensor.mean(dim=-1))
+
             target_halt = torch.zeros_like(halt_probs)
             for b in range(batch_size):
                 target_halt[best_steps[b]:, b] = 1.0
-            
+
             act_loss = F.binary_cross_entropy(halt_probs, target_halt)
             loss = main_loss + 0.1 * act_loss
 
+            # === FARS 成本：标准熵最大化负载均衡 + normed FARS 权重 ===
+            fars_loss = self._aggregate_fars_cost(routing_info)
+            if fars_loss is not None:
+                loss = loss + 0.1 * fars_loss
+
         if not return_dict:
-            return (loss, logits, all_routing_info) if loss is not None else (logits, all_routing_info)
+            return (loss, logits) if loss is not None else (logits,)
 
         return RecursiveDynSIHAOutput(
             loss=loss,
@@ -219,13 +239,51 @@ class RecursiveDynSIHAForCausalLM(RecursiveDynSIHAPreTrainedModel, GenerationMix
             past_key_values=past_key_values if use_cache else None,
             hidden_states=None,
             attentions=None,
-            routing_info=all_routing_info,
-            routing_weights=all_routing_weights,
-            # 返回 1-based 的步数，方便观察
             exit_steps=best_steps + 1,
             all_step_losses=all_step_losses_tensor,
-            best_step_mask=best_step_mask
+            best_step_mask=best_step_mask,
+            halt_logits=torch.stack(all_halt_logits).squeeze(-1) if all_halt_logits else None,
+            all_step_logits=torch.stack(step_logits_list) if step_logits_list else None,
+            eff_k=(torch.stack(active_counts).mean() if active_counts else None),
+            routing_weights=(torch.stack(routing_weights) if routing_weights else None)
         )
+
+    def _aggregate_fars_cost(self, routing_info: dict[str, torch.Tensor]) -> torch.Tensor | None:
+        """
+        实现基于 FARS 逻辑的负载均衡正则化：
+        1. 熵最大化 (Entropy Maximization): 鼓励 P_avg 趋向均匀分布。
+        2. FARS Cost: 使用归一化的二阶矩 (v_running) 作为惩罚权重。
+        """
+        total_fars_loss = 0.0
+        count = 0
+        
+        # 访问 block 内部的 router 以获取 v_running
+        routers = {
+            "q": self.block.attn.q_router,
+            "k": self.block.attn.k_router,
+            "v": self.block.attn.v_router,
+            "mlp": self.block.mlp.router
+        }
+
+        for head, router in routers.items():
+            w = routing_info.get(f"{head}_weights")
+            if w is not None:
+                # 1. 计算平均路由分布 P_avg
+                # w shape: [B, T, E] (attn) or [B, E] (mlp)
+                p_avg = w.mean(dim=list(range(w.dim() - 1)))
+                
+                # 2. 熵最大化损失 (最小化 -H(P_avg))
+                entropy_loss = (p_avg * torch.log(p_avg + 1e-9)).sum()
+                
+                # 3. FARS Cost (Fisher 曲率感知)
+                # 使用 router 中维护的 v_running (二阶矩代理)
+                v_norm = router.v_running / (router.v_running.max() + 1e-9)
+                fars_penalty = (p_avg * v_norm).sum()
+                
+                total_fars_loss = total_fars_loss + (entropy_loss + fars_penalty)
+                count += 1
+                
+        return total_fars_loss / count if count > 0 else None
 
     def prepare_inputs_for_generation(
         self,

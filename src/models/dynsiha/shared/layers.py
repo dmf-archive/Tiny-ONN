@@ -101,13 +101,19 @@ class DynSIHAAttention(nn.Module):
         cache_position: torch.LongTensor | None = None,
         position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
         layer_idx: int | None = None,
+        route_x: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor], Cache | None]:
         B, T, C = x.shape
         x_heads = x.view(B, T, self.num_heads, self.head_dim)
+        route_base = x if route_x is None else route_x
+        route_heads = route_base.view(B, T, self.num_heads, self.head_dim)
 
-        qw, qe, ql = self.q_router(x_heads)
-        kw, ke, kl = self.k_router(x_heads)
-        vw, ve, vl = self.v_router(x_heads)
+        qw, qe, ql = self.q_router(route_heads)
+        kw, ke, kl = self.k_router(route_heads)
+        vw, ve, vl = self.v_router(route_heads)
+        q_active = self.q_router.last_active_counts
+        k_active = self.k_router.last_active_counts
+        v_active = self.v_router.last_active_counts
 
         q = self.q_experts(x_heads, qw, qe).transpose(1, 2) # [B, num_heads, T, head_dim]
         k = self.k_experts(x_heads, kw, ke).transpose(1, 2)
@@ -133,7 +139,9 @@ class DynSIHAAttention(nn.Module):
 
         routing_info = {
             "q_logits": ql, "k_logits": kl, "v_logits": vl,
-            "q_weights": qw, "k_weights": kw, "v_weights": vw
+            "q_weights": qw, "k_weights": kw, "v_weights": vw,
+            "q_active": q_active, "k_active": k_active, "v_active": v_active,
+            "q_cost": None, "k_cost": None, "v_cost": None
         }
         return output, routing_info, past_key_value
 
@@ -155,9 +163,12 @@ class DynSIHAMLP(nn.Module):
             dtype=dtype
         )
 
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        w, e, l = self.router(x)
-        return self.experts(x, w, e), l, w
+    def forward(self, x: torch.Tensor, route_x: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        route_base = x if route_x is None else route_x
+        w, e, l = self.router(route_base)
+        active = self.router.last_active_counts
+        # 预留 cost 接口，先返回 None
+        return self.experts(x, w, e), l, w, active, None
 
 class DynSIHABlock(nn.Module):
     def __init__(
@@ -188,6 +199,7 @@ class DynSIHABlock(nn.Module):
         cache_position: torch.LongTensor | None = None,
         position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
         layer_idx: int | None = None,
+        route_x: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor], Cache | None]:
         attn_in = self.ln1(x)
         attn_out, attn_routing, past_key_value = self.attn(
@@ -199,12 +211,13 @@ class DynSIHABlock(nn.Module):
             use_cache,
             cache_position,
             position_embeddings,
-            layer_idx=layer_idx
+            layer_idx=layer_idx,
+            route_x=route_x
         )
         x = x + attn_out
 
         mlp_in = self.ln2(x)
-        mlp_out, mlp_routing, mlp_weights = self.mlp(mlp_in)
+        mlp_out, mlp_routing, mlp_weights, mlp_active, mlp_cost = self.mlp(mlp_in, route_x=route_x)
         x = x + mlp_out
 
-        return x, {**attn_routing, "mlp_logits": mlp_routing, "mlp_weights": mlp_weights}, past_key_value
+        return x, {**attn_routing, "mlp_logits": mlp_routing, "mlp_weights": mlp_weights, "mlp_active": mlp_active, "mlp_cost": mlp_cost}, past_key_value

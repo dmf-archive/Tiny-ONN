@@ -18,7 +18,9 @@ def parse_args():
     parser.add_argument("--max_tokens", type=int, default=2048, help="Max tokens per sequence")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="Device to use")
     parser.add_argument("--data_dir", type=str, default="data/ARC-AGI-2/data", help="Path to ARC data")
-    parser.add_argument("--use_art_mode", action="store_true", help="Enable ART (Detached Gradient) mode for recursive models")
+    parser.add_argument("--use_sia", action="store_true", help="Enable SIA (Detached Gradient) mode for recursive models")
+    parser.add_argument("--use_cache_in_train", action="store_true", help="Enable KV cache during training for recursive models")
+    parser.add_argument("--use_act_inference", action="store_true", help="Enable ACT early-exit during inference")
     parser.add_argument("--gradient_checkpointing", action="store_true", help="Enable gradient checkpointing")
     return parser.parse_args()
 
@@ -35,7 +37,9 @@ def main():
             num_heads=8,
             num_experts=32,
             top_k=4,
-            use_art_mode=args.use_art_mode,
+            use_sia=args.use_sia,
+            use_cache_in_train=args.use_cache_in_train,
+            use_act_inference=args.use_act_inference,
             max_position_embeddings=4096
         )
         model = RecursiveDynSIHAForCausalLM(config)

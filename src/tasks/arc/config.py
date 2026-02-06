@@ -1,4 +1,5 @@
 from dataclasses import dataclass, field
+from typing import Optional
 
 
 @dataclass
@@ -24,6 +25,7 @@ class TrainConfig:
     generation: GenerationConfig = field(default_factory=GenerationConfig)
     lr: float = 1e-4
     batch_size: int = 4
+    max_tokens: int = 6144
     num_epochs: int = 10
     device: str = "cuda"
     data_dir: str = "data/ARC-AGI-2/data"
@@ -32,7 +34,12 @@ class TrainConfig:
     adaptive_sync: bool = True
     eval_steps: int = 100
     save_steps: int = 500
+    max_checkpoints: int = 5
     resume_from_checkpoint: Optional[str] = None
+    # Memory Guard
+    memory_threshold_gb: float = 8.0
     # Routing Shaping
     w_meta: float = 0.5
     cost_alpha: float = 0.5
+    # Metrics
+    compute_rmi_itjd: bool = True

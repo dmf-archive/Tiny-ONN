@@ -24,7 +24,7 @@
 
 > 注意：以下文档因篇幅过长，为保持规则库简洁，仅在此提供路径索引，不直接并入 `.roo/rules`。
 
-- `ARS-Series`: `ref\F3EO\.roo\rules\ARS-Series.md`
+- `ARS-Series`: `ref\ARS\.roo\rules\ARS-Series.md`
   - 简介：探讨在黎曼流形上滑行的优化算法家族（ARS/ARS2-Neo），核心在于能量-几何解耦（Energy-Geometry Decoupling）与测地线优化。
 - `FARS`: `ref/FARS.md`
   - 简介：Fisher-Aware Routing Shaping。利用优化器二阶矩（Fisher 近似）量化专家认知代价，实现自发的功能分化与稀疏路由。

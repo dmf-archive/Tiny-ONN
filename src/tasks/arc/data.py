@@ -103,9 +103,11 @@ class ARCDataset(Dataset):
         self.h1_all_predict = h1_all_predict
 
         self.tasks = []
+        self.task_ids = []
         for p in sorted(self.data_path.glob("*.json")):
             with open(p) as f:
                 self.tasks.append(json.load(f))
+                self.task_ids.append(p.stem)
 
     def __len__(self) -> int:
         return len(self.tasks)
@@ -123,6 +125,7 @@ class ARCDataset(Dataset):
 
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
         task = self.tasks[idx]
+        task_id = getattr(self, "task_ids", [f"task_{i}" for i in range(len(self.tasks))])[idx]
 
         # Generate augmentation params
         color_perm = torch.arange(10)
@@ -210,6 +213,7 @@ class ARCDataset(Dataset):
             "input_ids": input_ids,
             "labels": labels,
             "diff_mask": diff_mask,
+            "task_id": task_id,
         }
 
 class PackedARCDataLoader:
@@ -268,6 +272,7 @@ class PackedARCDataLoader:
         input_ids = [s["input_ids"] for s in batch]
         labels = [s["labels"] for s in batch]
         diff_masks = [s["diff_mask"] for s in batch]
+        task_ids = [s["task_id"] for s in batch]
 
         max_len = max(len(x) for x in input_ids)
 
@@ -287,13 +292,16 @@ class PackedARCDataLoader:
             "input_ids": torch.stack(padded_input_ids),
             "labels": torch.stack(padded_labels),
             "diff_mask": torch.stack(padded_diff_masks),
-            "attention_mask": torch.stack(attention_masks)
+            "attention_mask": torch.stack(attention_masks),
+            "task_id": task_ids
         }
 
-def get_arc_dataloader(data_dir: str, batch_size: int, split: str = "training", num_workers: int = 4):
+def get_arc_dataloader(data_dir: str, batch_size: int, split: str = "training", num_workers: int = 4, max_tokens: int | None = None):
     dataset = ARCDataset(data_dir, split=split)
+    if max_tokens is None:
+        max_tokens = 6144 if split == "training" else 2048
     return PackedARCDataLoader(
         dataset,
-        max_tokens=8192 if split == "training" else 2048,
+        max_tokens=max_tokens,
         shuffle=(split == "training")
     )

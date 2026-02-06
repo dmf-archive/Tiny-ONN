@@ -1,4 +1,5 @@
 import time
+import math
 from typing import Any
 
 import torch
@@ -16,7 +17,8 @@ class RoutingShaper:
         self,
         routing_info: list[dict[str, torch.Tensor]],
         model: nn.Module,
-        optimizer: Any
+        optimizer: Any,
+        best_step_mask: torch.Tensor | None = None
     ) -> torch.Tensor:
         """
         FARS: Fisher-Aware Routing Shaping (Module-level).
@@ -56,11 +58,24 @@ class RoutingShaper:
                 self._mapping_verified = True
 
         for i, layer_info in enumerate(routing_info):
+            # 如果提供了 best_step_mask [steps, B]，则仅对有效路径进行惩罚
+            # 否则默认全量惩罚
+            step_mask = best_step_mask[i] if best_step_mask is not None else None
+
             for key, logits in layer_info.items():
                 if "logits" in key:
                     # 1. SARS: Surprise-Aware (Entropy of the prior)
                     probs = F.softmax(logits, dim=-1)
-                    entropy = -torch.sum(probs * torch.log(probs + 1e-9), dim=-1).mean()
+                    entropy_per_sample = -torch.sum(probs * torch.log(probs + 1e-9), dim=-1)
+                    if step_mask is not None:
+                        # 仅对有效步进行平均
+                        # logits 可能有 [B, T, num_heads, num_experts] 或 [B, T, num_experts]
+                        # step_mask 是 [B]
+                        while step_mask.ndim < entropy_per_sample.ndim:
+                            step_mask = step_mask.unsqueeze(-1)
+                        entropy = (entropy_per_sample * step_mask).sum() / (step_mask.sum() + 1e-9)
+                    else:
+                        entropy = entropy_per_sample.mean()
 
                     # 2. FARS: Fisher-Aware (Expert-level cost)
                     prefix = f"layers.{i}."
@@ -78,14 +93,24 @@ class RoutingShaper:
 
                     expert_costs = module_costs.get(module_name)
                     if expert_costs is not None:
-                        # expert_costs shape: [num_experts]
-                        # probs shape: [B, T, num_heads, num_experts] or [B, T, num_experts]
-                        # We want to penalize high-cost experts weighted by their selection probability
-                        cost_fars = (probs * expert_costs).sum(dim=-1).mean()
+                        cost_fars_per_sample = (probs * expert_costs).sum(dim=-1)
                     else:
-                        cost_fars = 0.0
+                        cost_fars_per_sample = torch.zeros_like(probs[..., 0])
 
-                    meta_losses.append(entropy + self.cost_alpha * cost_fars)
+                    num_experts = probs.shape[-1]
+                    entropy_raw = -torch.sum(probs * torch.log(probs + 1e-9), dim=-1)
+                    diversity = entropy_raw / (math.log(num_experts) + 1e-9)
+                    
+                    meta_step_per_sample = cost_fars_per_sample - self.cost_alpha * diversity
+                    
+                    if step_mask is not None:
+                        while step_mask.ndim < meta_step_per_sample.ndim:
+                            step_mask = step_mask.unsqueeze(-1)
+                        meta_step = (meta_step_per_sample * step_mask).sum() / (step_mask.sum() + 1e-9)
+                    else:
+                        meta_step = meta_step_per_sample.mean()
+                        
+                    meta_losses.append(meta_step)
 
         if not meta_losses:
             res = torch.tensor(0.0, device=next(model.parameters()).device)

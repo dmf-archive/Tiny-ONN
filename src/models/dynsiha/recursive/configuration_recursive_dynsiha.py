@@ -20,6 +20,9 @@ class RecursiveDynSIHAConfig(PretrainedConfig):
         rms_norm_eps=1e-6,
         rope_theta=10000.0,
         use_cache=True,
+        use_cache_in_train=True,
+        use_sia=True,
+        use_act_inference=True,
         **kwargs
     ):
         self.vocab_size = vocab_size
@@ -36,4 +39,7 @@ class RecursiveDynSIHAConfig(PretrainedConfig):
         self.rms_norm_eps = rms_norm_eps
         self.rope_theta = rope_theta
         self.use_cache = use_cache
+        self.use_cache_in_train = use_cache_in_train
+        self.use_sia = use_sia
+        self.use_act_inference = use_act_inference
         super().__init__(**kwargs)
