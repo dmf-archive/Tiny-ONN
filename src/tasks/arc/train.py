@@ -1,10 +1,15 @@
 import argparse
+
 import torch
 
 from src.models.dynsiha.flat.configuration_flat_dynsiha import FlatDynSIHAConfig
 from src.models.dynsiha.flat.modeling_flat_dynsiha import FlatDynSIHAForCausalLM
-from src.models.dynsiha.recursive.configuration_recursive_dynsiha import RecursiveDynSIHAConfig
-from src.models.dynsiha.recursive.modeling_recursive_dynsiha import RecursiveDynSIHAForCausalLM
+from src.models.dynsiha.recursive.configuration_recursive_dynsiha import (
+    RecursiveDynSIHAConfig,
+)
+from src.models.dynsiha.recursive.modeling_recursive_dynsiha import (
+    RecursiveDynSIHAForCausalLM,
+)
 from src.tasks.arc.config import TrainConfig
 from src.tasks.arc.trainer import ARCTrainer
 

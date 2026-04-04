@@ -1,5 +1,5 @@
-import time
 import math
+import time
 from typing import Any
 
 import torch
@@ -100,16 +100,16 @@ class RoutingShaper:
                     num_experts = probs.shape[-1]
                     entropy_raw = -torch.sum(probs * torch.log(probs + 1e-9), dim=-1)
                     diversity = entropy_raw / (math.log(num_experts) + 1e-9)
-                    
+
                     meta_step_per_sample = cost_fars_per_sample - self.cost_alpha * diversity
-                    
+
                     if step_mask is not None:
                         while step_mask.ndim < meta_step_per_sample.ndim:
                             step_mask = step_mask.unsqueeze(-1)
                         meta_step = (meta_step_per_sample * step_mask).sum() / (step_mask.sum() + 1e-9)
                     else:
                         meta_step = meta_step_per_sample.mean()
-                        
+
                     meta_losses.append(meta_step)
 
         if not meta_losses:

@@ -1,18 +1,31 @@
 from __future__ import annotations
 
+import argparse
 import math
 import random
+from collections.abc import Iterable
 from dataclasses import dataclass
-import argparse
-from typing import Iterable
+from typing import Any
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from rich.progress import (
+    BarColumn,
+    MofNCompleteColumn,
+    Progress,
+    TaskProgressColumn,
+    TextColumn,
+    TimeRemainingColumn,
+)
 from torch.utils.data import DataLoader, Dataset
 
-from src.models.dynsiha.recursive.configuration_recursive_dynsiha import RecursiveDynSIHAConfig
-from src.models.dynsiha.recursive.modeling_recursive_dynsiha import RecursiveDynSIHAForCausalLM
+from src.models.dynsiha.recursive.configuration_recursive_dynsiha import (
+    RecursiveDynSIHAConfig,
+)
+from src.models.dynsiha.recursive.modeling_recursive_dynsiha import (
+    RecursiveDynSIHAForCausalLM,
+)
 from src.optimizers.ars2_neo import ARS2Neo
 
 
@@ -60,7 +73,7 @@ CONFIG = Config(
         n_layers_rds=2,
         n_steps=4,
         act_weight=0.01,
-        seq_len=2,
+        seq_len=3,
     ),
     training=TrainingConfig(
         batch_size=256,
@@ -75,6 +88,13 @@ CONFIG = Config(
         seed=1337,
     ),
 )
+
+ROUTING_CONFIG = {
+    "fars_weight": 0.1,
+    "temperature_initial": 1.0,
+    "temperature_final": 0.1,
+    "temperature_warmup": 500,
+}
 
 
 def set_seed(seed: int) -> None:
@@ -100,12 +120,23 @@ def build_mod_addition(p: int, train_frac: float, seed: int) -> tuple[ModAddData
     a = torch.arange(p, dtype=torch.long)
     b = torch.arange(p, dtype=torch.long)
     aa, bb = torch.meshgrid(a, b, indexing="ij")
-    pairs = torch.stack([aa.flatten(), bb.flatten()], dim=1)
-    labels = (pairs[:, 0] + pairs[:, 1]) % p
-    perm = torch.randperm(pairs.size(0), generator=g)
-    pairs = pairs[perm]
-    labels = labels[perm]
-    split = int(pairs.size(0) * train_frac)
+    base_pairs = torch.stack([aa.flatten(), bb.flatten()], dim=1)
+    total = base_pairs.size(0)
+    perm = torch.randperm(total, generator=g)
+    shuffled = base_pairs[perm]
+    add_token = p
+    sub_token = p + 1
+    add_count = int(total * 0.55)
+    add_pairs = shuffled[:add_count]
+    sub_pairs = shuffled[add_count:]
+    ops = torch.empty(total, dtype=torch.long)
+    labels = torch.empty(total, dtype=torch.long)
+    ops[:add_count] = add_token
+    ops[add_count:] = sub_token
+    labels[:add_count] = (add_pairs[:, 0] + add_pairs[:, 1]) % p
+    labels[add_count:] = (sub_pairs[:, 0] - sub_pairs[:, 1]) % p
+    pairs = torch.cat([shuffled, ops.unsqueeze(1)], dim=1)
+    split = int(total * train_frac)
     train_ds = ModAddDataset(pairs[:split], labels[:split])
     test_ds = ModAddDataset(pairs[split:], labels[split:])
     return train_ds, test_ds
@@ -188,7 +219,7 @@ class ModAddTransformer(nn.Module):
 
 
 class RecursiveDynSIHATrunk(nn.Module):
-    def __init__(self, cfg: ModelConfig, vocab: int, steps: int, use_sia: bool):
+    def __init__(self, cfg: ModelConfig, vocab: int, steps: int, plsd_as_hypernet: bool = True):
         super().__init__()
         config = RecursiveDynSIHAConfig(
             vocab_size=vocab,
@@ -201,19 +232,20 @@ class RecursiveDynSIHATrunk(nn.Module):
             max_position_embeddings=64,
             use_cache=True,
             use_cache_in_train=True,
-            use_sia=use_sia,
+            use_sia=True,
             use_act_inference=False,
+            plsd_as_hypernet=plsd_as_hypernet,
         )
         self.model = RecursiveDynSIHAForCausalLM(config)
         self._steps = steps
+        self.plsd_as_hypernet = plsd_as_hypernet
 
     @property
-    def steps(self) -> int:
+    def steps(self) -> int:  # type: ignore[override]
         return self._steps
 
-    def forward_bundle(self, ids: torch.Tensor, labels: torch.Tensor | None = None) -> dict:
-        input_ids = torch.zeros(ids.size(0), 3, device=ids.device, dtype=ids.dtype)
-        input_ids[:, :2] = ids
+    def forward_bundle(self, ids: torch.Tensor, labels: torch.Tensor | None = None) -> dict[str, Any]:
+        input_ids = ids.clone()
         label_seq = None
         if labels is not None:
             label_seq = torch.full_like(input_ids, -100)
@@ -223,7 +255,8 @@ class RecursiveDynSIHATrunk(nn.Module):
         halt_logits = out.halt_logits
         halt_step = None
         if halt_logits is not None:
-            halt_step = halt_logits.mean(-1).transpose(0, 1)
+            # halt_logits 现在是 [T, B] -> 转置为 [B, T]
+            halt_step = halt_logits.transpose(0, 1)
         eff_k = float(out.eff_k.item()) if out.eff_k is not None else None
         routing_weights = out.routing_weights
         if out.all_step_logits is not None:
@@ -266,95 +299,37 @@ def compute_itjd_rmi(
     step_idx: torch.LongTensor,
     num_steps: int,
 ) -> tuple[float, float]:
-    """
-    routing_weights: [B, E] 每样本每专家权重
-    step_idx: [B] 每样本的 step id (0..num_steps-1)
-    """
-    B, E = routing_weights.shape
-    # ITJD: 两两 step 之间的 Jaccard 距离
-    step_mask = F.one_hot(step_idx, num_classes=num_steps).bool()  # [B, T]
-    step_weights = torch.zeros(num_steps, E, device=routing_weights.device)
-    for t in range(num_steps):
-        mask = step_mask[:, t]
-        if mask.any():
-            step_weights[t] = routing_weights[mask].mean(0)
-    # 只计算有样本的 step
-    occupied = step_weights.sum(1) > 0
-    if occupied.sum() < 2:
-        return 0.0, 0.0
-    w = step_weights[occupied]
-    # Jaccard 距离矩阵
-    inter = torch.minimum(w.unsqueeze(0), w.unsqueeze(1)).sum(-1)
-    union = torch.maximum(w.unsqueeze(0), w.unsqueeze(1)).sum(-1)
-    jaccard = inter / (union + 1e-9)
-    itjd = (1 - jaccard).triu(1).sum() / (jaccard.triu(1).numel() + 1e-9)
-    # RMI: I(step; routing)
-    # 离散化路由分布：取 top-1 专家索引
-    top1 = routing_weights.argmax(-1)
-    # 联合分布
-    joint = torch.zeros(num_steps, E, device=routing_weights.device)
-    for t in range(num_steps):
-        mask = step_idx == t
-        if mask.any():
-            cnt = torch.bincount(top1[mask], minlength=E).float()
-            joint[t] = cnt / (cnt.sum() + 1e-9)
-    p_t = joint.sum(1)
-    p_e = joint.sum(0)
-    # MI = sum p(t,e) log(p(t,e)/(p(t)p(e)))
-    mi = 0.0
-    for t in range(num_steps):
-        for e in range(E):
-            p_te = joint[t, e].item()
-            if p_te > 0:
-                mi += p_te * math.log(p_te / (p_t[t].item() * p_e[e].item() + 1e-9) + 1e-9)
-    return float(itjd), float(mi)
-
-
-def compute_itjd_rmi(
-    routing_weights: torch.Tensor,
-    step_idx: torch.LongTensor,
-    num_steps: int,
-) -> tuple[float, float]:
-    """
-    routing_weights: [B, E] 每样本每专家权重
-    step_idx: [B] 每样本的 step id (0..num_steps-1)
-    """
-    B = routing_weights.size(0)
     E = routing_weights.size(-1)
-    # ITJD: 两两 step 之间的 Jaccard 距离
-    step_mask = F.one_hot(step_idx, num_classes=num_steps).bool()  # [B, T]
-    # routing_weights: [T, B, E] -> 按 step 聚合
-    step_weights = torch.zeros(num_steps, E, device=routing_weights.device)
+    step_weights = torch.zeros(num_steps, E, device=routing_weights.device, dtype=routing_weights.dtype)
     for t in range(num_steps):
-        w_t = routing_weights[t]  # [B, E]
+        w_t = routing_weights[t] if routing_weights.dim() == 3 else routing_weights
         step_weights[t] = w_t.mean(dim=0)
-    # 只计算有样本的 step
     occupied = step_weights.sum(1) > 0
     if occupied.sum() < 2:
         return 0.0, 0.0
     w = step_weights[occupied]
-    # Jaccard 距离矩阵
     inter = torch.minimum(w.unsqueeze(0), w.unsqueeze(1)).sum(-1)
     union = torch.maximum(w.unsqueeze(0), w.unsqueeze(1)).sum(-1)
     jaccard = inter / (union + 1e-9)
     itjd = (1 - jaccard).triu(1).sum() / (jaccard.triu(1).numel() + 1e-9)
-    # RMI: I(step; routing)
-    # 离散化路由分布：取 top-1 专家索引
-    # routing_weights: [T, B, E] -> 按 step 聚合
-    top1 = routing_weights.argmax(-1)  # [T, B]
-    joint = torch.zeros(num_steps, E, device=routing_weights.device)
+    top1 = routing_weights.argmax(-1) if routing_weights.dim() == 3 else routing_weights.argmax(-1)
+    joint = torch.zeros(num_steps, E, device=routing_weights.device, dtype=routing_weights.dtype)
     for t in range(num_steps):
-        cnt = torch.bincount(top1[t], minlength=E).float()
+        if routing_weights.dim() == 3:
+            cnt = torch.bincount(top1[t], minlength=E).float()
+        else:
+            cnt = torch.bincount(top1, minlength=E).float()
         joint[t] = cnt / (cnt.sum() + 1e-9)
     p_t = joint.sum(1)
     p_e = joint.sum(0)
-    # MI = sum p(t,e) log(p(t,e)/(p(t)p(e)))
     mi = 0.0
     for t in range(num_steps):
         for e in range(E):
             p_te = joint[t, e].item()
-            if p_te > 0:
-                mi += p_te * math.log(p_te / (p_t[t].item() * p_e[e].item() + 1e-9) + 1e-9)
+            p_t_val = p_t[t].item()
+            p_e_val = p_e[e].item()
+            if p_te > 0 and p_t_val > 0 and p_e_val > 0:
+                mi += p_te * math.log(p_te / (p_t_val * p_e_val))
     return float(itjd), float(mi)
 
 
@@ -363,7 +338,8 @@ def compute_loss_components(
     ids: torch.Tensor,
     labels: torch.Tensor,
     act_weight: float,
-) -> tuple[torch.Tensor, dict, torch.Tensor, torch.Tensor]:
+    current_step: int = 1000,
+) -> tuple[torch.Tensor, dict[str, Any], torch.Tensor, torch.Tensor]:
     bundle = model.forward_bundle(ids, labels)
     logits_list = bundle["logits_list"]
     loss_stack = bundle["loss_stack"]
@@ -375,40 +351,112 @@ def compute_loss_components(
             [F.cross_entropy(logits, labels, reduction="none") for logits in logits_list]
         )
     if halt_logits is None:
-        halt_logits = torch.zeros(ids.size(0), model.steps, device=ids.device)
+        halt_logits = torch.zeros(ids.size(0), int(model.steps), device=ids.device, dtype=ids.dtype)
     steps = loss_stack.size(0)
     if steps == 1:
         total_loss = loss_stack[0].mean()
         eff_k = None
-        stats = {
+        stats: dict[str, Any] = {
             "plsd_losses": [float(loss_stack[0].mean().item())],
-            "halt_probs": [float(torch.sigmoid(halt_logits).mean().item())],
+            "pred_losses": [float(torch.exp(halt_logits).mean().item())],
             "eff_K": eff_k,
         }
         return total_loss, stats, loss_stack, halt_logits
     if halt_logits.size(1) != steps:
         halt_logits = halt_logits[:, :steps]
     best_loss, best_step = loss_stack.min(0)
-    step_mask = torch.arange(steps, device=ids.device)[None, :] <= best_step[:, None]
-    main_loss = (loss_stack.permute(1, 0) * step_mask).sum() / step_mask.sum()
-    target = (torch.arange(steps, device=ids.device)[None, :] >= best_step[:, None]).float()
-    act_loss = F.binary_cross_entropy_with_logits(halt_logits, target)
+
+    warmup_steps = 300
+    if current_step < warmup_steps:
+        alpha = current_step / warmup_steps
+        full_loss = loss_stack.mean()
+        step_mask = torch.arange(steps, device=ids.device)[None, :] <= best_step[:, None]
+        oracle_loss = (loss_stack.permute(1, 0) * step_mask).sum() / (step_mask.sum() + 1e-9)
+        main_loss = (1 - alpha) * full_loss + alpha * oracle_loss
+    else:
+        step_mask = torch.arange(steps, device=ids.device)[None, :] <= best_step[:, None]
+        main_loss = (loss_stack.permute(1, 0) * step_mask).sum() / (step_mask.sum() + 1e-9)
+    target_loss = torch.log(loss_stack.detach().permute(1, 0) + 1.0)
+    act_loss = F.mse_loss(halt_logits, target_loss)
+
     total_loss = main_loss + act_weight * act_loss
     oracle_dist = torch.bincount(best_step, minlength=steps).float().cpu()
     oracle_dist = (oracle_dist / oracle_dist.sum()).tolist()
     itjd, rmi = 0.0, 0.0
     if routing_weights is not None:
         itjd, rmi = compute_itjd_rmi(routing_weights, best_step, steps)
-    stats = {
-        "eff_L": float(best_step.float().mean().item()),
+    eff_layer = float(best_step.float().mean().item())
+    eff_act = None
+    if eff_k is not None:
+        num_experts = 32
+        top_k = 4
+        eff_act = eff_k / (num_experts * top_k)
+    routing_entropy = None
+    task_routing = None
+    if routing_weights is not None:
+        routing_entropy = float(torch.distributions.Categorical(probs=routing_weights.mean(0)).entropy().mean().item())
+        task_routing = analyze_task_routing(routing_weights, ids, labels, CONFIG.data.p)
+    stats: dict[str, Any] = {
+        "eff_layer": eff_layer,
+        "eff_act": eff_act,
         "eff_K": eff_k,
         "oracle_dist": oracle_dist,
-        "halt_probs": torch.sigmoid(halt_logits).mean(0).detach().cpu().tolist(),
+        "pred_losses": torch.exp(halt_logits).mean(0).detach().cpu().tolist(),
         "plsd_losses": loss_stack.mean(1).detach().cpu().tolist(),
         "itjd": itjd,
         "rmi": rmi,
+        "routing_entropy": routing_entropy,
+        "task_routing": task_routing,
     }
     return total_loss, stats, loss_stack, halt_logits
+
+
+def analyze_task_routing(
+    routing_weights: torch.Tensor,
+    ids: torch.Tensor,
+    labels: torch.Tensor,
+    p: int,
+) -> dict[str, list[float]]:
+    add_token = p
+    sub_token = p + 1
+    ops = ids[:, -1]
+    add_mask = ops == add_token
+    sub_mask = ops == sub_token
+    # routing_weights 形状：[num_steps, batch, num_experts]
+    # 我们需要对 step 和 batch 维度都求平均，得到 [num_experts]
+    result: dict[str, list[float]] = {"add": [], "sub": []}
+    if add_mask.any():
+        w_add = routing_weights[:, add_mask, :].mean(dim=(0, 1))
+        result["add"] = w_add.cpu().tolist()
+    if sub_mask.any():
+        w_sub = routing_weights[:, sub_mask, :].mean(dim=(0, 1))
+        result["sub"] = w_sub.cpu().tolist()
+    return result
+
+
+def evaluate_model(
+    model: nn.Module,
+    data_loader: DataLoader,
+    device: torch.device,
+) -> tuple[float, float]:
+    model.eval()
+    total_loss = 0.0
+    total_correct = 0
+    total_samples = 0
+    with torch.no_grad():
+        for ids, labels in data_loader:
+            ids = ids.to(device)
+            labels = labels.to(device)
+            bundle = model.forward_bundle(ids, labels)
+            logits = bundle["logits"]
+            loss_stack = bundle["loss_stack"]
+            if loss_stack is not None:
+                total_loss += float(loss_stack.mean().item()) * ids.size(0)
+            preds = logits.argmax(dim=-1)
+            total_correct += int((preds == labels).sum().item())
+            total_samples += ids.size(0)
+    model.train()
+    return total_loss / total_samples, total_correct / total_samples
 
 
 def compute_phi_s(
@@ -433,83 +481,115 @@ def infer_logits(model: nn.Module, ids: torch.Tensor) -> torch.Tensor:
     logits = bundle["logits"]
     logits_list = bundle["logits_list"]
     halt_logits = bundle["halt_logits"]
-    if model.steps == 1:
+    if model.steps == 1:  # type: ignore[operator]
         return logits
     if halt_logits is None:
         return logits
     logits = torch.stack(logits_list).permute(1, 0, 2)
-    halt_probs = torch.sigmoid(halt_logits)
-    mask = halt_probs > 0.5
-    first = mask.float().argmax(1)
-    has_halt = mask.any(1)
-    selected = torch.where(has_halt, first, torch.full_like(first, model.steps - 1))
+    # 回归模式：选择预测 Loss 最小的步骤
+    # halt_logits: [B, T]
+    selected = halt_logits.argmin(dim=1)
     gathered = logits.gather(1, selected[:, None, None].expand(-1, 1, logits.size(-1)))
     return gathered.squeeze(1)
 
 
-class StatsCollector:
-    def __init__(self, name: str, is_rds: bool):
-        self.name = name
-        self.is_rds = is_rds
-        self.loss: list[float] = []
-        self.acc: list[float] = []
-        self.eff_L: list[float] = []
-        self.eff_K: list[float] = []
-        self.oracle_dist: list[list[float]] = []
-        self.halt_probs: list[list[float]] = []
-        self.plsd_losses: list[list[float]] = []
-        self.phi_s: list[list[float]] = []
-        self.itjd: list[float] = []
-        self.rmi: list[float] = []
+@dataclass
+class MetricsBuffer:
+    loss_window: list[float]
+    acc_window: list[float]
+    eff_layer_window: list[float]
+    eff_act_window: list[float]
+    itjd_window: list[float]
+    rmi_window: list[float]
+    routing_entropy_window: list[float]
+    oracle_dist_sum: list[float]
+    oracle_count: int
+    task_routing_add_sum: list[float]
+    task_routing_sub_sum: list[float]
+    task_routing_count: int
 
-    def collect(self, loss: float, acc: float, stats: dict, phi_s: list[float]) -> None:
-        self.loss.append(loss)
-        self.acc.append(acc)
-        if self.is_rds:
-            if "eff_L" in stats:
-                self.eff_L.append(float(stats["eff_L"]))
-            if "eff_K" in stats:
-                if stats["eff_K"] is not None:
-                    self.eff_K.append(float(stats["eff_K"]))
-            if "oracle_dist" in stats:
-                self.oracle_dist.append([float(x) for x in stats["oracle_dist"]])
-            if "halt_probs" in stats:
-                self.halt_probs.append([float(x) for x in stats["halt_probs"]])
-            if "plsd_losses" in stats:
-                self.plsd_losses.append([float(x) for x in stats["plsd_losses"]])
-            if len(phi_s) > 0:
-                self.phi_s.append([float(x) for x in phi_s])
-            if "itjd" in stats:
-                self.itjd.append(float(stats["itjd"]))
-            if "rmi" in stats:
-                self.rmi.append(float(stats["rmi"]))
-
-    def summarize(self, step: int, log_interval: int) -> str:
-        window = min(len(self.loss), log_interval)
-        loss_avg = sum(self.loss[-window:]) / window
-        acc_avg = sum(self.acc[-window:]) / window
-        base = f"[{self.name}] Step {step:04d} | Loss: {loss_avg:.4f} | Acc: {acc_avg:.2%}"
-        if not self.is_rds or len(self.eff_L) == 0:
-            return base
-        eff_l = sum(self.eff_L[-window:]) / window
-        eff_k = sum(self.eff_K[-window:]) / window if self.eff_K else 0.0
-        oracle = [sum(x) / window for x in zip(*self.oracle_dist[-window:])]
-        halt = [sum(x) / window for x in zip(*self.halt_probs[-window:])]
-        plsd = [sum(x) / window for x in zip(*self.plsd_losses[-window:])]
-        phi = [sum(x) / window for x in zip(*self.phi_s[-window:])] if self.phi_s else []
-        itjd = sum(self.itjd[-window:]) / window if self.itjd else 0.0
-        rmi = sum(self.rmi[-window:]) / window if self.rmi else 0.0
-        return (
-            f"{base} | eff_L: {eff_l:.2f} | eff_K: {eff_k:.2f}\n"
-            f"  Oracle: {format_list(oracle)} | Halt: {format_list(halt)}\n"
-            f"  PLSD: {format_list(plsd)} | Phi: {format_list(phi)} | ITJD: {itjd:.3f} | RMI: {rmi:.3f}"
+    @classmethod
+    def create(cls, window_size: int, num_steps: int, num_experts: int = 32):
+        return cls(
+            loss_window=[],
+            acc_window=[],
+            eff_layer_window=[],
+            eff_act_window=[],
+            itjd_window=[],
+            rmi_window=[],
+            routing_entropy_window=[],
+            oracle_dist_sum=[0.0] * num_steps,
+            oracle_count=0,
+            task_routing_add_sum=[0.0] * num_experts,
+            task_routing_sub_sum=[0.0] * num_experts,
+            task_routing_count=0,
         )
 
+    def update(self, loss: float, acc: float, stats: dict[str, Any]) -> None:
+        self.loss_window.append(loss)
+        self.acc_window.append(acc)
+        if "eff_layer" in stats and stats["eff_layer"] is not None:
+            self.eff_layer_window.append(float(stats["eff_layer"]))
+        if "eff_act" in stats and stats["eff_act"] is not None:
+            self.eff_act_window.append(float(stats["eff_act"]))
+        if "itjd" in stats:
+            self.itjd_window.append(stats["itjd"])
+        if "rmi" in stats:
+            self.rmi_window.append(stats["rmi"])
+        if "routing_entropy" in stats and stats["routing_entropy"] is not None:
+            self.routing_entropy_window.append(stats["routing_entropy"])
+        if "oracle_dist" in stats:
+            for i, v in enumerate(stats["oracle_dist"]):
+                if i < len(self.oracle_dist_sum):
+                    self.oracle_dist_sum[i] += v
+            self.oracle_count += 1
+        if "task_routing" in stats and stats["task_routing"] is not None:
+            tr = stats["task_routing"]
+            if "add" in tr and tr["add"]:
+                for i, v in enumerate(tr["add"]):
+                    if i < len(self.task_routing_add_sum):
+                        self.task_routing_add_sum[i] += v
+            if "sub" in tr and tr["sub"]:
+                for i, v in enumerate(tr["sub"]):
+                    if i < len(self.task_routing_sub_sum):
+                        self.task_routing_sub_sum[i] += v
+            self.task_routing_count += 1
 
-def format_list(values: list[float]) -> str:
-    if len(values) == 0:
-        return "[]"
-    return "[" + ", ".join(f"{v:.2f}" for v in values) + "]"
+    def get_averages(self) -> dict:
+        n = len(self.loss_window)
+        if n == 0:
+            return {}
+        result = {
+            "loss": sum(self.loss_window[-n:]) / n,
+            "acc": sum(self.acc_window[-n:]) / n,
+        }
+        if self.eff_layer_window:
+            result["eff_layer"] = sum(self.eff_layer_window[-n:]) / n
+        if self.eff_act_window:
+            result["eff_act"] = sum(self.eff_act_window[-n:]) / n
+        if self.itjd_window:
+            result["itjd"] = sum(self.itjd_window[-n:]) / n
+        if self.rmi_window:
+            result["rmi"] = sum(self.rmi_window[-n:]) / n
+        if self.routing_entropy_window:
+            result["routing_entropy"] = sum(self.routing_entropy_window[-n:]) / n
+        if self.oracle_count > 0:
+            result["oracle_dist"] = [v / self.oracle_count for v in self.oracle_dist_sum]
+        return result
+
+    def reset_window(self) -> None:
+        self.loss_window.clear()
+        self.acc_window.clear()
+        self.eff_layer_window.clear()
+        self.eff_act_window.clear()
+        self.itjd_window.clear()
+        self.rmi_window.clear()
+        self.routing_entropy_window.clear()
+        self.oracle_dist_sum[:] = [0.0] * len(self.oracle_dist_sum)
+        self.oracle_count = 0
+        self.task_routing_add_sum[:] = [0.0] * len(self.task_routing_add_sum)
+        self.task_routing_sub_sum[:] = [0.0] * len(self.task_routing_sub_sum)
+        self.task_routing_count = 0
 
 
 def run_experiment(
@@ -522,42 +602,93 @@ def run_experiment(
     device: torch.device,
 ) -> None:
     model.train()
-    stats = StatsCollector(name, model.steps > 1)
+    metrics = MetricsBuffer.create(cfg.training.log_interval, int(model.steps))  # type: ignore[arg-type]
     train_iter = iter(train_loader)
-    test_iter = iter(test_loader)
-    for step in range(cfg.training.max_steps):
-        try:
-            ids, labels = next(train_iter)
-        except StopIteration:
-            train_iter = iter(train_loader)
-            ids, labels = next(train_iter)
-        ids = ids.to(device)
-        labels = labels.to(device)
 
-        def closure() -> torch.Tensor:
-            optimizer.zero_grad(set_to_none=True)
-            total_loss, _, _, _ = compute_loss_components(model, ids, labels, cfg.model.act_weight)
-            return total_loss
+    with Progress(
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TaskProgressColumn(),
+        MofNCompleteColumn(),
+        TimeRemainingColumn(),
+    ) as progress:
+        task = progress.add_task(f"[cyan]{name}", total=cfg.training.max_steps)
 
-        loss = optimizer.step(closure)
+        for step in range(cfg.training.max_steps):
+            try:
+                ids, labels = next(train_iter)
+            except StopIteration:
+                train_iter = iter(train_loader)
+                ids, labels = next(train_iter)
+            ids = ids.to(device)
+            labels = labels.to(device)
 
-        if step % cfg.training.log_interval == 0 or step == cfg.training.max_steps - 1:
-            model.eval()
-            with torch.enable_grad():
-                total_loss, stats_dict, loss_stack, _ = compute_loss_components(
-                    model, ids, labels, cfg.model.act_weight
-                )
-                phi_s = compute_phi_s(model, loss_stack, total_loss)
-            model.zero_grad(set_to_none=True)
-            with torch.no_grad():
-                logits = infer_logits(model, ids)
-                preds = logits.argmax(dim=-1)
-                acc = float((preds == labels).float().mean().item())
-            stats.collect(float(loss.item()), acc, stats_dict, phi_s)
-            print(stats.summarize(step, cfg.training.log_interval))
-            model.train()
-            if acc >= cfg.training.early_stop_acc:
-                break
+            def closure(_ids=ids, _labels=labels, _step=step) -> torch.Tensor:
+                optimizer.zero_grad(set_to_none=True)
+                total_loss, _, _, _ = compute_loss_components(model, _ids, _labels, cfg.model.act_weight, current_step=_step)
+                return total_loss
+
+            loss = optimizer.step(closure)
+
+            if step % cfg.training.log_interval == 0 or step == cfg.training.max_steps - 1:
+                model.eval()
+                with torch.enable_grad():
+                    total_loss, stats_dict, loss_stack, _ = compute_loss_components(
+                        model, ids, labels, cfg.model.act_weight, current_step=step
+                    )
+                    _ = compute_phi_s(model, loss_stack, total_loss)
+                model.zero_grad(set_to_none=True)
+                with torch.no_grad():
+                    logits = infer_logits(model, ids)
+                    preds = logits.argmax(dim=-1)
+                    train_acc = float((preds == labels).float().mean().item())
+
+                eval_loss, eval_acc = evaluate_model(model, test_loader, device)
+                metrics.update(float(loss.item()), train_acc, stats_dict)
+
+                avg = metrics.get_averages()
+                loss_avg = avg.get("loss", 0)
+                train_acc_avg = avg.get("acc", 0)
+
+                log_lines = [f"[{name}] Step {step:04d} | Train Loss: {loss_avg:.4f} | Train Acc: {train_acc_avg:.2%} | Eval Loss: {eval_loss:.4f} | Eval Acc: {eval_acc:.2%}"]
+
+                if loss_avg < 0.01:
+                    progress.console.print(" |".join(log_lines))
+                    progress.update(task, completed=step + 1)
+                    break
+                if "eff_layer" in avg:
+                    log_lines.append(f" eff_layer: {avg['eff_layer']:.2f}")
+                if "eff_act" in avg:
+                    log_lines.append(f" eff_act: {avg['eff_act']:.3f}")
+                if "itjd" in avg:
+                    log_lines.append(f" ITJD: {avg['itjd']:.3f}")
+                if "rmi" in avg:
+                    log_lines.append(f" RMI: {avg['rmi']:.3f}")
+                if "routing_entropy" in avg:
+                    log_lines.append(f" RouteEnt: {avg['routing_entropy']:.3f}")
+                if "oracle_dist" in avg:
+                    oracle_str = ", ".join(f"{v:.2f}" for v in avg["oracle_dist"])
+                    log_lines.append(f" Oracle: [{oracle_str}]")
+
+                if "pred_losses" in stats_dict:
+                    pred_str = ", ".join(f"{v:.2f}" for v in stats_dict["pred_losses"])
+                    log_lines.append(f" PredL: [{pred_str}]")
+
+                if metrics.task_routing_count > 0:
+                    add_str = ", ".join(f"{v/metrics.task_routing_count:.3f}" for v in metrics.task_routing_add_sum[:8])
+                    sub_str = ", ".join(f"{v/metrics.task_routing_count:.3f}" for v in metrics.task_routing_sub_sum[:8])
+                    log_lines.append(f" Route[Add]: [{add_str}]")
+                    log_lines.append(f" Route[Sub]: [{sub_str}]")
+
+                progress.console.print(" |".join(log_lines))
+                metrics.reset_window()
+
+                model.train()
+                if eval_acc >= cfg.training.early_stop_acc:
+                    progress.update(task, completed=step + 1)
+                    break
+
+            progress.update(task, advance=1)
 
 
 def build_optimizer(model: nn.Module, lr: float) -> ARS2Neo:
@@ -575,22 +706,39 @@ def build_optimizer(model: nn.Module, lr: float) -> ARS2Neo:
     )
 
 
-def run(skip_dense: bool) -> None:
+def run(skip_dense: bool = True) -> None:
     set_seed(CONFIG.data.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     train_ds, test_ds = build_mod_addition(CONFIG.data.p, CONFIG.data.train_frac, CONFIG.data.seed)
     train_loader = DataLoader(train_ds, batch_size=CONFIG.training.batch_size, shuffle=True)
     test_loader = DataLoader(test_ds, batch_size=CONFIG.training.batch_size, shuffle=True)
-    configs = [("RDS", CONFIG.model.n_steps, CONFIG.model.n_layers_rds, False)]
-    if not skip_dense:
-        configs.insert(0, ("Dense", 1, CONFIG.model.n_layers_dense, False))
-    for name, steps, layers, use_sia in configs:
+
+    configs: list[tuple[str, int, int, bool]] = []
+
+    # 只对比 Dense 和 BlockSIA-HyperPLSD
+    configs.append(("Dense", 1, CONFIG.model.n_layers_dense, False))
+    configs.append(("RDS-BlockSIA-HyperPLSD", CONFIG.model.n_steps, CONFIG.model.n_layers_rds, True))
+    # 注释掉其他 RDS 变体
+    # configs.append(("RDS-BlockSIA", CONFIG.model.n_steps, CONFIG.model.n_layers_rds, False))
+    # configs.append(("RDS-NoSIA", CONFIG.model.n_steps, CONFIG.model.n_layers_rds, False))
+
+    for name, steps, layers, plsd_cfg in configs:
+        vocab_size = CONFIG.data.p + 2
         if name == "Dense":
-            model = ModAddTransformer(CONFIG.model, CONFIG.data.p, steps, layers, use_sia).to(device)
+            model: nn.Module = ModAddTransformer(CONFIG.model, vocab_size, steps, layers, use_sia=False).to(device)
         else:
-            model = RecursiveDynSIHATrunk(CONFIG.model, CONFIG.data.p, steps, use_sia).to(device)
+            use_sia = "NoSIA" not in name
+            rds_model = RecursiveDynSIHATrunk(
+                CONFIG.model, vocab_size, steps,
+                plsd_as_hypernet=plsd_cfg
+            ).to(device)
+            if not use_sia:
+                rds_model.model.config.use_sia = False  # type: ignore[union-attr]
+                rds_model.model.block.use_sia = False  # type: ignore[union-attr]
+            model = rds_model
+
         optimizer = build_optimizer(model, CONFIG.training.lr)
-        print(f"\n>>> Starting {name} Experiment")
+        print(f"\n>>> Starting {name} Experiment (PLSD_Hypernet={plsd_cfg})")
         run_experiment(name, model, optimizer, train_loader, test_loader, CONFIG, device)
         print(f"--- {name} FINISHED ---")
 

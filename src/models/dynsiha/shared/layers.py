@@ -180,6 +180,7 @@ class DynSIHABlock(nn.Module):
         layer_idx: int | None = None,
         ffn_scale: int = 4,
         rms_norm_eps: float = 1e-6,
+        use_sia: bool = False,
         dtype: torch.dtype = torch.float32
     ):
         super().__init__()
@@ -187,6 +188,7 @@ class DynSIHABlock(nn.Module):
         self.attn = DynSIHAAttention(hidden_size, num_heads, num_experts, top_k, layer_idx=layer_idx, dtype=dtype)
         self.ln2 = DynSIHARMSNorm(hidden_size, eps=rms_norm_eps)
         self.mlp = DynSIHAMLP(hidden_size, num_experts, top_k, ffn_scale, dtype=dtype)
+        self.use_sia = use_sia
 
     def forward(
         self,
@@ -201,6 +203,10 @@ class DynSIHABlock(nn.Module):
         layer_idx: int | None = None,
         route_x: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor], Cache | None]:
+        # SIA: 采用梯度直通估计器 (STE) 模式
+        # 前向使用 x.detach() 以满足协同原子假设，反向保留 0.1 比例的梯度回流
+        if self.use_sia and self.training:
+            x = x.detach() + 0.1 * (x - x.detach())
         attn_in = self.ln1(x)
         attn_out, attn_routing, past_key_value = self.attn(
             attn_in,

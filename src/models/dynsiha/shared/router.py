@@ -33,7 +33,7 @@ class MLPRouter(nn.Module):
         routing_logits = (self.net(x) + self.expert_bias) / self.temperature
         routing_weights = F.softmax(routing_logits, dim=-1)
         selected_experts = torch.arange(self.num_experts, device=x.device).expand_as(routing_weights)
-        
+
         if self.training:
             with torch.no_grad():
                 # Update second-order moment proxy (usage intensity)

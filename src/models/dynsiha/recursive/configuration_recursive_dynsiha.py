@@ -23,6 +23,7 @@ class RecursiveDynSIHAConfig(PretrainedConfig):
         use_cache_in_train=True,
         use_sia=True,
         use_act_inference=True,
+        plsd_as_hypernet=True,
         **kwargs
     ):
         self.vocab_size = vocab_size
@@ -42,4 +43,5 @@ class RecursiveDynSIHAConfig(PretrainedConfig):
         self.use_cache_in_train = use_cache_in_train
         self.use_sia = use_sia
         self.use_act_inference = use_act_inference
+        self.plsd_as_hypernet = plsd_as_hypernet
         super().__init__(**kwargs)

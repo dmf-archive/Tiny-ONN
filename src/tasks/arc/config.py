@@ -1,5 +1,4 @@
 from dataclasses import dataclass, field
-from typing import Optional
 
 
 @dataclass
@@ -35,7 +34,7 @@ class TrainConfig:
     eval_steps: int = 100
     save_steps: int = 500
     max_checkpoints: int = 5
-    resume_from_checkpoint: Optional[str] = None
+    resume_from_checkpoint: str | None = None
     # Memory Guard
     memory_threshold_gb: float = 8.0
     # Routing Shaping

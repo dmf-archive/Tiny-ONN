@@ -3,13 +3,13 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint as cp
 from transformers import GenerationMixin, PreTrainedModel
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from ..shared.layers import DynSIHABlock, DynSIHARMSNorm, DynSIHARotaryEmbedding
 from .configuration_recursive_dynsiha import RecursiveDynSIHAConfig
-import torch.utils.checkpoint as cp
 
 
 @dataclass
@@ -54,7 +54,8 @@ class RecursiveDynSIHAForCausalLM(RecursiveDynSIHAPreTrainedModel, GenerationMix
             config.top_k,
             layer_idx=0,
             ffn_scale=config.ffn_scale,
-            rms_norm_eps=config.rms_norm_eps
+            rms_norm_eps=config.rms_norm_eps,
+            use_sia=config.use_sia
         )
         self.halt_head = nn.Linear(config.hidden_size, 1)
         self.ln_f = DynSIHARMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -141,8 +142,12 @@ class RecursiveDynSIHAForCausalLM(RecursiveDynSIHAPreTrainedModel, GenerationMix
         for step in range(max_steps):
             actual_steps = step + 1
 
+            # 注意: SIA 现在由 DynSIHABlock 内部处理，不在此处 detach
+            # 保留此逻辑仅用于兼容未使用 Block SIA 的情况
             if self.config.use_sia and self.training and step > 0:
-                x = x.detach()
+                # 如果 block 没有内部 SIA 逻辑，则在此处执行
+                if not hasattr(self.block, 'use_sia'):
+                    x = x.detach()
 
             if self.training and self.gradient_checkpointing:
                 x, past_key_values, routing_info = cp.checkpoint(
@@ -166,7 +171,11 @@ class RecursiveDynSIHAForCausalLM(RecursiveDynSIHAPreTrainedModel, GenerationMix
 
             prev_x = x
 
-            halt_step_logits = self.halt_head(x)
+            # PLSD 作为 Hypernetwork: 输入 detach 以防止梯度回流到主网络
+            # 聚合序列维度，每步生成一个 halt 决策/预测
+            halt_input = x.detach() if self.config.plsd_as_hypernet else x
+            # halt_input: [B, T, D] -> 对序列维取均值，得到该步的认知状态 [B, D]
+            halt_step_logits = self.halt_head(halt_input.mean(dim=1))
             all_halt_logits.append(halt_step_logits)
 
             if labels is not None:
@@ -215,14 +224,17 @@ class RecursiveDynSIHAForCausalLM(RecursiveDynSIHAPreTrainedModel, GenerationMix
 
             main_loss = (all_step_losses_tensor * best_step_mask.float()).sum() / (best_step_mask.float().sum() + 1e-9)
 
+            # 修改为 MSE 回归损失：预测 log(loss + 1)
+            # halt_logits_tensor: [T, B]
             halt_logits_tensor = torch.stack(all_halt_logits).squeeze(-1)
-            halt_probs = torch.sigmoid(halt_logits_tensor.mean(dim=-1))
-
-            target_halt = torch.zeros_like(halt_probs)
-            for b in range(batch_size):
-                target_halt[best_steps[b]:, b] = 1.0
-
-            act_loss = F.binary_cross_entropy(halt_probs, target_halt)
+            
+            # 使用 log 空间平滑损失目标
+            # all_step_losses_tensor shape: [T, B]
+            target_loss = torch.log(all_step_losses_tensor.detach() + 1.0)
+            
+            # MSE 监督
+            act_loss = F.mse_loss(halt_logits_tensor, target_loss)
+            
             loss = main_loss + 0.1 * act_loss
 
             # === FARS 成本：标准熵最大化负载均衡 + normed FARS 权重 ===
@@ -256,7 +268,7 @@ class RecursiveDynSIHAForCausalLM(RecursiveDynSIHAPreTrainedModel, GenerationMix
         """
         total_fars_loss = 0.0
         count = 0
-        
+
         # 访问 block 内部的 router 以获取 v_running
         routers = {
             "q": self.block.attn.q_router,
@@ -271,18 +283,18 @@ class RecursiveDynSIHAForCausalLM(RecursiveDynSIHAPreTrainedModel, GenerationMix
                 # 1. 计算平均路由分布 P_avg
                 # w shape: [B, T, E] (attn) or [B, E] (mlp)
                 p_avg = w.mean(dim=list(range(w.dim() - 1)))
-                
+
                 # 2. 熵最大化损失 (最小化 -H(P_avg))
                 entropy_loss = (p_avg * torch.log(p_avg + 1e-9)).sum()
-                
+
                 # 3. FARS Cost (Fisher 曲率感知)
                 # 使用 router 中维护的 v_running (二阶矩代理)
                 v_norm = router.v_running / (router.v_running.max() + 1e-9)
                 fars_penalty = (p_avg * v_norm).sum()
-                
+
                 total_fars_loss = total_fars_loss + (entropy_loss + fars_penalty)
                 count += 1
-                
+
         return total_fars_loss / count if count > 0 else None
 
     def prepare_inputs_for_generation(

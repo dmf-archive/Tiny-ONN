@@ -1,8 +1,8 @@
 import math
-from typing import Any
 from collections import Counter
-import numpy as np
+from typing import Any
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from rich.console import Console
@@ -22,7 +22,7 @@ class ARCObserver:
     def update_routing_history(self, task_ids: list[str], routing_info: list[dict[str, torch.Tensor]]):
         if not routing_info:
             return
-        
+
         last_step = routing_info[-1]
         if "mlp_weights" in last_step:
             weights = last_step["mlp_weights"].detach().cpu()
@@ -62,7 +62,7 @@ class ARCObserver:
             ws = [h[1] for h in self.routing_history if h[0] == name]
             if ws:
                 task_avg[name] = np.mean(ws, axis=0)
-        
+
         dists = []
         names = list(task_avg.keys())
         for i in range(len(names)):

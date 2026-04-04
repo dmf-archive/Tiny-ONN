@@ -1,5 +1,5 @@
 [project]
-name = "tiny-onn"
+name = "tiny-ouroboros"
 version = "0.1.0"
 authors = [{ name = "Rui.Lin", email = "Lin.Rui.ipwt@proton.me" }]
 description = ""
@@ -31,11 +31,11 @@ norecursedirs = ["ref", ".venv"]
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["tiny_onn*", "training*", "scripts*"]
+include = ["tiny_ouroboros*", "training*", "scripts*"]
 
 [project.urls]
-"Homepage" = "https://github.com/dmf-archive/Tiny-ONN"
-"Bug Tracker" = "https://github.com/dmf-archive/Tiny-ONN/issues"
+"Homepage" = "https://github.com/dmf-archive/Tiny-Ouroboros"
+"Bug Tracker" = "https://github.com/dmf-archive/Tiny-Ouroboros/issues"
 
 [dependency-groups]
 dev = [

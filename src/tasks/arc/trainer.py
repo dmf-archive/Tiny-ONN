@@ -1,6 +1,5 @@
-import time
 import os
-import shutil
+import time
 from pathlib import Path
 
 import torch

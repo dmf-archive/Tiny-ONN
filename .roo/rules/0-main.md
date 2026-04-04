@@ -1,8 +1,8 @@
 ---
-title: "Tiny-ONN 项目自主代理操作手册"
+title: "Tiny-Ouroboros 项目自主代理操作手册"
 version: "latest"
 last_updated: "2025-11-28"
-owner: "Tiny-ONN 课题组"
+owner: "Tiny-Ouroboros 课题组"
 ---
 
 ## 1. 定义
